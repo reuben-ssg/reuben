@@ -12,6 +12,7 @@ pub(crate) fn options() -> Options<'static> {
     options.extension.autolink = true;
     options.extension.tasklist = true;
     options.extension.footnotes = true;
+    options.parse.smart = true;
     options.render.r#unsafe = true;
     options
 }
@@ -159,6 +160,23 @@ pub fn code_ranges(body: &str) -> Vec<std::ops::Range<usize>> {
 mod tests {
     use super::*;
     use crate::doc::{Alignment, NodeKind, Span};
+
+    #[test]
+    fn smart_punctuation_in_text() {
+        let html = crate::html::render(&parse("\"Rye\" -- it's good...\n", 1));
+        assert_eq!(html, "<p>“Rye” – it’s good…</p>\n");
+    }
+
+    #[test]
+    fn smart_punctuation_leaves_code_html_and_urls() {
+        let render = |s: &str| crate::html::render(&parse(s, 1));
+        assert!(render("`\"a\" -- b`").contains("<code>&quot;a&quot; -- b</code>"));
+        assert!(render("```\n\"a\" -- b\n```").contains("&quot;a&quot; -- b\n</code>"));
+        assert!(
+            render("<span title=\"a -- b\">x</span>").contains("<span title=\"a -- b\">x</span>")
+        );
+        assert!(render("[x](/a--b \"t\")").contains("href=\"/a--b\""));
+    }
 
     #[test]
     fn heading_and_paragraph_with_spans() {

@@ -77,3 +77,15 @@ fn unknown_config_key_is_an_error() {
         "{errs:?}"
     );
 }
+
+#[test]
+fn smart_punctuation_does_not_touch_block_output() {
+    let tmp = fixture("scripted");
+    fs::remove_file(tmp.path().join("content/broken.md")).unwrap();
+    tmp.child("content/smart.md")
+        .write_str("---\ntitle: Smart\n---\n{{ \"\\\"q\\\" -- x\" }}\n")
+        .unwrap();
+    build(tmp.path()).unwrap();
+    let html = fs::read_to_string(tmp.path().join("dist/smart/index.html")).unwrap();
+    assert!(html.contains("&quot;q&quot; -- x"), "{html}");
+}
