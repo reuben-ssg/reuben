@@ -62,3 +62,13 @@ fn script_error_shows_snippet() {
         .stderr(predicates::str::contains("{{ nope( }}"))
         .stderr(predicates::str::contains("^"));
 }
+
+#[test]
+fn build_accepts_env_flag() {
+    let tmp = fixture("basic");
+    reuben()
+        .args(["build", "--env", "production", "--root"])
+        .arg(tmp.path())
+        .assert()
+        .success();
+}

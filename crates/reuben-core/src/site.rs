@@ -46,6 +46,12 @@ pub struct Site {
     pub engine: Arc<ScriptEngine>,
 }
 
+#[derive(Debug, Clone, Default)]
+pub struct LoadOptions {
+    /// Merges `reuben.<env>.toml` over the base config when it exists.
+    pub env: Option<String>,
+}
+
 pub struct BuildOptions {
     pub drafts: bool,
     pub out: PathBuf,
@@ -59,12 +65,16 @@ pub struct BuildReport {
 }
 
 impl Site {
-    /// Reads every page and static file, reporting all bad files at once rather than stopping at the first.
     pub fn load(root: &Path) -> Result<Site, Vec<Error>> {
+        Self::load_with(root, &LoadOptions::default())
+    }
+
+    /// Reads every page and static file, reporting all bad files at once rather than stopping at the first.
+    pub fn load_with(root: &Path, opts: &LoadOptions) -> Result<Site, Vec<Error>> {
         let mut errors = Vec::new();
         let mut pages = Vec::new();
 
-        let config = match config::load(root) {
+        let config = match config::load(root, opts.env.as_deref()) {
             Ok(c) => Some(c),
             Err(e) => {
                 errors.push(e);
