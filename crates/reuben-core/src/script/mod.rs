@@ -38,6 +38,12 @@ pub struct ScriptEngine {
     engine: rhai::Engine,
 }
 
+impl std::fmt::Debug for ScriptEngine {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("ScriptEngine")
+    }
+}
+
 thread_local! {
     static CURRENT_FILE: std::cell::RefCell<String> = const { std::cell::RefCell::new(String::new()) };
 }

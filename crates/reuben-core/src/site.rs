@@ -6,12 +6,15 @@ use std::path::{Path, PathBuf};
 
 use walkdir::WalkDir;
 
-use crate::doc::Document;
+use std::sync::Arc;
+
+use crate::config::{self, Config};
 use crate::error::{Error, ErrorKind};
 use crate::frontmatter::{self, FrontMatter};
 use crate::route::{Route, route_for_page};
+use crate::script::ScriptEngine;
 use crate::theme::{PageShell, builtin_page};
-use crate::{html, markdown};
+use crate::{html, page};
 
 /// Written into every output directory Reuben builds. Only a directory containing it is ever cleared.
 pub const OUTPUT_MARKER: &str = ".reuben-output";
@@ -20,7 +23,14 @@ pub const OUTPUT_MARKER: &str = ".reuben-output";
 pub struct Page {
     pub source: PathBuf,
     pub front_matter: FrontMatter,
-    pub doc: Document,
+    /// Raw Markdown after the front matter, with blocks unevaluated.
+    pub body: String,
+    /// 1-based line in `source` where `body` starts.
+    pub body_line: usize,
+    /// Path relative to `content/`.
+    pub rel: PathBuf,
+    /// The sibling `<stem>.rhai`, if present.
+    pub sidecar: Option<PathBuf>,
     pub route: Route,
 }
 
@@ -30,6 +40,8 @@ pub struct Site {
     pub pages: Vec<Page>,
     /// Paths relative to `static/`.
     pub static_files: Vec<PathBuf>,
+    pub config: Config,
+    pub engine: Arc<ScriptEngine>,
 }
 
 pub struct BuildOptions {
@@ -49,6 +61,27 @@ impl Site {
     pub fn load(root: &Path) -> Result<Site, Vec<Error>> {
         let mut errors = Vec::new();
         let mut pages = Vec::new();
+
+        let config = match config::load(root) {
+            Ok(c) => Some(c),
+            Err(e) => {
+                errors.push(e);
+                None
+            }
+        };
+        let mut engine = ScriptEngine::new(root);
+        if let Some(config) = &config {
+            let dirs: Vec<PathBuf> = config
+                .theme
+                .iter()
+                .map(|t| t.join("includes"))
+                .chain([root.join("includes")])
+                .filter(|d| d.is_dir())
+                .collect();
+            if let Err(mut e) = engine.load_includes(&dirs) {
+                errors.append(&mut e);
+            }
+        }
 
         let content = root.join("content");
         for (path, rel) in walk(&content, &mut errors) {
@@ -70,14 +103,15 @@ impl Site {
             Vec::new()
         };
 
-        if errors.is_empty() {
-            Ok(Site {
+        match config {
+            Some(config) if errors.is_empty() => Ok(Site {
                 root: root.to_path_buf(),
                 pages,
                 static_files,
-            })
-        } else {
-            Err(errors)
+                config,
+                engine: Arc::new(engine),
+            }),
+            _ => Err(errors),
         }
     }
 
@@ -91,8 +125,16 @@ impl Site {
         prepare_out_dir(&opts.out).map_err(|e| vec![e])?;
 
         let mut errors = Vec::new();
+        let site_map = page::site_map(&self.config).map_err(|e| vec![e])?;
         for page in &pages {
-            let body = html::render(&page.doc);
+            let doc = match page::render_body(page, &self.engine, &site_map) {
+                Ok((doc, _scope)) => doc,
+                Err(mut e) => {
+                    errors.append(&mut e);
+                    continue;
+                }
+            };
+            let body = html::render(&doc);
             let shell = PageShell {
                 title: &page.front_matter.title,
                 lang: "en",
@@ -190,9 +232,13 @@ fn load_page(path: &Path, rel: &Path) -> Result<Page, Error> {
     let bytes = fs::read(path).map_err(|e| Error::new(path, e))?;
     let src = String::from_utf8(bytes).map_err(|_| Error::new(path, ErrorKind::NotUtf8))?;
     let parsed = frontmatter::parse(&src).map_err(|e| Error::new(path, e))?;
+    let sidecar = Some(path.with_extension("rhai")).filter(|p| p.is_file());
     Ok(Page {
         source: path.to_path_buf(),
-        doc: markdown::parse(parsed.body, parsed.body_line),
+        body: parsed.body.to_string(),
+        body_line: parsed.body_line,
+        rel: rel.to_path_buf(),
+        sidecar,
         front_matter: parsed.front_matter,
         route: route_for_page(rel),
     })

@@ -1,0 +1,6 @@
+---
+title: Broken
+---
+ok
+
+{{ nope( }}

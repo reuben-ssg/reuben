@@ -23,6 +23,8 @@ pub enum ErrorKind {
     Script(ScriptError),
     #[error("{0}")]
     Block(BlockError),
+    #[error("config: {0}")]
+    Config(String),
     #[error("file is not valid UTF-8")]
     NotUtf8,
     #[error("builds to {} too, which {} already builds to", file.display(), other.display())]
