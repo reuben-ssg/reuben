@@ -58,6 +58,8 @@ pub struct Site {
     pub pages: Vec<Page>,
     /// Paths relative to `static/`.
     pub static_files: Vec<PathBuf>,
+    /// Non-page files in `content/`, relative to it, with whether a drafted folder hides them.
+    pub content_assets: Vec<(PathBuf, bool)>,
     /// Paths relative to the theme's `static/`, including ones the site overrides.
     pub theme_static_files: Vec<PathBuf>,
     pub config: Config,
@@ -128,12 +130,18 @@ impl Site {
         });
 
         let content = root.join("content");
+        let mut content_assets = Vec::new();
         // Pages without their folder defaults would report misleading missing-title errors, so skip them.
         match dirs::load(&content) {
             Ok(dirs) => {
+                let mut asset_rels = Vec::new();
                 for (path, rel) in walk(&content, &mut errors) {
                     let is_markdown = path.extension().is_some_and(|e| e == "md");
                     if !is_markdown && path.file_name().is_some_and(|n| n == "_dir.toml") {
+                        continue;
+                    }
+                    // Sidecars hold build scripts, which must never be published.
+                    if path.extension().is_some_and(|e| e == "rhai") {
                         continue;
                     }
                     let loaded = if is_markdown {
@@ -143,11 +151,18 @@ impl Site {
                     };
                     match loaded {
                         Ok(Some(page)) => pages.push(page),
-                        Ok(None) => {}
+                        Ok(None) => asset_rels.push(rel),
                         Err(e) => errors.push(e),
                     }
                 }
                 mark_draft_excluded(&mut pages, &dirs);
+                content_assets = asset_rels
+                    .into_iter()
+                    .map(|rel| {
+                        let hidden = asset_drafted(&rel, &pages, &dirs);
+                        (rel, hidden)
+                    })
+                    .collect();
             }
             Err(mut e) => errors.append(&mut e),
         }
@@ -183,6 +198,7 @@ impl Site {
                 root: root.to_path_buf(),
                 pages,
                 static_files,
+                content_assets,
                 theme_static_files,
                 config,
                 engine: Arc::new(engine),
@@ -197,7 +213,7 @@ impl Site {
             .iter()
             .partition(|p| opts.drafts || !p.draft_excluded);
 
-        self.check_collisions(&pages)?;
+        self.check_collisions(&pages, opts.drafts)?;
         prepare_out_dir(&opts.out).map_err(|e| vec![e])?;
 
         let mut errors = Vec::new();
@@ -225,7 +241,7 @@ impl Site {
                 errors.push(Error::new(&dest, e));
             }
         }
-        let statics = self.static_sources();
+        let statics = self.static_sources(opts.drafts);
         for (rel, src) in &statics {
             let dest = opts.out.join(rel);
             let copied = dest
@@ -288,7 +304,8 @@ impl Site {
 
     /// Every file to copy as (path relative to the output, source). Theme files come first and a site file at the
     /// same path replaces one, so only two files within the site can collide.
-    fn static_sources(&self) -> Vec<(PathBuf, PathBuf)> {
+    /// Content assets are included unless a drafted folder hides them and `drafts` is off.
+    fn static_sources(&self, drafts: bool) -> Vec<(PathBuf, PathBuf)> {
         let theme_dir = self.config.theme.as_ref().map(|t| t.join("static"));
         let templated: HashSet<&Path> = self
             .pages
@@ -308,16 +325,29 @@ impl Site {
         let site = self
             .static_files
             .iter()
+            // A static template's sidecar script is source, not an asset.
+            .filter(|rel| {
+                !self
+                    .pages
+                    .iter()
+                    .any(|p| p.from_static && p.rel.with_extension("rhai") == **rel)
+            })
             .map(|rel| (rel.clone(), site_dir.join(rel)));
-        theme.chain(site).collect()
+        let content_dir = self.root.join("content");
+        let assets = self
+            .content_assets
+            .iter()
+            .filter(move |(_, hidden)| drafts || !hidden)
+            .map(move |(rel, _)| (rel.clone(), content_dir.join(rel)));
+        theme.chain(site).chain(assets).collect()
     }
 
     /// Fails if two sources (pages or static files) would write the same output file.
-    fn check_collisions(&self, pages: &[&Page]) -> Result<(), Vec<Error>> {
+    fn check_collisions(&self, pages: &[&Page], drafts: bool) -> Result<(), Vec<Error>> {
         let sources = pages
             .iter()
             .map(|p| (p.route.file.clone(), p.source.clone()))
-            .chain(self.static_sources());
+            .chain(self.static_sources(drafts));
 
         // Keyed case-insensitively: on macOS and Windows `Notes/` and `notes/` are the same directory, and a site
         // that relies on the difference can't be deployed portably anyway.
@@ -459,6 +489,20 @@ fn mark_draft_excluded(pages: &mut [Page], dirs: &DirDefaults) {
     for (page, excluded) in pages.iter_mut().zip(excluded) {
         page.draft_excluded = excluded;
     }
+}
+
+/// Whether a drafted folder (by `_dir.toml` or a draft `index.md`) hides the asset at `rel`.
+fn asset_drafted(rel: &Path, pages: &[Page], dirs: &DirDefaults) -> bool {
+    let dir = rel.parent().unwrap_or(Path::new(""));
+    dirs.folder_drafted(dir)
+        || pages.iter().any(|p| {
+            p.front_matter.draft
+                && !p.from_static
+                && p.rel.file_name().is_some_and(|n| n == "index.md")
+                && p.rel
+                    .parent()
+                    .is_some_and(|d| dir.ancestors().any(|a| a == d))
+        })
 }
 
 /// Creates the output directory, or clears it only if a previous Reuben build created it.

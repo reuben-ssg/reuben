@@ -92,3 +92,84 @@ fn only_html_templates_join_collections() {
     assert!(home.contains("Post A,Post B,"), "{home}");
     assert!(!home.contains("Data"), "{home}");
 }
+
+fn fixture_copy() -> TempDir {
+    let tmp = TempDir::new().unwrap();
+    tmp.copy_from(Path::new(env!("CARGO_MANIFEST_DIR")).join(FIXTURE), &["**"])
+        .unwrap();
+    tmp
+}
+
+fn build_in(tmp: &TempDir, drafts: bool) -> Result<(), Vec<reuben_core::Error>> {
+    Site::load(tmp.path())?
+        .build(&BuildOptions {
+            drafts,
+            out: tmp.path().join("dist"),
+        })
+        .map(|_| ())
+}
+
+#[test]
+fn static_template_sidecar_is_not_published() {
+    let tmp = fixture_copy();
+    tmp.child("static/side.css")
+        .write_str("---\ntitle: S\n---\na { color: {{ accent }}; }\n")
+        .unwrap();
+    tmp.child("static/side.rhai")
+        .write_str("let accent = \"red\";\n")
+        .unwrap();
+    build_in(&tmp, false).unwrap();
+    assert!(dist(&tmp, "side.css").contains("red"));
+    assert!(!tmp.path().join("dist/side.rhai").exists());
+}
+
+#[test]
+fn content_assets_are_copied_verbatim() {
+    let tmp = fixture_copy();
+    let bytes = b"\x89PNG\xff\xfe\x00";
+    tmp.child("content/posts/rye.png")
+        .write_binary(bytes)
+        .unwrap();
+    tmp.child("content/posts/a.rhai")
+        .write_str("let x = 1;")
+        .unwrap();
+    tmp.child("content/_dir.toml").write_str("").unwrap();
+    build_in(&tmp, false).unwrap();
+    assert_eq!(
+        fs::read(tmp.path().join("dist/posts/rye.png")).unwrap(),
+        bytes
+    );
+    assert!(!tmp.path().join("dist/posts/a.rhai").exists());
+    assert!(!tmp.path().join("dist/_dir.toml").exists());
+}
+
+#[test]
+fn content_and_static_asset_collide() {
+    let tmp = fixture_copy();
+    tmp.child("content/posts/rye.png")
+        .write_binary(b"a")
+        .unwrap();
+    tmp.child("static/posts/Rye.png")
+        .write_binary(b"b")
+        .unwrap();
+    let errs = build_in(&tmp, false).unwrap_err();
+    let text = format!("{errs:?}");
+    assert!(text.contains("OutputCollision"), "{text}");
+    assert!(
+        text.contains("rye.png") && text.contains("Rye.png"),
+        "{text}"
+    );
+}
+
+#[test]
+fn assets_in_drafted_folders_need_drafts_flag() {
+    let tmp = fixture_copy();
+    tmp.child("content/wip/_dir.toml")
+        .write_str("draft = true\n")
+        .unwrap();
+    tmp.child("content/wip/pic.png").write_binary(b"x").unwrap();
+    build_in(&tmp, false).unwrap();
+    assert!(!tmp.path().join("dist/wip/pic.png").exists());
+    build_in(&tmp, true).unwrap();
+    assert!(tmp.path().join("dist/wip/pic.png").exists());
+}
