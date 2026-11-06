@@ -10,6 +10,7 @@ pub mod html;
 pub mod markdown;
 pub mod route;
 pub mod site;
+pub mod splice;
 pub mod theme;
 
 pub use error::{Error, ErrorKind};
