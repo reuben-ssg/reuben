@@ -29,15 +29,18 @@ pub fn escape_for(path: &Path) -> Escape {
     }
 }
 
-/// True when the bytes are UTF-8 and, after an optional BOM, start with a `---` or `+++` line.
+/// True when the bytes are UTF-8 and, after an optional BOM, open with a `---` or `+++` line that a later line
+/// closes. An unclosed opener is just a file that happens to start that way, like a YAML document.
 pub fn starts_with_front_matter(bytes: &[u8]) -> bool {
     let Ok(text) = std::str::from_utf8(bytes) else {
         return false;
     };
     let text = text.strip_prefix('\u{feff}').unwrap_or(text);
-    let first = text.split('\n').next().unwrap_or("");
-    let first = first.strip_suffix('\r').unwrap_or(first);
-    first == "---" || first == "+++"
+    let mut lines = text.split('\n').map(|l| l.strip_suffix('\r').unwrap_or(l));
+    match lines.next() {
+        Some(open @ ("---" | "+++")) => lines.any(|l| l == open),
+        _ => false,
+    }
 }
 
 /// Replaces each block placeholder in one pass, so output that happens to look like a placeholder stays literal.
@@ -104,12 +107,22 @@ mod tests {
     use crate::blocks::placeholder;
 
     #[test]
+    fn front_matter_needs_a_closing_delimiter() {
+        assert!(starts_with_front_matter(b"---\ntitle: x\n---\nbody"));
+        assert!(starts_with_front_matter(
+            b"\xef\xbb\xbf+++\r\na = 1\r\n+++\r\n"
+        ));
+        assert!(!starts_with_front_matter(b"---\nopenapi: 3.0.0\n"));
+        assert!(!starts_with_front_matter(b"---\na: 1\n+++\n"));
+    }
+
+    #[test]
     fn front_matter_detection_requires_utf8() {
         assert!(!starts_with_front_matter(b"---\n\xff\n---\n"));
         assert!(starts_with_front_matter(
             b"\xef\xbb\xbf---\ntitle: x\n---\n"
         ));
-        assert!(starts_with_front_matter(b"+++\r\n"));
+        assert!(starts_with_front_matter(b"+++\r\n+++\r\n"));
         assert!(!starts_with_front_matter(b"----\n"));
         assert!(!starts_with_front_matter(b"body { }\n"));
     }

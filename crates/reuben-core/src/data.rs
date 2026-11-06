@@ -11,6 +11,7 @@ use walkdir::WalkDir;
 use crate::error::{Error, ErrorKind};
 use crate::merge::{Layered, toml_to_json};
 use crate::script::ScriptEngine;
+use crate::site::is_junk;
 
 #[derive(Debug, Clone, Default)]
 pub struct SiteData {
@@ -33,9 +34,16 @@ pub fn load(root: &Path, engine: &ScriptEngine, site: &Map) -> Result<SiteData, 
     }
     let mut errors = Vec::new();
     let mut files = Vec::new();
-    for entry in WalkDir::new(&dir).sort_by_file_name() {
+    // Hidden folders are pruned whole, so nothing inside them is read.
+    let visible =
+        |e: &walkdir::DirEntry| e.depth() == 0 || !e.file_name().to_string_lossy().starts_with('.');
+    for entry in WalkDir::new(&dir)
+        .sort_by_file_name()
+        .into_iter()
+        .filter_entry(visible)
+    {
         match entry {
-            Ok(e) if e.file_type().is_file() => files.push(e.into_path()),
+            Ok(e) if e.file_type().is_file() && !is_junk(e.path()) => files.push(e.into_path()),
             Ok(_) => {}
             Err(e) => {
                 let path = e.path().unwrap_or(&dir).to_path_buf();

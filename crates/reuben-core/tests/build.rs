@@ -151,3 +151,23 @@ fn case_only_collision_names_both() {
     assert!(got[0].ends_with("content/Notes.md"), "{got:?}");
     assert!(got[1].ends_with("content/notes/index.md"), "{got:?}");
 }
+
+#[test]
+fn failed_collections_leave_previous_output() {
+    let tmp = TempDir::new().unwrap();
+    tmp.child("content/index.md")
+        .write_str("---\ntitle: H\n---\nhi")
+        .unwrap();
+    tmp.child("content/a/x.md")
+        .write_str("---\ntitle: X\n---\nx")
+        .unwrap();
+    tmp.child("content/b/y.md")
+        .write_str("---\ntitle: Y\n---\ny")
+        .unwrap();
+    build(tmp.path(), false).unwrap();
+    tmp.child("reuben.toml")
+        .write_str("[collections.a]\nname = \"same\"\n[collections.b]\nname = \"same\"\n")
+        .unwrap();
+    assert!(build(tmp.path(), false).is_err());
+    assert!(tmp.path().join("dist/index.html").exists());
+}

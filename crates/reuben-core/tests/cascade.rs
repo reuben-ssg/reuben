@@ -84,3 +84,51 @@ fn dir_toml_is_not_output() {
     assert!(!tmp.path().join("dist/_dir.toml").exists());
     assert!(!tmp.path().join("dist/guide/_dir.toml").exists());
 }
+
+fn site_of(files: &[(&str, &str)]) -> TempDir {
+    let tmp = TempDir::new().unwrap();
+    for (path, text) in files {
+        tmp.child(path).write_str(text).unwrap();
+    }
+    tmp
+}
+
+#[test]
+fn draft_home_page_only_excludes_itself() {
+    let tmp = site_of(&[
+        ("content/index.md", "---\ntitle: H\ndraft: true\n---\nhome"),
+        ("content/about.md", "---\ntitle: A\n---\na"),
+        ("content/posts/a.md", "---\ntitle: P\n---\np"),
+        ("content/img.png", "png"),
+    ]);
+    let report = build(tmp.path(), false).unwrap();
+    assert!(!tmp.path().join("dist/index.html").exists());
+    assert!(tmp.path().join("dist/about/index.html").exists());
+    assert!(tmp.path().join("dist/posts/a/index.html").exists());
+    assert!(tmp.path().join("dist/img.png").exists());
+    assert_eq!(report.drafts_skipped, 1);
+}
+
+#[test]
+fn root_dir_toml_draft_still_drafts_everything() {
+    let tmp = site_of(&[
+        ("content/_dir.toml", "draft = true\n"),
+        ("content/about.md", "---\ntitle: A\n---\na"),
+    ]);
+    let report = build(tmp.path(), false).unwrap();
+    assert_eq!(report.drafts_skipped, 1);
+}
+
+#[test]
+fn page_draft_reflects_inherited_drafting() {
+    let tmp = site_of(&[
+        ("content/old/_dir.toml", "draft = true\n"),
+        (
+            "content/old/p.md",
+            "---\ntitle: P\ndraft: false\n---\n{{ page.draft }}",
+        ),
+    ]);
+    build(tmp.path(), true).unwrap();
+    let html = fs::read_to_string(tmp.path().join("dist/old/p/index.html")).unwrap();
+    assert!(html.contains("true"), "{html}");
+}

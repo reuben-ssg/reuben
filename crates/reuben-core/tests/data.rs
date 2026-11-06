@@ -78,3 +78,26 @@ fn data_script_error_has_location() {
     };
     assert_eq!(s.location.unwrap().line, 2);
 }
+
+#[test]
+fn hidden_and_junk_data_files_are_skipped() {
+    let tmp = TempDir::new().unwrap();
+    tmp.child("data/team.toml").write_str("n = 1\n").unwrap();
+    tmp.child("data/._team.toml")
+        .write_str("\u{0}\u{1}[[")
+        .unwrap();
+    tmp.child("data/.DS_Store").write_str("junk").unwrap();
+    tmp.child("data/.hidden/x.json").write_str("{").unwrap();
+    tmp.child("content/index.md")
+        .write_str("---\ntitle: H\n---\n{{ data.team.n }}")
+        .unwrap();
+    Site::load(tmp.path())
+        .unwrap()
+        .build(&BuildOptions {
+            drafts: false,
+            out: tmp.path().join("dist"),
+        })
+        .unwrap();
+    let html = fs::read_to_string(tmp.path().join("dist/index.html")).unwrap();
+    assert!(html.contains('1'), "{html}");
+}

@@ -42,7 +42,7 @@ pub(crate) fn page_map(page: &Page, config: &Config) -> Result<Map, Error> {
         map.insert(key.as_str().into(), to_dynamic(value).map_err(fail)?);
     }
     map.insert("title".into(), fm.title.clone().into());
-    map.insert("draft".into(), fm.draft.into());
+    map.insert("draft".into(), page.draft_excluded.into());
     map.insert("description".into(), opt(fm.description.clone()));
     map.insert("date".into(), opt(fm.date.clone()));
     map.insert("layout".into(), opt(fm.layout.clone()));

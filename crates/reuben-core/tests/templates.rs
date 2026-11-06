@@ -263,3 +263,75 @@ fn theme_junk_is_not_copied() {
     assert!(dist.join("ok.txt").exists());
     assert!(!dist.join(".DS_Store").exists());
 }
+
+fn site_of(files: &[(&str, &str)]) -> TempDir {
+    let tmp = TempDir::new().unwrap();
+    for (path, text) in files {
+        tmp.child(path).write_str(text).unwrap();
+    }
+    tmp
+}
+
+fn run_build(tmp: &TempDir) -> Result<reuben_core::site::BuildReport, Vec<reuben_core::Error>> {
+    Site::load(tmp.path())?.build(&BuildOptions {
+        drafts: false,
+        out: tmp.path().join("dist"),
+    })
+}
+
+const WRAP: &str = "<html><body>{{ content }}</body></html>";
+
+#[test]
+fn templates_without_their_own_layout_are_not_wrapped() {
+    let tmp = site_of(&[
+        ("layouts/default.html", WRAP),
+        ("content/feed.xml", "---\ntitle: F\n---\n<feed/>"),
+        ("content/p.md", "---\ntitle: P\n---\nhi"),
+        ("static/css/s.css", "---\ntitle: S\n---\nbody{}"),
+    ]);
+    run_build(&tmp).unwrap();
+    assert_eq!(dist(&tmp, "feed.xml"), "<feed/>");
+    assert_eq!(dist(&tmp, "css/s.css"), "body{}");
+    assert!(dist(&tmp, "p/index.html").contains("<html><body>"));
+}
+
+#[test]
+fn dir_layout_never_applies_to_templates() {
+    let tmp = site_of(&[
+        ("layouts/doc.html", "<doc>{{ content }}</doc>"),
+        ("content/docs/_dir.toml", "layout = \"doc\"\n"),
+        ("content/docs/feed.xml", "---\ntitle: F\n---\n<feed/>"),
+        ("content/docs/page.html", "---\ntitle: P\n---\n<p>x</p>"),
+        (
+            "content/docs/named.html",
+            "---\ntitle: N\nlayout: doc\n---\n<p>y</p>",
+        ),
+    ]);
+    run_build(&tmp).unwrap();
+    assert_eq!(dist(&tmp, "docs/feed.xml"), "<feed/>");
+    assert_eq!(dist(&tmp, "docs/page/index.html"), "<p>x</p>");
+    assert_eq!(dist(&tmp, "docs/named/index.html"), "<doc><p>y</p></doc>");
+}
+
+#[test]
+fn yaml_starting_with_dashes_is_copied() {
+    let yaml = "---\nopenapi: 3.0.0\ninfo:\n  title: x\n";
+    let tmp = site_of(&[
+        ("static/api.yaml", yaml),
+        ("content/index.md", "---\ntitle: H\n---\nhi"),
+    ]);
+    run_build(&tmp).unwrap();
+    assert_eq!(dist(&tmp, "api.yaml"), yaml);
+}
+
+#[test]
+fn template_title_is_optional_but_markdown_title_is_not() {
+    let tmp = site_of(&[
+        ("static/s.css", "---\n---\nbody{}"),
+        ("content/index.md", "---\ntitle: H\n---\nhi"),
+    ]);
+    run_build(&tmp).unwrap();
+    assert_eq!(dist(&tmp, "s.css"), "body{}");
+    let tmp = site_of(&[("content/p.md", "---\n---\nhi")]);
+    assert!(Site::load(tmp.path()).is_err());
+}

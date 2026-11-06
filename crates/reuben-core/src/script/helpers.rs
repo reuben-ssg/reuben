@@ -48,7 +48,12 @@ fn format_date(date: &str, fmt: &str) -> RhaiResult<String> {
             .into()
     };
     if let Ok(ts) = date.parse::<jiff::Timestamp>() {
-        return jiff::fmt::strtime::format(fmt, &ts.to_zoned(jiff::tz::TimeZone::UTC))
+        // Format in the offset the author wrote so the shown date is the written one; `Z` is UTC.
+        let offset = jiff::fmt::temporal::Pieces::parse(date)
+            .ok()
+            .and_then(|p| p.to_numeric_offset())
+            .unwrap_or(jiff::tz::Offset::UTC);
+        return jiff::fmt::strtime::format(fmt, &ts.to_zoned(jiff::tz::TimeZone::fixed(offset)))
             .map_err(fail);
     }
     if let Ok(dt) = date.parse::<jiff::civil::DateTime>() {
@@ -172,6 +177,30 @@ mod tests {
         assert_eq!(v.into_string().unwrap(), "March 2024");
         let v = run(&engine, "format_date(\"2024-03-01T10:00:00Z\", \"%Y\")").unwrap();
         assert_eq!(v.into_string().unwrap(), "2024");
+    }
+
+    #[test]
+    fn format_date_keeps_the_offset() {
+        let engine = ScriptEngine::new(Path::new("."));
+        let v = run(
+            &engine,
+            "format_date(\"2024-03-01T01:00:00+02:00\", \"%d\")",
+        )
+        .unwrap();
+        assert_eq!(v.into_string().unwrap(), "01");
+        let v = run(
+            &engine,
+            "format_date(\"2024-03-01T23:30:00-05:00\", \"%Y-%m-%d\")",
+        )
+        .unwrap();
+        assert_eq!(v.into_string().unwrap(), "2024-03-01");
+    }
+
+    #[test]
+    fn format_date_bad_format_names_it() {
+        let engine = ScriptEngine::new(Path::new("."));
+        let err = run(&engine, "format_date(\"2024-03-01\", \"%Q\")").unwrap_err();
+        assert!(err.to_string().contains("%Q"), "{err}");
     }
 
     #[test]

@@ -232,11 +232,12 @@ impl Site {
             .partition(|p| opts.drafts || !p.draft_excluded);
 
         self.check_collisions(&pages, opts.drafts)?;
+        // Anything that can fail before writing runs first, so a failed build leaves the previous output intact.
+        let site_map = page::site_map(&self.config).map_err(|e| vec![e])?;
+        let collections = collections::build(&pages, &self.config)?;
         prepare_out_dir(&opts.out).map_err(|e| vec![e])?;
 
         let mut errors = Vec::new();
-        let site_map = page::site_map(&self.config).map_err(|e| vec![e])?;
-        let collections = collections::build(&pages, &self.config)?;
         let scopes = page::SiteScopes {
             site: &site_map,
             data: &self.data.value,
@@ -338,7 +339,14 @@ impl Site {
             PageKind::Template { escape } => {
                 let (text, scope) =
                     template::render(page, escape, &self.engine, &self.config, scopes)?;
-                (text, scope, page.front_matter.layout.as_deref())
+                // Folder defaults and collection layouts are meant for pages, so only a layout the template names
+                // itself wraps it; otherwise its output is written as-is.
+                let own = page.front_matter_sources.get("layout") == Some(&page.source);
+                let name = page.front_matter.layout.as_deref().filter(|_| own);
+                if name.is_none() {
+                    return Ok(text);
+                }
+                (text, scope, name)
             }
         };
         let layout = layout::find_layout(layout_name, &self.root, self.config.theme.as_deref())
@@ -500,6 +508,18 @@ fn load_page_from(
         d.defaults_for(rel.parent().unwrap_or(Path::new("")))
     });
     merged.merge(raw.value, path);
+    // Only Markdown pages need a title; any other template is named after its file.
+    let untitled = match merged.value.get("title") {
+        None | Some(serde_json::Value::Null) => true,
+        Some(serde_json::Value::String(t)) => t.trim().is_empty(),
+        Some(_) => false,
+    };
+    if matches!(kind, PageKind::Template { .. }) && untitled {
+        let name = rel
+            .file_name()
+            .map_or_else(String::new, |n| n.to_string_lossy().into_owned());
+        merged.value.insert("title".into(), name.into());
+    }
     let front_matter = frontmatter::from_value(merged.value).map_err(|e| Error::new(path, e))?;
     let sidecar = Some(path.with_extension("rhai")).filter(|p| p.is_file());
     let route = match kind {
@@ -527,6 +547,8 @@ fn mark_draft_excluded(pages: &mut [Page], dirs: &DirDefaults) {
         .iter()
         .filter(|p| p.front_matter.draft && p.rel.file_name().is_some_and(|n| n == "index.md"))
         .filter_map(|p| p.rel.parent())
+        // The home page's own `draft` hides only itself.
+        .filter(|d| !d.as_os_str().is_empty())
         .collect();
     let excluded: Vec<bool> = pages
         .iter()
@@ -553,7 +575,7 @@ fn is_static_sidecar(pages: &[Page], static_dir: &Path, rel: &Path) -> bool {
 }
 
 /// OS and editor leftovers that are never published, wherever they sit.
-fn is_junk(rel: &Path) -> bool {
+pub(crate) fn is_junk(rel: &Path) -> bool {
     rel.file_name().is_some_and(|n| {
         let n = n.to_string_lossy();
         n == ".DS_Store" || n == "Thumbs.db" || n.ends_with(".swp") || n.ends_with('~')
@@ -570,7 +592,7 @@ fn asset_drafted(rel: &Path, pages: &[Page], dirs: &DirDefaults) -> bool {
                 && p.rel.file_name().is_some_and(|n| n == "index.md")
                 && p.rel
                     .parent()
-                    .is_some_and(|d| dir.ancestors().any(|a| a == d))
+                    .is_some_and(|d| !d.as_os_str().is_empty() && dir.ancestors().any(|a| a == d))
         })
 }
 
