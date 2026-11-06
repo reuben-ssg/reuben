@@ -7,6 +7,7 @@ use std::process::ExitCode;
 use std::time::Instant;
 
 use clap::{Parser, Subcommand};
+use reuben_core::highlight;
 use reuben_core::site::{BuildOptions, BuildReport, LoadOptions, Site};
 
 /// The tastiest SSG.
@@ -34,6 +35,19 @@ enum Command {
         #[arg(long)]
         env: Option<String>,
     },
+    /// Print stylesheets that go with build output.
+    #[command(subcommand)]
+    Css(CssCommand),
+}
+
+#[derive(Subcommand)]
+enum CssCommand {
+    /// Print CSS for the `hl-` classes used by highlighted code blocks.
+    Highlight {
+        /// Built-in theme name or path to a `.tmTheme` file.
+        #[arg(long, default_value = "base16-ocean.dark")]
+        theme: String,
+    },
 }
 
 fn main() -> ExitCode {
@@ -44,6 +58,16 @@ fn main() -> ExitCode {
             drafts,
             env,
         } => build(root, out, drafts, env),
+        Command::Css(CssCommand::Highlight { theme }) => match highlight::theme_css(&theme) {
+            Ok(css) => {
+                print!("{css}");
+                ExitCode::SUCCESS
+            }
+            Err(e) => {
+                eprintln!("error: {e}");
+                ExitCode::FAILURE
+            }
+        },
     }
 }
 

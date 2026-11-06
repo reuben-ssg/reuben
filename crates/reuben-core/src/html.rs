@@ -6,16 +6,19 @@ use std::collections::HashMap;
 use std::fmt::Write;
 
 use crate::doc::{Alignment, Document, Node, NodeKind};
+use crate::highlight::{Highlighter, default_highlighter};
 
-/// Footnote bookkeeping the writer needs across the tree: how many times each footnote is referenced (for the
-/// backrefs) and how many references to each it has written so far (for repeated reference ids).
-struct Footnotes {
+/// State the writer needs across the tree: the code highlighter, and footnote bookkeeping (how many times each footnote is referenced (for the
+/// times each footnote is referenced, for the backrefs, and how many references to each it has written so far,
+/// for repeated reference ids).
+struct Footnotes<'a> {
+    highlighter: &'a dyn Highlighter,
     totals: HashMap<usize, u32>,
     written: RefCell<HashMap<usize, u32>>,
 }
 
-impl Footnotes {
-    fn of(doc: &Document) -> Self {
+impl<'a> Footnotes<'a> {
+    fn of(doc: &Document, highlighter: &'a dyn Highlighter) -> Self {
         fn walk(node: &Node, totals: &mut HashMap<usize, u32>) {
             if let NodeKind::FootnoteReference { index, .. } = node.kind {
                 *totals.entry(index).or_default() += 1;
@@ -25,6 +28,7 @@ impl Footnotes {
         let mut totals = HashMap::new();
         walk(doc, &mut totals);
         Footnotes {
+            highlighter,
             totals,
             written: RefCell::default(),
         }
@@ -33,8 +37,13 @@ impl Footnotes {
 
 /// Renders a page body. Output follows the CommonMark reference renderer's layout.
 pub fn render(doc: &Document) -> String {
+    render_with(doc, default_highlighter())
+}
+
+/// Like [`render`], with a caller-supplied code highlighter.
+pub fn render_with(doc: &Document, highlighter: &dyn Highlighter) -> String {
     let mut out = String::new();
-    block(&mut out, doc, false, &Footnotes::of(doc));
+    block(&mut out, doc, false, &Footnotes::of(doc, highlighter));
     out
 }
 
@@ -127,7 +136,14 @@ fn block(out: &mut String, node: &Node, tight: bool, fns: &Footnotes) {
                 let _ = write!(out, " class=\"language-{}\"", escape_attr(lang));
             }
             out.push('>');
-            out.push_str(&escape_text(literal));
+            let highlighted = info
+                .split_whitespace()
+                .next()
+                .and_then(|lang| fns.highlighter.highlight(lang, literal));
+            match highlighted {
+                Some(html) => out.push_str(&html),
+                None => out.push_str(&escape_text(literal)),
+            }
             out.push_str("</code></pre>\n");
         }
         NodeKind::BlockQuote => {
@@ -396,12 +412,25 @@ mod tests {
     }
 
     #[test]
-    fn code_block_language_class() {
-        let d = crate::markdown::parse("```rust\nlet x = 1 < 2;\n```\n", 1);
+    fn code_block_uses_highlighter() {
+        let d = crate::markdown::parse("```rust\nfn a() {}\n```\n", 1);
+        assert!(render(&d).contains("<pre><code class=\"language-rust\"><span class=\"hl-"));
+    }
+
+    #[test]
+    fn unknown_language_stays_plain() {
+        let d = crate::markdown::parse("```rhai\nlet x = 1 < 2;\n```\n", 1);
         assert_eq!(
             render(&d),
-            "<pre><code class=\"language-rust\">let x = 1 &lt; 2;\n</code></pre>\n"
+            "<pre><code class=\"language-rhai\">let x = 1 &lt; 2;\n</code></pre>\n"
         );
+    }
+
+    #[test]
+    fn code_block_language_class() {
+        let html = render(&crate::markdown::parse("```rust\nlet x = 1 < 2;\n```\n", 1));
+        assert!(html.starts_with("<pre><code class=\"language-rust\"><span class=\"hl-"));
+        assert!(html.contains("&lt;"));
     }
 
     #[test]

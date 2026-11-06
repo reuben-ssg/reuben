@@ -11,6 +11,7 @@ pub mod doc;
 pub mod error;
 pub mod frontmatter;
 pub mod headings;
+pub mod highlight;
 pub mod html;
 pub mod layout;
 pub mod markdown;
