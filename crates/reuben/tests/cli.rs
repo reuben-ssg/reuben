@@ -49,3 +49,16 @@ fn build_failure_exits_1_and_names_file() {
         .stderr(predicates::str::contains("no-title.md"))
         .stderr(predicates::str::contains("title"));
 }
+
+#[test]
+fn script_error_shows_snippet() {
+    let tmp = fixture("scripted");
+    reuben()
+        .args(["build", "--root"])
+        .arg(tmp.path())
+        .assert()
+        .code(1)
+        .stderr(predicates::str::contains("broken.md:6:"))
+        .stderr(predicates::str::contains("{{ nope( }}"))
+        .stderr(predicates::str::contains("^"));
+}

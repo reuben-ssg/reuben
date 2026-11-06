@@ -1,5 +1,7 @@
 #![forbid(unsafe_code)]
 
+mod diagnostic;
+
 use std::path::PathBuf;
 use std::process::ExitCode;
 use std::time::Instant;
@@ -54,7 +56,8 @@ fn build(root: PathBuf, out: Option<PathBuf>, drafts: bool) -> ExitCode {
         }
         Err(errors) => {
             for e in errors {
-                eprintln!("error: {e}");
+                let source = std::fs::read_to_string(&e.path).ok();
+                eprint!("{}", diagnostic::render(&e, source.as_deref()));
             }
             ExitCode::FAILURE
         }
