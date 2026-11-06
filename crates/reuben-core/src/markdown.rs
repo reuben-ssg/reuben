@@ -52,7 +52,10 @@ fn convert<'a>(node: &'a AstNode<'a>, line_offset: usize, options: &Options) -> 
     let kind = match &ast.value {
         NodeValue::Document => NodeKind::Document,
         NodeValue::Paragraph => NodeKind::Paragraph,
-        NodeValue::Heading(h) => NodeKind::Heading { level: h.level },
+        NodeValue::Heading(h) => NodeKind::Heading {
+            level: h.level,
+            id: String::new(),
+        },
         NodeValue::Text(t) => NodeKind::Text(t.to_string()),
         NodeValue::Emph => NodeKind::Emphasis,
         NodeValue::Strong => NodeKind::Strong,
@@ -160,7 +163,13 @@ mod tests {
     #[test]
     fn heading_and_paragraph_with_spans() {
         let d = parse("# Title\n\nHello *you*.\n", 4);
-        assert_eq!(d.children[0].kind, NodeKind::Heading { level: 1 });
+        assert_eq!(
+            d.children[0].kind,
+            NodeKind::Heading {
+                level: 1,
+                id: String::new()
+            }
+        );
         assert_eq!(d.children[0].span, Span { line: 4, column: 1 });
         assert_eq!(d.children[1].kind, NodeKind::Paragraph);
         assert_eq!(d.children[1].span.line, 6);

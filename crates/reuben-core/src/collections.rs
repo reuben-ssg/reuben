@@ -63,16 +63,7 @@ pub fn summary(page: &Page) -> String {
     else {
         return String::new();
     };
-    let mut text = String::new();
-    let mut in_placeholder = false;
-    for c in plain_text(paragraph).chars() {
-        match c {
-            '\u{E000}' => in_placeholder = true,
-            '\u{E001}' => in_placeholder = false,
-            _ if !in_placeholder => text.push(c),
-            _ => {}
-        }
-    }
+    let text = blocks::strip_placeholders(&plain_text(paragraph));
     text.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 

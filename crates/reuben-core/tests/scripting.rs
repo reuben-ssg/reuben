@@ -30,7 +30,10 @@ fn page_blocks_render() {
     fs::remove_file(tmp.path().join("content/broken.md")).unwrap();
     build(tmp.path()).unwrap();
     let html = fs::read_to_string(tmp.path().join("dist/index.html")).unwrap();
-    assert!(html.contains("<h1>Home by Nick</h1>"), "{html}");
+    assert!(
+        html.contains("<h1 id=\"home-by-nick\">Home by Nick</h1>"),
+        "{html}"
+    );
     assert!(html.contains("Tags: 2"), "{html}");
     assert!(
         html.contains("<a class=\"card\" href=\"/about/\">About</a>"),

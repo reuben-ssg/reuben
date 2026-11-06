@@ -110,9 +110,13 @@ fn block(out: &mut String, node: &Node, tight: bool, fns: &Footnotes) {
             inlines(out, node, fns);
             out.push_str("</p>\n");
         }
-        NodeKind::Heading { level } => {
+        NodeKind::Heading { level, id } => {
             cr(out);
-            let _ = write!(out, "<h{level}>");
+            if id.is_empty() {
+                let _ = write!(out, "<h{level}>");
+            } else {
+                let _ = write!(out, "<h{level} id=\"{}\">", escape_attr(id));
+            }
             inlines(out, node, fns);
             let _ = writeln!(out, "</h{level}>");
         }

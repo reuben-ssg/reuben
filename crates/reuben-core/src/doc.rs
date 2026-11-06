@@ -20,8 +20,10 @@ pub struct Node {
 pub enum NodeKind {
     Document,
     Paragraph,
+    /// `id` is empty until `headings::assign_ids` runs on the final tree.
     Heading {
         level: u8,
+        id: String,
     },
     Text(String),
     Emphasis,
