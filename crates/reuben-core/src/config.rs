@@ -82,8 +82,10 @@ pub fn load(root: &Path, env: Option<&str>) -> Result<Config, Error> {
         merge_layer(&mut layered, &root.join(format!("reuben.{env}.toml")))?;
     }
 
-    let raw: Raw = serde_json::from_value(Value::Object(layered.value))
-        .map_err(|e| Error::new(&path, ErrorKind::Config(e.to_string())))?;
+    let raw: Raw = serde_json::from_value(Value::Object(layered.value.clone())).map_err(|e| {
+        let blamed = blame(&layered, &e.to_string()).unwrap_or_else(|| path.clone());
+        Error::new(blamed, ErrorKind::Config(e.to_string()))
+    })?;
     let theme = raw.theme.map(|t| root.join(t));
     if let Some(theme) = &theme
         && !theme.is_dir()
@@ -104,6 +106,29 @@ pub fn load(root: &Path, env: Option<&str>) -> Result<Config, Error> {
     })
 }
 
+/// Finds the file that set the key an "unknown field" error names, at the top level or inside a collection table.
+fn blame(layered: &Layered, message: &str) -> Option<PathBuf> {
+    let key = message.strip_prefix("unknown field `")?.split('`').next()?;
+    let dotted = if layered.value.contains_key(key) {
+        key.to_string()
+    } else {
+        let folder = layered
+            .value
+            .get("collections")?
+            .as_object()?
+            .iter()
+            .find(|(_, table)| table.get(key).is_some())?
+            .0;
+        format!("collections.{folder}.{key}")
+    };
+    let nested = format!("{dotted}.");
+    layered
+        .sources
+        .iter()
+        .find(|(k, _)| **k == dotted || k.starts_with(&nested))
+        .map(|(_, file)| file.clone())
+}
+
 fn merge_layer(layered: &mut Layered, file: &Path) -> Result<(), Error> {
     if let Some(layer) = read_layer(file)? {
         if layer.contains_key("include") {
@@ -120,9 +145,13 @@ fn merge_layer(layered: &mut Layered, file: &Path) -> Result<(), Error> {
 /// Matches are sorted by path so merge order doesn't depend on the filesystem.
 fn expand_glob(root: &Path, pattern: &str, config: &Path) -> Result<Vec<PathBuf>, Error> {
     let bad = |msg: String| Error::new(config, ErrorKind::Config(msg));
-    let full = root.join(pattern);
-    let paths = glob::glob(&full.to_string_lossy())
-        .map_err(|e| bad(format!("invalid include glob `{pattern}`: {e}")))?;
+    // Only the user's pattern is a glob; the root may contain `[` or `*`.
+    let full = format!(
+        "{}/{pattern}",
+        glob::Pattern::escape(&root.to_string_lossy())
+    );
+    let paths =
+        glob::glob(&full).map_err(|e| bad(format!("invalid include glob `{pattern}`: {e}")))?;
     let mut files = Vec::new();
     for entry in paths {
         let file = entry.map_err(|e| bad(format!("reading include `{pattern}`: {e}")))?;
@@ -247,6 +276,45 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         write(&tmp, "reuben.toml", "[collections.blog]\nsrot = \"date\"\n");
         let err = load(tmp.path(), None).unwrap_err();
+        assert!(err.to_string().contains("srot"), "{err}");
+    }
+
+    #[test]
+    fn glob_metacharacters_in_the_root_are_literal() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.child("my[site]");
+        root.create_dir_all().unwrap();
+        root.child("reuben.toml")
+            .write_str("include = [\"config/*.toml\"]\n")
+            .unwrap();
+        root.child("config/1.toml")
+            .write_str("[params]\na = 1\n")
+            .unwrap();
+        let c = load(root.path(), None).unwrap();
+        assert_eq!(c.params["a"].as_integer(), Some(1));
+    }
+
+    #[test]
+    fn unknown_key_in_included_file_blames_that_file() {
+        let tmp = TempDir::new().unwrap();
+        write(&tmp, "reuben.toml", "include = [\"config/*.toml\"]\n");
+        write(&tmp, "config/1.toml", "titel = \"x\"\n");
+        let err = load(tmp.path(), None).unwrap_err();
+        assert!(err.path.ends_with("config/1.toml"), "{err}");
+        assert!(err.to_string().contains("titel"), "{err}");
+    }
+
+    #[test]
+    fn unknown_collection_key_in_env_file_blames_that_file() {
+        let tmp = TempDir::new().unwrap();
+        write(&tmp, "reuben.toml", "title = \"A\"\n");
+        write(
+            &tmp,
+            "reuben.production.toml",
+            "[collections.blog]\nsrot = \"date\"\n",
+        );
+        let err = load(tmp.path(), Some("production")).unwrap_err();
+        assert!(err.path.ends_with("reuben.production.toml"), "{err}");
         assert!(err.to_string().contains("srot"), "{err}");
     }
 
