@@ -3,6 +3,8 @@
 use serde::Deserialize;
 use serde_json::{Map, Value};
 
+use crate::merge::toml_to_json;
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct FrontMatter {
     pub title: String,
@@ -47,6 +49,8 @@ pub enum FrontMatterError {
     Yaml(String),
     #[error("invalid TOML: {0}")]
     Toml(String),
+    #[error("invalid front matter: {0}")]
+    Invalid(String),
     #[error("`title` is required")]
     MissingTitle,
 }
@@ -57,7 +61,25 @@ enum Format {
     Toml,
 }
 
+/// Front matter as an untyped map, before folder defaults are layered under it.
+#[derive(Debug, PartialEq)]
+pub struct RawParsed<'a> {
+    pub value: Map<String, Value>,
+    pub body: &'a str,
+    /// 1-based line in the original file where `body` starts.
+    pub body_line: usize,
+}
+
 pub fn parse(src: &str) -> Result<Parsed<'_>, FrontMatterError> {
+    let raw = parse_raw(src)?;
+    Ok(Parsed {
+        front_matter: from_value(raw.value)?,
+        body: raw.body,
+        body_line: raw.body_line,
+    })
+}
+
+pub fn parse_raw(src: &str) -> Result<RawParsed<'_>, FrontMatterError> {
     let src = src.strip_prefix('\u{feff}').unwrap_or(src);
     let mut lines = LineIter { src, pos: 0 };
 
@@ -73,9 +95,9 @@ pub fn parse(src: &str) -> Result<Parsed<'_>, FrontMatterError> {
     for (line, line_start) in lines.by_ref() {
         line_no += 1;
         if line == delimiter {
-            let front_matter = deserialize(&src[start..line_start], format)?;
-            return Ok(Parsed {
-                front_matter,
+            let value = to_map(&src[start..line_start], format)?;
+            return Ok(RawParsed {
+                value,
                 body: &src[lines.pos..],
                 body_line: line_no + 1,
             });
@@ -108,20 +130,30 @@ impl<'a> Iterator for LineIter<'a> {
     }
 }
 
-fn deserialize(text: &str, format: Format) -> Result<FrontMatter, FrontMatterError> {
+fn to_map(text: &str, format: Format) -> Result<Map<String, Value>, FrontMatterError> {
     let err = |e: String| match format {
         Format::Yaml => FrontMatterError::Yaml(e),
         Format::Toml => FrontMatterError::Toml(e),
     };
     let value = match format {
-        Format::Yaml => serde_saphyr::from_str::<Value>(text).map_err(|e| err(e.to_string()))?,
+        Format::Yaml => serde_saphyr::from_str_with_options::<Value>(
+            text,
+            serde_saphyr::options! { strict_booleans: true },
+        )
+        .map_err(|e| err(e.to_string()))?,
         Format::Toml => toml_to_json(toml::from_str(text).map_err(|e| err(e.to_string()))?),
     };
-    let value = match value {
-        Value::Null => Value::Object(Map::new()),
-        v => v,
-    };
-    let raw: RawFrontMatter = serde_json::from_value(value).map_err(|e| err(e.to_string()))?;
+    match value {
+        Value::Null => Ok(Map::new()),
+        Value::Object(map) => Ok(map),
+        _ => Err(err("front matter must be a mapping".to_string())),
+    }
+}
+
+/// Types a merged map. The title check lives here so a title supplied only by a folder's `_dir.toml` counts.
+pub fn from_value(value: Map<String, Value>) -> Result<FrontMatter, FrontMatterError> {
+    let raw: RawFrontMatter = serde_json::from_value(Value::Object(value))
+        .map_err(|e| FrontMatterError::Invalid(e.to_string()))?;
     Ok(FrontMatter {
         title: raw
             .title
@@ -134,21 +166,6 @@ fn deserialize(text: &str, format: Format) -> Result<FrontMatter, FrontMatterErr
         weight: raw.weight,
         extra: raw.extra,
     })
-}
-
-/// TOML dates become strings, matching how YAML dates arrive, so `date` works the same in both formats.
-fn toml_to_json(value: toml::Value) -> Value {
-    match value {
-        toml::Value::String(s) => Value::String(s),
-        toml::Value::Integer(i) => Value::from(i),
-        toml::Value::Float(f) => Value::from(f),
-        toml::Value::Boolean(b) => Value::Bool(b),
-        toml::Value::Datetime(d) => Value::String(d.to_string()),
-        toml::Value::Array(a) => Value::Array(a.into_iter().map(toml_to_json).collect()),
-        toml::Value::Table(t) => {
-            Value::Object(t.into_iter().map(|(k, v)| (k, toml_to_json(v))).collect())
-        }
-    }
 }
 
 #[cfg(test)]
@@ -209,6 +226,45 @@ mod tests {
             parse("---\ntitle: [\n---\n"),
             Err(FrontMatterError::Yaml(_))
         ));
+    }
+}
+
+#[cfg(test)]
+mod raw_tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn yaml_only_treats_true_and_false_as_booleans() {
+        let p = parse("---\ntitle: No\ntags: [on, off]\n---\n").unwrap();
+        assert_eq!(p.front_matter.title, "No");
+        assert_eq!(p.front_matter.extra["tags"], json!(["on", "off"]));
+    }
+
+    #[test]
+    fn parse_raw_does_not_validate() {
+        let raw = parse_raw("---\ndraft: true\n---\nBody\n").unwrap();
+        assert_eq!(raw.value["draft"], json!(true));
+        assert!(!raw.value.contains_key("title"));
+        assert_eq!(raw.body, "Body\n");
+        assert_eq!(raw.body_line, 4);
+    }
+
+    #[test]
+    fn from_value_requires_a_title() {
+        let map = |v: Value| v.as_object().unwrap().clone();
+        assert!(matches!(
+            from_value(map(json!({"draft": true}))),
+            Err(FrontMatterError::MissingTitle)
+        ));
+        let fm = from_value(map(json!({"title": "Hi"}))).unwrap();
+        assert_eq!(fm.title, "Hi");
+    }
+
+    #[test]
+    fn from_value_rejects_wrong_types() {
+        let map = json!({"title": 5}).as_object().unwrap().clone();
+        assert!(matches!(from_value(map), Err(FrontMatterError::Invalid(_))));
     }
 }
 

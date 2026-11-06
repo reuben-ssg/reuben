@@ -3,18 +3,24 @@
 #![forbid(unsafe_code)]
 
 pub mod blocks;
+pub mod collections;
 pub mod config;
+pub mod data;
+pub mod dirs;
 pub mod doc;
 pub mod error;
 pub mod frontmatter;
 pub mod html;
 pub mod layout;
 pub mod markdown;
+pub mod merge;
 pub mod page;
 pub mod route;
 pub mod script;
 pub mod site;
+pub mod sitemap;
 pub mod splice;
+pub mod template;
 pub mod theme;
 
 pub use error::{Error, ErrorKind};

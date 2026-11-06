@@ -38,10 +38,40 @@ pub fn route_for_page(rel: &Path) -> Route {
     Route { url, file }
 }
 
+/// Routes a template from its path relative to `content/` or `static/`. `.html` follows the page rules and every
+/// other extension keeps its path.
+pub fn route_for_template(rel: &Path) -> Route {
+    if rel.extension().is_some_and(|e| e == "html") {
+        return route_for_page(rel);
+    }
+    let parts: Vec<String> = rel
+        .components()
+        .map(|c| c.as_os_str().to_string_lossy().into_owned())
+        .collect();
+    Route {
+        url: format!("/{}", parts.join("/")),
+        file: rel.to_path_buf(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::path::Path;
+
+    #[test]
+    fn template_routes() {
+        let route = |p: &str| route_for_template(Path::new(p));
+        let r = |url: &str, file: &str| Route {
+            url: url.into(),
+            file: file.into(),
+        };
+        assert_eq!(route("about.html"), r("/about/", "about/index.html"));
+        assert_eq!(route("index.html"), r("/", "index.html"));
+        assert_eq!(route("a/index.html"), r("/a/", "a/index.html"));
+        assert_eq!(route("feed.xml"), r("/feed.xml", "feed.xml"));
+        assert_eq!(route("a/b/s.json"), r("/a/b/s.json", "a/b/s.json"));
+    }
 
     #[test]
     fn routes() {

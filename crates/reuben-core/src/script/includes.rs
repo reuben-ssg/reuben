@@ -90,6 +90,7 @@ mod tests {
     use crate::error::ErrorKind;
     use crate::script::ScriptError;
     use crate::splice::Output;
+    use crate::template::Escape;
 
     fn fixture(name: &str) -> PathBuf {
         Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -110,7 +111,7 @@ mod tests {
                 column: 4,
             },
         };
-        engine.eval_block(&mut scope, &block, Path::new("page.md"))
+        engine.eval_block(&mut scope, &block, Path::new("page.md"), Escape::Html)
     }
 
     #[test]

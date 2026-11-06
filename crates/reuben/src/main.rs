@@ -7,7 +7,7 @@ use std::process::ExitCode;
 use std::time::Instant;
 
 use clap::{Parser, Subcommand};
-use reuben_core::site::{BuildOptions, BuildReport, Site};
+use reuben_core::site::{BuildOptions, BuildReport, LoadOptions, Site};
 
 /// The tastiest SSG.
 #[derive(Parser)]
@@ -30,28 +30,39 @@ enum Command {
         /// Include pages marked `draft: true`.
         #[arg(long)]
         drafts: bool,
+        /// Merge `reuben.<name>.toml` over `reuben.toml` if it exists.
+        #[arg(long)]
+        env: Option<String>,
     },
 }
 
 fn main() -> ExitCode {
     match Cli::parse().command {
-        Command::Build { root, out, drafts } => build(root, out, drafts),
+        Command::Build {
+            root,
+            out,
+            drafts,
+            env,
+        } => build(root, out, drafts, env),
     }
 }
 
-fn build(root: PathBuf, out: Option<PathBuf>, drafts: bool) -> ExitCode {
+fn build(root: PathBuf, out: Option<PathBuf>, drafts: bool, env: Option<String>) -> ExitCode {
     let started = Instant::now();
     let opts = BuildOptions {
         drafts,
         out: out.unwrap_or_else(|| root.join("dist")),
     };
-    match Site::load(&root).and_then(|site| site.build(&opts)) {
+    match Site::load_with(&root, &LoadOptions { env }).and_then(|site| site.build(&opts)) {
         Ok(report) => {
             println!(
                 "{} in {}ms",
                 summary(&report),
                 started.elapsed().as_millis()
             );
+            for w in &report.warnings {
+                eprintln!("warning: {w}");
+            }
             ExitCode::SUCCESS
         }
         Err(errors) => {

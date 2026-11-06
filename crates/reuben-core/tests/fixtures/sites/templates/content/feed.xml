@@ -1,0 +1,4 @@
+---
+title: Feed
+---
+<rss>{{ collections.posts.map(|p| "<item>" + p.title + "</item>") }}</rss>
