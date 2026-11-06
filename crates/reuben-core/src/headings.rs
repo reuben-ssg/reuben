@@ -92,6 +92,7 @@ fn walk(node: &mut Node, ids: &mut Ids, toc: &mut Vec<TocEntry>) {
 fn collect(node: &Node, s: &mut String) {
     match &node.kind {
         NodeKind::Text(t) | NodeKind::Code(t) => s.push_str(t),
+        NodeKind::Math { latex, .. } => s.push_str(latex),
         NodeKind::SoftBreak | NodeKind::LineBreak => s.push(' '),
         NodeKind::HtmlInline(h) | NodeKind::Raw(h) => s.push_str(&decode(&strip_tags(h))),
         _ => node.children.iter().for_each(|c| collect(c, s)),

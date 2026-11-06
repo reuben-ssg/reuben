@@ -12,6 +12,7 @@ pub(crate) fn options() -> Options<'static> {
     options.extension.autolink = true;
     options.extension.tasklist = true;
     options.extension.footnotes = true;
+    options.extension.math_dollars = true;
     options.parse.smart = true;
     options.render.r#unsafe = true;
     options
@@ -111,6 +112,11 @@ fn convert<'a>(node: &'a AstNode<'a>, line_offset: usize, options: &Options) -> 
         NodeValue::FootnoteDefinition(d) => NodeKind::FootnoteDefinition {
             label: d.name.clone(),
             index: 0,
+        },
+        NodeValue::Math(m) => NodeKind::Math {
+            display: m.display_math,
+            // A `$$` block's literal keeps the newlines around the formula.
+            latex: m.literal.trim().to_string(),
         },
         _ => {
             drop(ast);
@@ -268,6 +274,44 @@ mod tests {
                 label: "x".into(),
                 index: 1
             }
+        );
+    }
+
+    fn math_nodes(n: &Node, out: &mut Vec<NodeKind>) {
+        if matches!(n.kind, NodeKind::Math { .. }) {
+            out.push(n.kind.clone());
+        }
+        n.children.iter().for_each(|c| math_nodes(c, out));
+    }
+
+    #[test]
+    fn dollars_in_prose_stay_text() {
+        let mut found = Vec::new();
+        let d = parse("costs $5 and $10\n", 1);
+        math_nodes(&d, &mut found);
+        assert!(found.is_empty());
+        assert_eq!(crate::html::render(&d), "<p>costs $5 and $10</p>\n");
+        let d = parse("\\$100 and $ x $\n", 1);
+        math_nodes(&d, &mut found);
+        assert!(found.is_empty());
+    }
+
+    #[test]
+    fn math_nodes_parse() {
+        let mut found = Vec::new();
+        math_nodes(&parse("$a$ and\n\n$$\nb\n$$\n", 1), &mut found);
+        assert_eq!(
+            found,
+            vec![
+                NodeKind::Math {
+                    display: false,
+                    latex: "a".into()
+                },
+                NodeKind::Math {
+                    display: true,
+                    latex: "b".into()
+                },
+            ]
         );
     }
 

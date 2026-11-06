@@ -12,6 +12,7 @@ pub fn render(error: &Error, source: Option<&str>) -> String {
             None => return plain(error),
         },
         ErrorKind::Block(e) => (&e.message, e.span, &[]),
+        ErrorKind::Math { message, location } => (message, *location, &[]),
         _ => return plain(error),
     };
     let width = span.line.to_string().len();
@@ -62,6 +63,21 @@ mod tests {
         assert_eq!(
             render(&err, Some("a\nb\n{{ nope( }}\n")),
             "error: unexpected end of input\n  --> site/content/broken.md:3:4\n  |\n3 | {{ nope( }}\n  |    ^\n"
+        );
+    }
+
+    #[test]
+    fn renders_math_errors_with_snippet() {
+        let err = Error::new(
+            "content/m.md",
+            ErrorKind::Math {
+                message: "bad".into(),
+                location: Span { line: 2, column: 1 },
+            },
+        );
+        assert_eq!(
+            render(&err, Some("a\n$\\frac{1}{$\n")),
+            "error: bad\n  --> content/m.md:2:1\n  |\n2 | $\\frac{1}{$\n  | ^\n"
         );
     }
 

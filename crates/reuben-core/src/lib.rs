@@ -14,6 +14,7 @@ pub mod headings;
 pub mod html;
 pub mod layout;
 pub mod markdown;
+pub mod math;
 pub mod merge;
 pub mod page;
 pub mod route;

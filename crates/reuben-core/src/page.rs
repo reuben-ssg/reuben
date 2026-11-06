@@ -10,6 +10,7 @@ use crate::doc::Document;
 use crate::error::{Error, ErrorKind};
 use crate::headings;
 use crate::markdown;
+use crate::math;
 use crate::script::ScriptEngine;
 use crate::site::{Page, PageKind};
 use crate::splice::{self, Output};
@@ -150,7 +151,16 @@ pub fn render_body(
         return Err(errors);
     }
     splice::splice(&mut doc, &outputs);
+    // Ids are assigned first so a heading's slug reads its LaTeX, not the MathML's annotation.
     let toc = headings::toc_array(&headings::assign_ids(&mut doc));
+    math::render_math(&mut doc).map_err(|errors| {
+        errors
+            .into_iter()
+            .map(|(location, message)| {
+                Error::new(&page.source, ErrorKind::Math { message, location })
+            })
+            .collect::<Vec<_>>()
+    })?;
 
     // Constants can't be reassigned, so the layout's `page` is swapped for a copy carrying the final toc.
     if let Some(mut page_map) = scope.get_value::<Map>("page") {

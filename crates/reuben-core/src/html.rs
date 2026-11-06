@@ -351,6 +351,11 @@ fn inline(out: &mut String, node: &Node, fns: &Footnotes) {
         }
         NodeKind::SoftBreak => out.push('\n'),
         NodeKind::LineBreak => out.push_str("<br />\n"),
+        // `math::render_math` normally replaces these first; this keeps the source visible if it didn't run.
+        NodeKind::Math { display, latex } => {
+            let d = if *display { "$$" } else { "$" };
+            let _ = write!(out, "{d}{}{d}", escape_text(latex));
+        }
         NodeKind::HtmlInline(html) | NodeKind::Raw(html) => out.push_str(html),
         _ => block(out, node, false, fns),
     }

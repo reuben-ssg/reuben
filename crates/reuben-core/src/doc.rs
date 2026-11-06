@@ -75,6 +75,11 @@ pub enum NodeKind {
         label: String,
         index: usize,
     },
+    /// Becomes `Raw` MathML in `math::render_math`.
+    Math {
+        display: bool,
+        latex: String,
+    },
     /// Already-rendered HTML for a construct the tree doesn't model yet, so nothing is dropped.
     Raw(String),
 }

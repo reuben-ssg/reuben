@@ -15,6 +15,7 @@ serde-saphyr.workspace = true
 toml.workspace = true
 thiserror.workspace = true
 comrak.workspace = true
+pulldown-latex.workspace = true
 rhai.workspace = true
 walkdir.workspace = true
 glob.workspace = true
