@@ -2,7 +2,9 @@
 
 #![forbid(unsafe_code)]
 
+pub mod doc;
 pub mod error;
 pub mod frontmatter;
+pub mod markdown;
 
 pub use error::{Error, ErrorKind};
