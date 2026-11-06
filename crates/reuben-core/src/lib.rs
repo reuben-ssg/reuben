@@ -18,6 +18,7 @@ pub mod page;
 pub mod route;
 pub mod script;
 pub mod site;
+pub mod sitemap;
 pub mod splice;
 pub mod template;
 pub mod theme;

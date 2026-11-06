@@ -16,7 +16,9 @@ use crate::dirs::{self, DirDefaults};
 use crate::error::{Error, ErrorKind};
 use crate::frontmatter::{self, FrontMatter};
 use crate::route::{Route, route_for_page, route_for_template};
+use crate::script::helpers::url_for;
 use crate::script::{Html, ScriptEngine};
+use crate::sitemap;
 use crate::template::{self, Escape};
 use crate::theme::{PageShell, builtin_page};
 use crate::{html, layout, page, splice};
@@ -83,6 +85,7 @@ pub struct BuildReport {
     pub pages_written: usize,
     pub static_copied: usize,
     pub drafts_skipped: usize,
+    pub warnings: Vec<String>,
 }
 
 impl Site {
@@ -104,6 +107,7 @@ impl Site {
         };
         let mut engine = ScriptEngine::new(root);
         if let Some(config) = &config {
+            engine.set_base_url(&config.base_url);
             let dirs: Vec<PathBuf> = config
                 .theme
                 .iter()
@@ -267,6 +271,36 @@ impl Site {
             }
         }
 
+        let mut warnings = Vec::new();
+        if self.config.sitemap && !self.user_provides_sitemap(&pages, &statics) {
+            if self.config.base_url.starts_with("http://")
+                || self.config.base_url.starts_with("https://")
+            {
+                let mut urls: Vec<String> = pages
+                    .iter()
+                    .filter(|p| {
+                        p.route.url != "/404.html"
+                            && match p.kind {
+                                PageKind::Markdown => true,
+                                PageKind::Template { .. } => {
+                                    p.route.file.extension().is_some_and(|e| e == "html")
+                                }
+                            }
+                    })
+                    .map(|p| url_for(&self.config.base_url, &p.route.url))
+                    .collect();
+                urls.sort();
+                let dest = opts.out.join("sitemap.xml");
+                if let Err(e) = write(&dest, sitemap::render(&urls).as_bytes()) {
+                    errors.push(Error::new(&dest, e));
+                }
+            } else {
+                warnings.push(
+                    "sitemap.xml skipped: base_url must be absolute (http:// or https://)".into(),
+                );
+            }
+        }
+
         if !errors.is_empty() {
             return Err(errors);
         }
@@ -274,7 +308,15 @@ impl Site {
             pages_written: pages.len(),
             static_copied: statics.len(),
             drafts_skipped: drafts.len(),
+            warnings,
         })
+    }
+
+    /// A page or copied file that already writes `sitemap.xml` (any case) takes the place of the generated one.
+    fn user_provides_sitemap(&self, pages: &[&Page], statics: &[(PathBuf, PathBuf)]) -> bool {
+        let is_sitemap = |p: &Path| p.to_string_lossy().eq_ignore_ascii_case("sitemap.xml");
+        pages.iter().any(|p| is_sitemap(&p.route.file))
+            || statics.iter().any(|(rel, _)| is_sitemap(rel))
     }
 
     /// Renders one page or template to its final output text, layout included.

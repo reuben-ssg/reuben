@@ -72,3 +72,14 @@ fn build_accepts_env_flag() {
         .assert()
         .success();
 }
+
+#[test]
+fn warnings_print_to_stderr() {
+    let tmp = fixture("basic");
+    reuben()
+        .args(["build", "--root"])
+        .arg(tmp.path())
+        .assert()
+        .success()
+        .stderr(predicates::str::contains("warning: sitemap.xml skipped"));
+}

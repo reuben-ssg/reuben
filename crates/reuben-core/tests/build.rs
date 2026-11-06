@@ -6,6 +6,9 @@ use assert_fs::prelude::*;
 use reuben_core::site::{BuildOptions, BuildReport, OUTPUT_MARKER, Site};
 use reuben_core::{Error, ErrorKind};
 
+const SITEMAP_WARNING: &str =
+    "sitemap.xml skipped: base_url must be absolute (http:// or https://)";
+
 fn fixture(name: &str) -> TempDir {
     let tmp = TempDir::new().unwrap();
     let src = Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -41,7 +44,8 @@ fn builds_basic_site() {
         BuildReport {
             pages_written: 3,
             static_copied: 2,
-            drafts_skipped: 1
+            drafts_skipped: 1,
+            warnings: vec![SITEMAP_WARNING.into()]
         }
     );
     let out = tmp.path().join("dist");

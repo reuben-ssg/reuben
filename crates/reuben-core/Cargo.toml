@@ -18,6 +18,7 @@ comrak.workspace = true
 rhai.workspace = true
 walkdir.workspace = true
 glob.workspace = true
+jiff.workspace = true
 
 [dev-dependencies]
 insta.workspace = true

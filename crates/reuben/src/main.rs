@@ -60,6 +60,9 @@ fn build(root: PathBuf, out: Option<PathBuf>, drafts: bool, env: Option<String>)
                 summary(&report),
                 started.elapsed().as_millis()
             );
+            for w in &report.warnings {
+                eprintln!("warning: {w}");
+            }
             ExitCode::SUCCESS
         }
         Err(errors) => {

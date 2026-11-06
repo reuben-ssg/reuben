@@ -1,7 +1,7 @@
 //! The sandboxed Rhai engine that evaluates template blocks and sidecar scripts.
 
 pub mod collection;
-mod helpers;
+pub(crate) mod helpers;
 mod includes;
 
 use std::path::{Path, PathBuf};
@@ -51,6 +51,11 @@ thread_local! {
 }
 
 impl ScriptEngine {
+    /// Makes `url_for` use the site's `base_url`. Call before loading includes or data.
+    pub fn set_base_url(&mut self, base_url: &str) {
+        helpers::register_url_for(&mut self.engine, base_url);
+    }
+
     pub fn new(site_root: &Path) -> Self {
         let mut engine = rhai::Engine::new();
         engine.set_max_call_levels(32);
