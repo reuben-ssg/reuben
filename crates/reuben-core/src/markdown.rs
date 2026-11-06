@@ -1,11 +1,11 @@
 //! Markdown to Reuben's typed document tree.
 
-use comrak::nodes::{AstNode, ListType, NodeValue};
+use comrak::nodes::{AstNode, ListType, NodeValue, TableAlignment};
 use comrak::{Arena, Options};
 
-use crate::doc::{Document, Node, NodeKind, Span};
+use crate::doc::{Alignment, Document, Node, NodeKind, Span};
 
-fn options() -> Options<'static> {
+pub(crate) fn options() -> Options<'static> {
     let mut options = Options::default();
     options.extension.strikethrough = true;
     options.extension.table = true;
@@ -22,36 +22,25 @@ pub fn parse(body: &str, body_line: usize) -> Document {
     let options = options();
     let root = comrak::parse_document(&arena, body, &options);
     let mut doc = convert(root, body_line - 1, &options);
-    if let Some(footnotes) = footnotes_section(root, body_line - 1, &options) {
-        doc.children.push(footnotes);
+    // comrak numbers footnotes by first reference and moves the definitions to the end of the document in that order.
+    let definitions = doc
+        .children
+        .iter()
+        .position(|c| matches!(c.kind, NodeKind::FootnoteDefinition { .. }));
+    if let Some(first) = definitions {
+        let mut section = Node {
+            kind: NodeKind::FootnoteSection,
+            span: doc.children[first].span,
+            children: doc.children.split_off(first),
+        };
+        for (i, def) in section.children.iter_mut().enumerate() {
+            if let NodeKind::FootnoteDefinition { index, .. } = &mut def.kind {
+                *index = i + 1;
+            }
+        }
+        doc.children.push(section);
     }
     doc
-}
-
-fn is_footnote_definition(node: &AstNode<'_>) -> bool {
-    matches!(node.data.borrow().value, NodeValue::FootnoteDefinition(_))
-}
-
-/// All footnote definitions as one `<section>`. comrak only numbers and wraps them correctly when it renders the
-/// whole document, so render it once and keep the footnotes section. `convert` skips the individual definitions.
-fn footnotes_section<'a>(
-    root: &'a AstNode<'a>,
-    line_offset: usize,
-    options: &Options,
-) -> Option<Node> {
-    let first = root.children().find(|c| is_footnote_definition(c))?;
-    let span = Span {
-        line: first.data.borrow().sourcepos.start.line + line_offset,
-        column: 1,
-    };
-    let mut html = String::new();
-    comrak::format_html(root, options, &mut html).expect("writing to a String cannot fail");
-    let start = html.find("<section class=\"footnotes\"")?;
-    Some(Node {
-        kind: NodeKind::Raw(html[start..].to_string()),
-        span,
-        children: Vec::new(),
-    })
 }
 
 fn convert<'a>(node: &'a AstNode<'a>, line_offset: usize, options: &Options) -> Node {
@@ -95,6 +84,30 @@ fn convert<'a>(node: &'a AstNode<'a>, line_offset: usize, options: &Options) -> 
         NodeValue::LineBreak => NodeKind::LineBreak,
         NodeValue::HtmlBlock(h) => NodeKind::HtmlBlock(h.literal.clone()),
         NodeValue::HtmlInline(h) => NodeKind::HtmlInline(h.clone()),
+        NodeValue::Table(t) => NodeKind::Table {
+            alignments: t
+                .alignments
+                .iter()
+                .map(|a| match a {
+                    TableAlignment::None => Alignment::None,
+                    TableAlignment::Left => Alignment::Left,
+                    TableAlignment::Center => Alignment::Center,
+                    TableAlignment::Right => Alignment::Right,
+                })
+                .collect(),
+        },
+        NodeValue::TableRow(header) => NodeKind::TableRow { header: *header },
+        NodeValue::TableCell => NodeKind::TableCell,
+        NodeValue::Strikethrough => NodeKind::Strikethrough,
+        NodeValue::FootnoteReference(r) => NodeKind::FootnoteReference {
+            label: r.name.clone(),
+            index: r.ix as usize,
+        },
+        // `parse` numbers the definitions once they're gathered into a section.
+        NodeValue::FootnoteDefinition(d) => NodeKind::FootnoteDefinition {
+            label: d.name.clone(),
+            index: 0,
+        },
         _ => {
             drop(ast);
             let mut html = String::new();
@@ -112,7 +125,6 @@ fn convert<'a>(node: &'a AstNode<'a>, line_offset: usize, options: &Options) -> 
         span,
         children: node
             .children()
-            .filter(|child| !is_footnote_definition(child))
             .map(|child| convert(child, line_offset, options))
             .collect(),
     }
@@ -143,7 +155,7 @@ pub fn code_ranges(body: &str) -> Vec<std::ops::Range<usize>> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::doc::{NodeKind, Span};
+    use crate::doc::{Alignment, NodeKind, Span};
 
     #[test]
     fn heading_and_paragraph_with_spans() {
@@ -188,9 +200,54 @@ mod tests {
     }
 
     #[test]
-    fn unmodeled_nodes_become_raw() {
-        let d = parse("| a |\n|---|\n| b |\n", 1);
-        assert!(matches!(&d.children[0].kind, NodeKind::Raw(h) if h.contains("<table>")));
+    fn tables_are_tree_nodes() {
+        let d = parse("| a | b |\n|:-|-:|\n| 1 | 2 |\n", 1);
+        assert_eq!(
+            d.children[0].kind,
+            NodeKind::Table {
+                alignments: vec![Alignment::Left, Alignment::Right]
+            }
+        );
+        assert_eq!(
+            d.children[0].children[0].kind,
+            NodeKind::TableRow { header: true }
+        );
+        assert_eq!(
+            d.children[0].children[1].kind,
+            NodeKind::TableRow { header: false }
+        );
+        assert_eq!(
+            d.children[0].children[1].children[0].kind,
+            NodeKind::TableCell
+        );
+    }
+
+    #[test]
+    fn footnotes_are_tree_nodes() {
+        let d = parse("A[^x] B[^y]\n\n[^x]: one\n[^y]: two\n", 1);
+        let section = d.children.last().unwrap();
+        assert!(matches!(section.kind, NodeKind::FootnoteSection));
+        assert_eq!(section.children.len(), 2);
+        assert_eq!(
+            section.children[1].kind,
+            NodeKind::FootnoteDefinition {
+                label: "y".into(),
+                index: 2
+            }
+        );
+        assert_eq!(
+            d.children[0].children[1].kind,
+            NodeKind::FootnoteReference {
+                label: "x".into(),
+                index: 1
+            }
+        );
+    }
+
+    #[test]
+    fn strikethrough_is_a_node() {
+        let d = parse("~~gone~~\n", 1);
+        assert_eq!(d.children[0].children[0].kind, NodeKind::Strikethrough);
     }
 
     #[test]

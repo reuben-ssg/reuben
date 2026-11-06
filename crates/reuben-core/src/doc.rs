@@ -54,8 +54,35 @@ pub enum NodeKind {
     LineBreak,
     HtmlBlock(String),
     HtmlInline(String),
-    /// Already-rendered HTML for a construct the tree doesn't model yet (tables, footnotes, …), so nothing is dropped.
+    Table {
+        alignments: Vec<Alignment>,
+    },
+    TableRow {
+        header: bool,
+    },
+    TableCell,
+    Strikethrough,
+    /// `index` is the 1-based number the footnote gets, in order of first reference.
+    FootnoteReference {
+        label: String,
+        index: usize,
+    },
+    /// All footnote definitions, appended to the document in reference order.
+    FootnoteSection,
+    FootnoteDefinition {
+        label: String,
+        index: usize,
+    },
+    /// Already-rendered HTML for a construct the tree doesn't model yet, so nothing is dropped.
     Raw(String),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum Alignment {
+    None,
+    Left,
+    Center,
+    Right,
 }
 
 pub type Document = Node;
