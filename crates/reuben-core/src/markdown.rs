@@ -118,6 +118,28 @@ fn convert<'a>(node: &'a AstNode<'a>, line_offset: usize, options: &Options) -> 
     }
 }
 
+/// Byte ranges of `body` covered by code blocks and inline code, where `{{` must stay literal.
+pub fn code_ranges(body: &str) -> Vec<std::ops::Range<usize>> {
+    let mut line_starts = vec![0];
+    line_starts.extend(body.match_indices('\n').map(|(i, _)| i + 1));
+    let offset = |line: usize, column: usize| {
+        let start = line_starts.get(line - 1).copied().unwrap_or(body.len());
+        (start + column - 1).min(body.len())
+    };
+    let arena = Arena::new();
+    let root = comrak::parse_document(&arena, body, &options());
+    root.descendants()
+        .filter_map(|node| {
+            let ast = node.data.borrow();
+            if !matches!(ast.value, NodeValue::CodeBlock(_) | NodeValue::Code(_)) {
+                return None;
+            }
+            let (start, end) = (ast.sourcepos.start, ast.sourcepos.end);
+            Some(offset(start.line, start.column)..offset(end.line, end.column + 1))
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -169,5 +191,21 @@ mod tests {
     fn unmodeled_nodes_become_raw() {
         let d = parse("| a |\n|---|\n| b |\n", 1);
         assert!(matches!(&d.children[0].kind, NodeKind::Raw(h) if h.contains("<table>")));
+    }
+
+    #[test]
+    fn code_ranges_are_exact_for_spans_and_indented_blocks() {
+        let body = "a `{{ x }}` b\n\n    {{ z }}\n";
+        let slices: Vec<&str> = code_ranges(body).iter().map(|r| &body[r.clone()]).collect();
+        assert_eq!(slices[0], "`{{ x }}`");
+        assert!(slices[1].contains("{{ z }}"));
+    }
+
+    #[test]
+    fn code_ranges_cover_fences_and_spans() {
+        let body = "a `{{ x }}` b\n\n```\n{{ y }}\n```\n";
+        let r = code_ranges(body);
+        assert!(r.iter().any(|r| body[r.clone()].contains("{{ x }}")));
+        assert!(r.iter().any(|r| body[r.clone()].contains("{{ y }}")));
     }
 }

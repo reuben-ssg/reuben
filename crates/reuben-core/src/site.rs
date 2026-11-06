@@ -6,12 +6,15 @@ use std::path::{Path, PathBuf};
 
 use walkdir::WalkDir;
 
-use crate::doc::Document;
+use std::sync::Arc;
+
+use crate::config::{self, Config};
 use crate::error::{Error, ErrorKind};
 use crate::frontmatter::{self, FrontMatter};
 use crate::route::{Route, route_for_page};
+use crate::script::{Html, ScriptEngine};
 use crate::theme::{PageShell, builtin_page};
-use crate::{html, markdown};
+use crate::{html, layout, page, splice};
 
 /// Written into every output directory Reuben builds. Only a directory containing it is ever cleared.
 pub const OUTPUT_MARKER: &str = ".reuben-output";
@@ -20,7 +23,14 @@ pub const OUTPUT_MARKER: &str = ".reuben-output";
 pub struct Page {
     pub source: PathBuf,
     pub front_matter: FrontMatter,
-    pub doc: Document,
+    /// Raw Markdown after the front matter, with blocks unevaluated.
+    pub body: String,
+    /// 1-based line in `source` where `body` starts.
+    pub body_line: usize,
+    /// Path relative to `content/`.
+    pub rel: PathBuf,
+    /// The sibling `<stem>.rhai`, if present.
+    pub sidecar: Option<PathBuf>,
     pub route: Route,
 }
 
@@ -30,6 +40,10 @@ pub struct Site {
     pub pages: Vec<Page>,
     /// Paths relative to `static/`.
     pub static_files: Vec<PathBuf>,
+    /// Paths relative to the theme's `static/`, including ones the site overrides.
+    pub theme_static_files: Vec<PathBuf>,
+    pub config: Config,
+    pub engine: Arc<ScriptEngine>,
 }
 
 pub struct BuildOptions {
@@ -49,6 +63,27 @@ impl Site {
     pub fn load(root: &Path) -> Result<Site, Vec<Error>> {
         let mut errors = Vec::new();
         let mut pages = Vec::new();
+
+        let config = match config::load(root) {
+            Ok(c) => Some(c),
+            Err(e) => {
+                errors.push(e);
+                None
+            }
+        };
+        let mut engine = ScriptEngine::new(root);
+        if let Some(config) = &config {
+            let dirs: Vec<PathBuf> = config
+                .theme
+                .iter()
+                .map(|t| t.join("includes"))
+                .chain([root.join("includes")])
+                .filter(|d| d.is_dir())
+                .collect();
+            if let Err(mut e) = engine.load_includes(&dirs) {
+                errors.append(&mut e);
+            }
+        }
 
         let content = root.join("content");
         for (path, rel) in walk(&content, &mut errors) {
@@ -70,14 +105,26 @@ impl Site {
             Vec::new()
         };
 
-        if errors.is_empty() {
-            Ok(Site {
+        let theme_static_files = match config.as_ref().and_then(|c| c.theme.as_ref()) {
+            Some(theme) if theme.join("static").exists() => {
+                walk(&theme.join("static"), &mut errors)
+                    .into_iter()
+                    .map(|(_, rel)| rel)
+                    .collect()
+            }
+            _ => Vec::new(),
+        };
+
+        match config {
+            Some(config) if errors.is_empty() => Ok(Site {
                 root: root.to_path_buf(),
                 pages,
                 static_files,
-            })
-        } else {
-            Err(errors)
+                theme_static_files,
+                config,
+                engine: Arc::new(engine),
+            }),
+            _ => Err(errors),
         }
     }
 
@@ -91,25 +138,61 @@ impl Site {
         prepare_out_dir(&opts.out).map_err(|e| vec![e])?;
 
         let mut errors = Vec::new();
+        let site_map = page::site_map(&self.config).map_err(|e| vec![e])?;
         for page in &pages {
-            let body = html::render(&page.doc);
-            let shell = PageShell {
-                title: &page.front_matter.title,
-                lang: "en",
-                description: page.front_matter.description.as_deref(),
-                body: &body,
+            let (doc, mut scope) = match page::render_body(page, &self.engine, &site_map) {
+                Ok(rendered) => rendered,
+                Err(mut e) => {
+                    errors.append(&mut e);
+                    continue;
+                }
             };
+            let body = html::render(&doc);
+            let layout = match layout::find_layout(
+                page.front_matter.layout.as_deref(),
+                &self.root,
+                self.config.theme.as_deref(),
+            ) {
+                Ok(layout) => layout,
+                Err(mut e) => {
+                    e.path.clone_from(&page.source);
+                    errors.push(e);
+                    continue;
+                }
+            };
+            let output = match layout {
+                Some(path) => {
+                    match layout::render_layout(&path, &self.engine, &mut scope, Html(body)) {
+                        Ok(html) => html,
+                        Err(mut e) => {
+                            errors.append(&mut e);
+                            continue;
+                        }
+                    }
+                }
+                None => builtin_page(&PageShell {
+                    title: &page.front_matter.title,
+                    lang: "en",
+                    description: page.front_matter.description.as_deref(),
+                    body: &body,
+                }),
+            };
+            if let Err(e) = splice::ensure_no_placeholders(&page.source, &output) {
+                errors.push(e);
+                continue;
+            }
             let dest = opts.out.join(&page.route.file);
-            if let Err(e) = write(&dest, builtin_page(&shell).as_bytes()) {
+            if let Err(e) = write(&dest, output.as_bytes()) {
                 errors.push(Error::new(&dest, e));
             }
         }
-        for rel in &self.static_files {
+        let statics = self.static_sources();
+        for (rel, src) in &statics {
             let dest = opts.out.join(rel);
             let copied = dest
                 .parent()
                 .map_or(Ok(()), fs::create_dir_all)
-                .and_then(|()| fs::copy(self.root.join("static").join(rel), &dest));
+                .and_then(|()| fs::copy(src, &dest));
             if let Err(e) = copied {
                 errors.push(Error::new(&dest, e));
             }
@@ -120,22 +203,35 @@ impl Site {
         }
         Ok(BuildReport {
             pages_written: pages.len(),
-            static_copied: self.static_files.len(),
+            static_copied: statics.len(),
             drafts_skipped: drafts.len(),
         })
     }
 
+    /// Every file to copy as (path relative to the output, source). Theme files come first and a site file at the
+    /// same path replaces one, so only two files within the site can collide.
+    fn static_sources(&self) -> Vec<(PathBuf, PathBuf)> {
+        let theme_dir = self.config.theme.as_ref().map(|t| t.join("static"));
+        let theme = theme_dir.iter().flat_map(|dir| {
+            self.theme_static_files
+                .iter()
+                .filter(|rel| !self.static_files.contains(rel))
+                .map(|rel| (rel.clone(), dir.join(rel)))
+        });
+        let site_dir = self.root.join("static");
+        let site = self
+            .static_files
+            .iter()
+            .map(|rel| (rel.clone(), site_dir.join(rel)));
+        theme.chain(site).collect()
+    }
+
     /// Fails if two sources (pages or static files) would write the same output file.
     fn check_collisions(&self, pages: &[&Page]) -> Result<(), Vec<Error>> {
-        let static_dir = self.root.join("static");
         let sources = pages
             .iter()
             .map(|p| (p.route.file.clone(), p.source.clone()))
-            .chain(
-                self.static_files
-                    .iter()
-                    .map(|rel| (rel.clone(), static_dir.join(rel))),
-            );
+            .chain(self.static_sources());
 
         // Keyed case-insensitively: on macOS and Windows `Notes/` and `notes/` are the same directory, and a site
         // that relies on the difference can't be deployed portably anyway.
@@ -190,9 +286,13 @@ fn load_page(path: &Path, rel: &Path) -> Result<Page, Error> {
     let bytes = fs::read(path).map_err(|e| Error::new(path, e))?;
     let src = String::from_utf8(bytes).map_err(|_| Error::new(path, ErrorKind::NotUtf8))?;
     let parsed = frontmatter::parse(&src).map_err(|e| Error::new(path, e))?;
+    let sidecar = Some(path.with_extension("rhai")).filter(|p| p.is_file());
     Ok(Page {
         source: path.to_path_buf(),
-        doc: markdown::parse(parsed.body, parsed.body_line),
+        body: parsed.body.to_string(),
+        body_line: parsed.body_line,
+        rel: rel.to_path_buf(),
+        sidecar,
         front_matter: parsed.front_matter,
         route: route_for_page(rel),
     })
