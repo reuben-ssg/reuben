@@ -7,6 +7,8 @@ pub mod error;
 pub mod frontmatter;
 pub mod html;
 pub mod markdown;
+pub mod route;
+pub mod site;
 pub mod theme;
 
 pub use error::{Error, ErrorKind};

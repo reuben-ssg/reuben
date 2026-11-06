@@ -17,6 +17,15 @@ pub enum ErrorKind {
     FrontMatter(#[from] FrontMatterError),
     #[error("{0}")]
     Io(#[from] std::io::Error),
+    #[error("file is not valid UTF-8")]
+    NotUtf8,
+    #[error("builds to {} too, which {} already builds to", file.display(), other.display())]
+    OutputCollision { other: PathBuf, file: PathBuf },
+    #[error(
+        "output directory isn't empty and wasn't created by Reuben (no `{}` file), so it won't be cleared",
+        crate::site::OUTPUT_MARKER
+    )]
+    UnsafeOutputDir,
 }
 
 impl Error {

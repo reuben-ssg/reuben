@@ -1,0 +1,20 @@
+---
+source: crates/reuben-core/tests/build.rs
+expression: "fs::read_to_string(out.join(\"about/index.html\")).unwrap()"
+---
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="description" content="Who makes the sandwich">
+<title>About</title>
+<style>body{font-family:system-ui,sans-serif;line-height:1.6;max-width:70ch;margin:auto;padding:1rem}</style>
+</head>
+<body>
+<main>
+<h1>About</h1>
+<p>Rye, corned beef, and <a href="/notes/">notes</a>.</p>
+</main>
+</body>
+</html>
