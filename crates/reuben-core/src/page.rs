@@ -86,7 +86,7 @@ fn pre_block_toc(page: &Page) -> Vec<headings::TocEntry> {
     let Ok(extracted) = blocks::extract(&page.body, page.body_line, &skip) else {
         return Vec::new();
     };
-    headings::assign_ids(&mut markdown::parse(&extracted.text, page.body_line))
+    headings::assign_ids_before_blocks(&mut markdown::parse(&extracted.text, page.body_line))
 }
 
 fn opt<T: Clone + Send + Sync + 'static>(v: Option<T>) -> Dynamic {

@@ -57,3 +57,35 @@ fn math_in_a_markdown_helper_converts() {
     let html = build("---\ntitle: T\n---\n{{ markdown(\"$x$\") }}\n");
     assert!(html.contains("<math"), "{html}");
 }
+
+#[test]
+fn double_brace_in_inline_math_is_literal() {
+    let html = build("---\ntitle: T\n---\n$x^{{2}}$\n");
+    assert!(html.contains("<msup>"), "{html}");
+}
+
+#[test]
+fn spaced_double_brace_in_math_is_literal() {
+    let html = build("---\ntitle: T\n---\n$x = {{ 3 }}$\n");
+    assert!(html.contains("<math"), "{html}");
+    assert!(html.contains('3'), "{html}");
+}
+
+#[test]
+fn double_brace_fraction_renders() {
+    let html = build("---\ntitle: T\n---\n$\\frac{{a+b}}{c}$\n");
+    assert!(html.contains("<mfrac>"), "{html}");
+}
+
+#[test]
+fn double_brace_in_display_math_block() {
+    let html = build("---\ntitle: T\n---\n$$\na = {{n}}\nb = 2\n$$\n");
+    assert!(html.contains("<math"), "{html}");
+}
+
+#[test]
+fn blocks_outside_math_still_evaluate() {
+    let html = build("---\ntitle: T\n---\n$x^{{2}}$\n\n{{ 1 + 1 }}\n");
+    assert!(html.contains("<msup>"), "{html}");
+    assert!(html.contains("<p>2</p>"), "{html}");
+}

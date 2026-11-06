@@ -79,3 +79,85 @@ fn collection_items_carry_toc() {
     );
     assert!(html.contains("20"), "{html}");
 }
+
+#[test]
+fn pre_block_toc_skips_placeholder_headings() {
+    let docs = "---\ntitle: A\n---\n# {{ page.title }}\n\n## Section\n\n## Section\n\n{{ page.toc.len() }}\n";
+    let html = build(
+        &[
+            (
+                "content/index.md",
+                "---\ntitle: Home\n---\n{{ collections.docs.map(|p| p.toc.map(|e| e.id)) }}\n",
+            ),
+            ("content/docs/a.md", docs),
+        ],
+        "index.html",
+    );
+    assert!(
+        html.contains("section") && html.contains("section-1"),
+        "{html}"
+    );
+    assert!(!html.contains("section-2"), "{html}");
+    assert!(!html.contains("\"a\""), "{html}");
+}
+
+#[test]
+fn pre_block_toc_ids_match_rendered_page() {
+    let docs = "---\ntitle: A\n---\n# {{ page.title }}\n\n## Section\n\n## Section\n\n{{ page.toc.len() }}\n";
+    let html = build(&[("content/docs/a.md", docs)], "docs/a/index.html");
+    assert!(html.contains("id=\"section\""), "{html}");
+    assert!(html.contains("id=\"section-1\""), "{html}");
+    assert!(html.contains("<p>2</p>"), "{html}");
+}
+
+#[test]
+fn smart_punctuation_slug() {
+    let html = build(
+        &[("content/index.md", "---\ntitle: T\n---\n## Rye -- it's\n")],
+        "index.html",
+    );
+    assert!(html.contains("id=\"rye--its\""), "{html}");
+}
+
+fn try_build(files: &[(&str, &str)]) -> (TempDir, Result<(), Vec<reuben_core::Error>>) {
+    let tmp = TempDir::new().unwrap();
+    for (path, text) in files {
+        tmp.child(path).write_str(text).unwrap();
+    }
+    let site = Site::load(tmp.path()).unwrap();
+    let result = site
+        .build(&BuildOptions {
+            drafts: false,
+            out: tmp.path().join("dist"),
+        })
+        .map(|_| ());
+    (tmp, result)
+}
+
+#[test]
+fn layout_sees_sidecar_block_and_page() {
+    let html = build(
+        &[
+            (
+                "content/index.md",
+                "---\ntitle: T\n---\n{% let blk = \"B\"; %}\n# H\n",
+            ),
+            ("content/index.rhai", "let side = \"S\";\n"),
+            (
+                "layouts/default.html",
+                "{{ side }}{{ blk }}{{ page.title }}{{ page.toc.len() }}",
+            ),
+        ],
+        "index.html",
+    );
+    assert!(html.contains("SBT1"), "{html}");
+}
+
+#[test]
+fn layout_cannot_assign_to_page() {
+    let (_tmp, result) = try_build(&[
+        ("content/index.md", "---\ntitle: T\n---\nHi\n"),
+        ("layouts/default.html", "{% page = 1; %}{{ content }}"),
+    ]);
+    assert!(result.is_err());
+}

@@ -140,7 +140,7 @@ fn convert<'a>(node: &'a AstNode<'a>, line_offset: usize, options: &Options) -> 
     }
 }
 
-/// Byte ranges of `body` covered by code blocks and inline code, where `{{` must stay literal.
+/// Byte ranges of `body` covered by code blocks, inline code and math, where `{{` must stay literal.
 pub fn code_ranges(body: &str) -> Vec<std::ops::Range<usize>> {
     let mut line_starts = vec![0];
     line_starts.extend(body.match_indices('\n').map(|(i, _)| i + 1));
@@ -153,7 +153,10 @@ pub fn code_ranges(body: &str) -> Vec<std::ops::Range<usize>> {
     root.descendants()
         .filter_map(|node| {
             let ast = node.data.borrow();
-            if !matches!(ast.value, NodeValue::CodeBlock(_) | NodeValue::Code(_)) {
+            if !matches!(
+                ast.value,
+                NodeValue::CodeBlock(_) | NodeValue::Code(_) | NodeValue::Math(_)
+            ) {
                 return None;
             }
             let (start, end) = (ast.sourcepos.start, ast.sourcepos.end);
@@ -335,5 +338,12 @@ mod tests {
         let r = code_ranges(body);
         assert!(r.iter().any(|r| body[r.clone()].contains("{{ x }}")));
         assert!(r.iter().any(|r| body[r.clone()].contains("{{ y }}")));
+    }
+
+    #[test]
+    fn code_ranges_cover_whole_math_spans() {
+        let body = "a $x^{{2}}$ b\n\n$$\nq {{n}}\n$$\n";
+        let slices: Vec<&str> = code_ranges(body).iter().map(|r| &body[r.clone()]).collect();
+        assert_eq!(slices, ["$x^{{2}}$", "$$\nq {{n}}\n$$"]);
     }
 }

@@ -62,14 +62,26 @@ impl Ids {
 pub fn assign_ids(doc: &mut Document) -> Vec<TocEntry> {
     let mut ids = Ids::default();
     let mut toc = Vec::new();
-    walk(doc, &mut ids, &mut toc);
+    walk(doc, &mut ids, &mut toc, false);
     toc
 }
 
-fn walk(node: &mut Node, ids: &mut Ids, toc: &mut Vec<TocEntry>) {
+/// Like [`assign_ids`] for a tree whose blocks haven't run. A heading holding a block placeholder
+/// has unknown text, so it is left out of the toc and doesn't take a place in the id sequence.
+pub fn assign_ids_before_blocks(doc: &mut Document) -> Vec<TocEntry> {
+    let mut ids = Ids::default();
+    let mut toc = Vec::new();
+    walk(doc, &mut ids, &mut toc, true);
+    toc
+}
+
+fn walk(node: &mut Node, ids: &mut Ids, toc: &mut Vec<TocEntry>, skip_placeholders: bool) {
     if let NodeKind::Heading { level, id } = &mut node.kind {
         let mut raw = String::new();
         node.children.iter().for_each(|c| collect(c, &mut raw));
+        if skip_placeholders && raw.contains('\u{E000}') {
+            return;
+        }
         let text = strip_placeholders(&raw).trim().to_string();
         let base = match slug(&text) {
             s if s.is_empty() => "section".to_string(),
@@ -84,7 +96,7 @@ fn walk(node: &mut Node, ids: &mut Ids, toc: &mut Vec<TocEntry>) {
         return;
     }
     for child in &mut node.children {
-        walk(child, ids, toc);
+        walk(child, ids, toc, skip_placeholders);
     }
 }
 

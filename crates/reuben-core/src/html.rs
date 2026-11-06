@@ -8,16 +8,16 @@ use std::fmt::Write;
 use crate::doc::{Alignment, Document, Node, NodeKind};
 use crate::highlight::{Highlighter, default_highlighter};
 
-/// State the writer needs across the tree: the code highlighter, and footnote bookkeeping (how many times each footnote is referenced (for the
-/// times each footnote is referenced, for the backrefs, and how many references to each it has written so far,
-/// for repeated reference ids).
-struct Footnotes<'a> {
+/// State the writer carries through the whole tree: the code highlighter, how many references each
+/// footnote has (for its backrefs), and how many of those references have been written so far
+/// (to give repeated references distinct ids).
+struct RenderCtx<'a> {
     highlighter: &'a dyn Highlighter,
     totals: HashMap<usize, u32>,
     written: RefCell<HashMap<usize, u32>>,
 }
 
-impl<'a> Footnotes<'a> {
+impl<'a> RenderCtx<'a> {
     fn of(doc: &Document, highlighter: &'a dyn Highlighter) -> Self {
         fn walk(node: &Node, totals: &mut HashMap<usize, u32>) {
             if let NodeKind::FootnoteReference { index, .. } = node.kind {
@@ -27,7 +27,7 @@ impl<'a> Footnotes<'a> {
         }
         let mut totals = HashMap::new();
         walk(doc, &mut totals);
-        Footnotes {
+        RenderCtx {
             highlighter,
             totals,
             written: RefCell::default(),
@@ -43,7 +43,7 @@ pub fn render(doc: &Document) -> String {
 /// Like [`render`], with a caller-supplied code highlighter.
 pub fn render_with(doc: &Document, highlighter: &dyn Highlighter) -> String {
     let mut out = String::new();
-    block(&mut out, doc, false, &Footnotes::of(doc, highlighter));
+    block(&mut out, doc, false, &RenderCtx::of(doc, highlighter));
     out
 }
 
@@ -102,21 +102,21 @@ fn cr(out: &mut String) {
     }
 }
 
-fn children(out: &mut String, node: &Node, tight: bool, fns: &Footnotes) {
+fn children(out: &mut String, node: &Node, tight: bool, ctx: &RenderCtx) {
     for child in &node.children {
-        block(out, child, tight, fns);
+        block(out, child, tight, ctx);
     }
 }
 
 /// Renders a node. `tight` is true for the direct contents of a tight list item, whose paragraphs drop `<p>`.
-fn block(out: &mut String, node: &Node, tight: bool, fns: &Footnotes) {
+fn block(out: &mut String, node: &Node, tight: bool, ctx: &RenderCtx) {
     match &node.kind {
-        NodeKind::Document => children(out, node, false, fns),
-        NodeKind::Paragraph if tight => inlines(out, node, fns),
+        NodeKind::Document => children(out, node, false, ctx),
+        NodeKind::Paragraph if tight => inlines(out, node, ctx),
         NodeKind::Paragraph => {
             cr(out);
             out.push_str("<p>");
-            inlines(out, node, fns);
+            inlines(out, node, ctx);
             out.push_str("</p>\n");
         }
         NodeKind::Heading { level, id } => {
@@ -126,20 +126,22 @@ fn block(out: &mut String, node: &Node, tight: bool, fns: &Footnotes) {
             } else {
                 let _ = write!(out, "<h{level} id=\"{}\">", escape_attr(id));
             }
-            inlines(out, node, fns);
+            inlines(out, node, ctx);
             let _ = writeln!(out, "</h{level}>");
         }
         NodeKind::CodeBlock { info, literal } => {
             cr(out);
-            out.push_str("<pre><code");
-            if let Some(lang) = info.split_whitespace().next() {
+            let lang = info.split_whitespace().next();
+            let highlighted = lang.and_then(|lang| ctx.highlighter.highlight(lang, literal));
+            out.push_str(if highlighted.is_some() {
+                "<pre class=\"hl-code\"><code"
+            } else {
+                "<pre><code"
+            });
+            if let Some(lang) = lang {
                 let _ = write!(out, " class=\"language-{}\"", escape_attr(lang));
             }
             out.push('>');
-            let highlighted = info
-                .split_whitespace()
-                .next()
-                .and_then(|lang| fns.highlighter.highlight(lang, literal));
             match highlighted {
                 Some(html) => out.push_str(&html),
                 None => out.push_str(&escape_text(literal)),
@@ -149,7 +151,7 @@ fn block(out: &mut String, node: &Node, tight: bool, fns: &Footnotes) {
         NodeKind::BlockQuote => {
             cr(out);
             out.push_str("<blockquote>\n");
-            children(out, node, false, fns);
+            children(out, node, false, ctx);
             cr(out);
             out.push_str("</blockquote>\n");
         }
@@ -182,7 +184,7 @@ fn block(out: &mut String, node: &Node, tight: bool, fns: &Footnotes) {
                     }
                     _ => out.push_str("<li>"),
                 }
-                children(out, item, *list_tight, fns);
+                children(out, item, *list_tight, ctx);
                 if !*list_tight {
                     cr(out);
                 }
@@ -198,16 +200,16 @@ fn block(out: &mut String, node: &Node, tight: bool, fns: &Footnotes) {
             cr(out);
             out.push_str(html);
         }
-        NodeKind::Table { alignments } => table(out, node, alignments, fns),
-        NodeKind::FootnoteSection => footnote_section(out, node, fns),
+        NodeKind::Table { alignments } => table(out, node, alignments, ctx),
+        NodeKind::FootnoteSection => footnote_section(out, node, ctx),
         NodeKind::TableRow { .. } | NodeKind::TableCell | NodeKind::FootnoteDefinition { .. } => {
-            children(out, node, false, fns)
+            children(out, node, false, ctx)
         }
-        _ => inline(out, node, fns),
+        _ => inline(out, node, ctx),
     }
 }
 
-fn table(out: &mut String, node: &Node, alignments: &[Alignment], fns: &Footnotes) {
+fn table(out: &mut String, node: &Node, alignments: &[Alignment], ctx: &RenderCtx) {
     cr(out);
     out.push_str("<table>\n");
     for (i, row) in node.children.iter().enumerate() {
@@ -235,7 +237,7 @@ fn table(out: &mut String, node: &Node, alignments: &[Alignment], fns: &Footnote
                 _ => {}
             }
             out.push('>');
-            inlines(out, cell, fns);
+            inlines(out, cell, ctx);
             let _ = write!(out, "</{tag}>");
         }
         cr(out);
@@ -253,7 +255,7 @@ fn table(out: &mut String, node: &Node, alignments: &[Alignment], fns: &Footnote
     out.push_str("</table>\n");
 }
 
-fn footnote_section(out: &mut String, node: &Node, fns: &Footnotes) {
+fn footnote_section(out: &mut String, node: &Node, ctx: &RenderCtx) {
     cr(out);
     out.push_str("<section class=\"footnotes\" data-footnotes>\n<ol>\n");
     for def in &node.children {
@@ -261,19 +263,19 @@ fn footnote_section(out: &mut String, node: &Node, fns: &Footnotes) {
             continue;
         };
         let _ = write!(out, "<li id=\"fn-{}\">", url_attr(label));
-        let backref = footnote_backref(label, *index, fns.totals.get(index).copied().unwrap_or(0));
+        let backref = footnote_backref(label, *index, ctx.totals.get(index).copied().unwrap_or(0));
         let (last, rest) = match def.children.split_last() {
             Some((last, rest)) if last.kind == NodeKind::Paragraph => (Some(last), rest),
             _ => (None, def.children.as_slice()),
         };
         for child in rest {
-            block(out, child, false, fns);
+            block(out, child, false, ctx);
         }
         match last {
             Some(p) => {
                 cr(out);
                 out.push_str("<p>");
-                inlines(out, p, fns);
+                inlines(out, p, ctx);
                 out.push(' ');
                 out.push_str(&backref);
                 out.push_str("</p>\n");
@@ -310,18 +312,18 @@ fn footnote_backref(label: &str, index: usize, total: u32) -> String {
     html
 }
 
-fn inlines(out: &mut String, node: &Node, fns: &Footnotes) {
+fn inlines(out: &mut String, node: &Node, ctx: &RenderCtx) {
     for child in &node.children {
-        inline(out, child, fns);
+        inline(out, child, ctx);
     }
 }
 
-fn inline(out: &mut String, node: &Node, fns: &Footnotes) {
+fn inline(out: &mut String, node: &Node, ctx: &RenderCtx) {
     match &node.kind {
         NodeKind::Text(t) => out.push_str(&escape_text(t)),
-        NodeKind::Emphasis => wrap(out, node, "em", fns),
-        NodeKind::Strong => wrap(out, node, "strong", fns),
-        NodeKind::Strikethrough => wrap(out, node, "del", fns),
+        NodeKind::Emphasis => wrap(out, node, "em", ctx),
+        NodeKind::Strong => wrap(out, node, "strong", ctx),
+        NodeKind::Strikethrough => wrap(out, node, "del", ctx),
         NodeKind::Code(c) => {
             let _ = write!(out, "<code>{}</code>", escape_text(c));
         }
@@ -331,7 +333,7 @@ fn inline(out: &mut String, node: &Node, fns: &Footnotes) {
                 let _ = write!(out, " title=\"{}\"", escape_attr(title));
             }
             out.push('>');
-            inlines(out, node, fns);
+            inlines(out, node, ctx);
             out.push_str("</a>");
         }
         NodeKind::Image { url, title } => {
@@ -348,7 +350,7 @@ fn inline(out: &mut String, node: &Node, fns: &Footnotes) {
         }
         NodeKind::FootnoteReference { label, index } => {
             let n = {
-                let mut written = fns.written.borrow_mut();
+                let mut written = ctx.written.borrow_mut();
                 let n = written.entry(*index).or_default();
                 *n += 1;
                 *n
@@ -373,13 +375,13 @@ fn inline(out: &mut String, node: &Node, fns: &Footnotes) {
             let _ = write!(out, "{d}{}{d}", escape_text(latex));
         }
         NodeKind::HtmlInline(html) | NodeKind::Raw(html) => out.push_str(html),
-        _ => block(out, node, false, fns),
+        _ => block(out, node, false, ctx),
     }
 }
 
-fn wrap(out: &mut String, node: &Node, tag: &str, fns: &Footnotes) {
+fn wrap(out: &mut String, node: &Node, tag: &str, ctx: &RenderCtx) {
     let _ = write!(out, "<{tag}>");
-    inlines(out, node, fns);
+    inlines(out, node, ctx);
     let _ = write!(out, "</{tag}>");
 }
 
@@ -414,7 +416,10 @@ mod tests {
     #[test]
     fn code_block_uses_highlighter() {
         let d = crate::markdown::parse("```rust\nfn a() {}\n```\n", 1);
-        assert!(render(&d).contains("<pre><code class=\"language-rust\"><span class=\"hl-"));
+        assert!(
+            render(&d)
+                .contains("<pre class=\"hl-code\"><code class=\"language-rust\"><span class=\"hl-")
+        );
     }
 
     #[test]
@@ -429,8 +434,21 @@ mod tests {
     #[test]
     fn code_block_language_class() {
         let html = render(&crate::markdown::parse("```rust\nlet x = 1 < 2;\n```\n", 1));
-        assert!(html.starts_with("<pre><code class=\"language-rust\"><span class=\"hl-"));
+        assert!(
+            html.starts_with(
+                "<pre class=\"hl-code\"><code class=\"language-rust\"><span class=\"hl-"
+            )
+        );
         assert!(html.contains("&lt;"));
+    }
+
+    #[test]
+    fn highlighted_code_is_escaped() {
+        let src = "```rust\nlet s = \"</code></pre><script>\" & \"x\";\n```\n";
+        let html = render(&crate::markdown::parse(src, 1));
+        assert!(!html.contains("<script"), "{html}");
+        assert!(html.contains("&lt;/code&gt;"), "{html}");
+        assert!(html.contains("&amp;"), "{html}");
     }
 
     #[test]

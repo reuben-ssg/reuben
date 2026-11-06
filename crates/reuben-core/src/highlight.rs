@@ -122,6 +122,16 @@ mod tests {
     }
 
     #[test]
+    fn theme_css_styles_the_pre_class_the_writer_emits() {
+        let css = theme_css("base16-ocean.dark").unwrap();
+        let rule = css
+            .split('}')
+            .find(|r| r.contains(".hl-code"))
+            .expect(".hl-code rule");
+        assert!(rule.contains("background-color"), "{css}");
+    }
+
+    #[test]
     fn unknown_theme_names_it() {
         assert!(theme_css("nope").unwrap_err().contains("nope"));
     }
