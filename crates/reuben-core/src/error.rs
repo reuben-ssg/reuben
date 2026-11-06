@@ -25,6 +25,8 @@ pub enum ErrorKind {
     Block(BlockError),
     #[error("config: {0}")]
     Config(String),
+    #[error("layout `{0}` not found in the site or its theme")]
+    LayoutNotFound(String),
     #[error("file is not valid UTF-8")]
     NotUtf8,
     #[error("builds to {} too, which {} already builds to", file.display(), other.display())]
