@@ -251,4 +251,32 @@ mod tests {
             .collect();
         assert_eq!(order, "bca");
     }
+
+    fn real_eval(src: &str) -> Result<crate::splice::Output, crate::script::ScriptError> {
+        use crate::blocks::{Block, BlockKind};
+        let engine = crate::script::ScriptEngine::new(std::path::Path::new("."));
+        let mut s = scope();
+        let block = Block {
+            kind: BlockKind::Output,
+            source: src.into(),
+            span: Default::default(),
+        };
+        engine.eval_block(&mut s, &block, std::path::Path::new("p.md"))
+    }
+
+    #[test]
+    fn errors_inside_map_and_filter_closures_propagate() {
+        assert!(real_eval("c.map(|p| p.nope.x)").is_err());
+        let err = real_eval("c.filter(|p| 1)").unwrap_err();
+        assert!(err.message.contains("true or false"), "{}", err.message);
+    }
+
+    #[test]
+    fn registered_array_sort_by_orders_arrays() {
+        let out = real_eval(
+            r#"[#{d: 2, path: "b", t: "B"}, #{d: 1, path: "a", t: "A"}].sort_by("d").map(|m| m.t)"#,
+        )
+        .unwrap();
+        assert_eq!(out, crate::splice::Output::Text("AB".into()));
+    }
 }

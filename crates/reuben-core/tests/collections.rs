@@ -49,3 +49,46 @@ fn drafts_flag_adds_drafts_to_collections() {
     let (_tmp, html) = build(true);
     assert!(html.contains("DBAC|4|"), "{html}");
 }
+
+fn build_with_page(body: &str) -> Vec<reuben_core::Error> {
+    let tmp = TempDir::new().unwrap();
+    let src = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/sites/collections");
+    tmp.copy_from(src, &["**"]).unwrap();
+    tmp.child("content/bad.md").write_str(body).unwrap();
+    let site = Site::load(tmp.path()).unwrap();
+    site.build(&BuildOptions {
+        drafts: false,
+        out: tmp.path().join("dist"),
+    })
+    .unwrap_err()
+}
+
+#[test]
+fn error_in_map_closure_names_page_and_line() {
+    let errs = build_with_page(
+        "---\ntitle: Bad\n---\n\nintro\n\n{{ collections.blog.map(|p| p.nope.x) }}\n",
+    );
+    let e = errs.iter().find(|e| e.path.ends_with("bad.md")).unwrap();
+    let reuben_core::ErrorKind::Script(s) = &e.kind else {
+        panic!("{e:?}")
+    };
+    assert_eq!(s.location.unwrap().line, 7, "{s:?}");
+}
+
+#[test]
+fn array_sort_by_helper_orders_filtered_collection() {
+    let tmp = TempDir::new().unwrap();
+    let src = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/sites/collections");
+    tmp.copy_from(src, &["**"]).unwrap();
+    tmp.child("content/sorted.md")
+        .write_str("---\ntitle: S\n---\n{{ collections.blog.filter(|p| true).sort_by(\"date\").map(|p| p.title) }}|{{ [#{d: 2, path: \"b\"}, #{d: 1, path: \"a\"}].sort_by(\"d\").map(|p| p.path) }}\n")
+        .unwrap();
+    let site = Site::load(tmp.path()).unwrap();
+    site.build(&BuildOptions {
+        drafts: false,
+        out: tmp.path().join("dist"),
+    })
+    .unwrap();
+    let html = fs::read_to_string(tmp.path().join("dist/sorted/index.html")).unwrap();
+    assert!(html.contains("ABC|ab"), "{html}");
+}
