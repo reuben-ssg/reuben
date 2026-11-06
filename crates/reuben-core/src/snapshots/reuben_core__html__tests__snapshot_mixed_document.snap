@@ -1,0 +1,49 @@
+---
+source: crates/reuben-core/src/html.rs
+
+expression: render(&d)
+---
+<h1>Heading one</h1>
+<p>Some <em>emphasis</em>, <strong>strong</strong>, and <code>inline &lt;code&gt;</code>.
+A soft break follows,<br />
+and a hard break before this.</p>
+<h2>Heading two</h2>
+<!-- vale off -->
+<pre><code class="language-rhai">let x = &quot;a&quot; &lt; &quot;b&quot;;
+</code></pre>
+<ol>
+<li>First</li>
+<li>Second</li>
+</ol>
+<ul>
+<li>Tight</li>
+<li>List</li>
+</ul>
+<ul>
+<li>
+<p>Loose</p>
+</li>
+<li>
+<p>List</p>
+</li>
+</ul>
+<h3>Heading three</h3>
+<blockquote>
+<p>A quote with a <a href="/about/" title="About">link</a>.</p>
+</blockquote>
+<hr />
+<p><img src="/rye.png" alt="A sandwich" /></p>
+<table>
+<thead>
+<tr>
+<th>Bread</th>
+<th>Filling</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Rye</td>
+<td>Corned beef</td>
+</tr>
+</tbody>
+</table>

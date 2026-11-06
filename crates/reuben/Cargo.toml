@@ -1,0 +1,21 @@
+[package]
+name = "reuben"
+version = "0.0.0"
+description = "The tastiest SSG. A static site generator with Rhai scripting in Markdown."
+readme = "../../README.md"
+keywords = ["static-site", "ssg", "markdown", "rhai"]
+categories = ["command-line-utilities", "web-programming"]
+include = ["src/**", "Cargo.toml", "LICENSE-MIT", "LICENSE-APACHE"]
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+clap.workspace = true
+reuben-core.workspace = true
+
+[dev-dependencies]
+assert_cmd.workspace = true
+predicates.workspace = true
+assert_fs.workspace = true
