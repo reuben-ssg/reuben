@@ -137,10 +137,13 @@ impl Site {
                     .map(|rel| (rel.clone(), static_dir.join(rel))),
             );
 
-        let mut seen: HashMap<PathBuf, PathBuf> = HashMap::new();
+        // Keyed case-insensitively: on macOS and Windows `Notes/` and `notes/` are the same directory, and a site
+        // that relies on the difference can't be deployed portably anyway.
+        let mut seen: HashMap<String, PathBuf> = HashMap::new();
         let mut errors = Vec::new();
         for (file, source) in sources {
-            if let Some(other) = seen.get(&file) {
+            let key = file.to_string_lossy().to_lowercase();
+            if let Some(other) = seen.get(&key) {
                 errors.push(Error::new(
                     &source,
                     ErrorKind::OutputCollision {
@@ -149,7 +152,7 @@ impl Site {
                     },
                 ));
             } else {
-                seen.insert(file, source);
+                seen.insert(key, source);
             }
         }
         if errors.is_empty() {

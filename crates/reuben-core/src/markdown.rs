@@ -21,7 +21,37 @@ pub fn parse(body: &str, body_line: usize) -> Document {
     let arena = Arena::new();
     let options = options();
     let root = comrak::parse_document(&arena, body, &options);
-    convert(root, body_line - 1, &options)
+    let mut doc = convert(root, body_line - 1, &options);
+    if let Some(footnotes) = footnotes_section(root, body_line - 1, &options) {
+        doc.children.push(footnotes);
+    }
+    doc
+}
+
+fn is_footnote_definition(node: &AstNode<'_>) -> bool {
+    matches!(node.data.borrow().value, NodeValue::FootnoteDefinition(_))
+}
+
+/// All footnote definitions as one `<section>`. comrak only numbers and wraps them correctly when it renders the
+/// whole document, so render it once and keep the footnotes section. `convert` skips the individual definitions.
+fn footnotes_section<'a>(
+    root: &'a AstNode<'a>,
+    line_offset: usize,
+    options: &Options,
+) -> Option<Node> {
+    let first = root.children().find(|c| is_footnote_definition(c))?;
+    let span = Span {
+        line: first.data.borrow().sourcepos.start.line + line_offset,
+        column: 1,
+    };
+    let mut html = String::new();
+    comrak::format_html(root, options, &mut html).expect("writing to a String cannot fail");
+    let start = html.find("<section class=\"footnotes\"")?;
+    Some(Node {
+        kind: NodeKind::Raw(html[start..].to_string()),
+        span,
+        children: Vec::new(),
+    })
 }
 
 fn convert<'a>(node: &'a AstNode<'a>, line_offset: usize, options: &Options) -> Node {
@@ -56,6 +86,9 @@ fn convert<'a>(node: &'a AstNode<'a>, line_offset: usize, options: &Options) -> 
             tight: l.tight,
         },
         NodeValue::Item(_) => NodeKind::Item,
+        NodeValue::TaskItem(t) => NodeKind::TaskItem {
+            checked: t.symbol.is_some_and(|c| c != ' '),
+        },
         NodeValue::BlockQuote => NodeKind::BlockQuote,
         NodeValue::ThematicBreak => NodeKind::ThematicBreak,
         NodeValue::SoftBreak => NodeKind::SoftBreak,
@@ -79,6 +112,7 @@ fn convert<'a>(node: &'a AstNode<'a>, line_offset: usize, options: &Options) -> 
         span,
         children: node
             .children()
+            .filter(|child| !is_footnote_definition(child))
             .map(|child| convert(child, line_offset, options))
             .collect(),
     }

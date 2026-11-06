@@ -132,3 +132,18 @@ fn reports_all_bad_files() {
     assert!(got[1].ends_with("content/no-title.md"));
     assert!(errors.iter().any(|e| matches!(e.kind, ErrorKind::NotUtf8)));
 }
+
+#[test]
+fn case_only_collision_names_both() {
+    let tmp = TempDir::new().unwrap();
+    tmp.child("content/Notes.md")
+        .write_str("---\ntitle: Upper\n---\n")
+        .unwrap();
+    tmp.child("content/notes/index.md")
+        .write_str("---\ntitle: Lower\n---\n")
+        .unwrap();
+    let errors = build(tmp.path(), false).unwrap_err();
+    let got = collision(&errors);
+    assert!(got[0].ends_with("content/Notes.md"), "{got:?}");
+    assert!(got[1].ends_with("content/notes/index.md"), "{got:?}");
+}

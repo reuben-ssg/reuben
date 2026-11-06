@@ -45,6 +45,9 @@ pub enum NodeKind {
         tight: bool,
     },
     Item,
+    TaskItem {
+        checked: bool,
+    },
     BlockQuote,
     ThematicBreak,
     SoftBreak,

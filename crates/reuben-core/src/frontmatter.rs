@@ -123,7 +123,10 @@ fn deserialize(text: &str, format: Format) -> Result<FrontMatter, FrontMatterErr
     };
     let raw: RawFrontMatter = serde_json::from_value(value).map_err(|e| err(e.to_string()))?;
     Ok(FrontMatter {
-        title: raw.title.ok_or(FrontMatterError::MissingTitle)?,
+        title: raw
+            .title
+            .filter(|t| !t.trim().is_empty())
+            .ok_or(FrontMatterError::MissingTitle)?,
         draft: raw.draft,
         description: raw.description,
         date: raw.date,
@@ -205,6 +208,19 @@ mod tests {
         assert!(matches!(
             parse("---\ntitle: [\n---\n"),
             Err(FrontMatterError::Yaml(_))
+        ));
+    }
+}
+
+#[cfg(test)]
+mod review_fixes {
+    use super::*;
+
+    #[test]
+    fn blank_title_is_missing() {
+        assert!(matches!(
+            parse("---\ntitle: \"  \"\n---\n"),
+            Err(FrontMatterError::MissingTitle)
         ));
     }
 }

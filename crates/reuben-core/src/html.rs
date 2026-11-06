@@ -116,7 +116,20 @@ fn block(out: &mut String, node: &Node, tight: bool) {
             }
             for item in &node.children {
                 cr(out);
-                out.push_str("<li>");
+                match &item.kind {
+                    NodeKind::Raw(html) => {
+                        out.push_str(html);
+                        continue;
+                    }
+                    NodeKind::TaskItem { checked } => {
+                        out.push_str("<li><input type=\"checkbox\" disabled=\"\"");
+                        if *checked {
+                            out.push_str(" checked=\"\"");
+                        }
+                        out.push_str(" /> ");
+                    }
+                    _ => out.push_str("<li>"),
+                }
                 children(out, item, *list_tight);
                 if !*list_tight {
                     cr(out);
@@ -226,5 +239,30 @@ mod tests {
     fn snapshot_mixed_document() {
         let d = crate::markdown::parse(include_str!("../tests/fixtures/mixed.md"), 1);
         insta::assert_snapshot!(render(&d));
+    }
+}
+
+#[cfg(test)]
+mod review_fixes {
+    use super::*;
+
+    #[test]
+    fn task_list_items_keep_content() {
+        let html = render(&crate::markdown::parse("- [ ] todo\n- [x] done\n", 1));
+        assert!(html.contains("todo"), "{html}");
+        assert!(html.contains("done"), "{html}");
+        assert_eq!(html.matches("type=\"checkbox\"").count(), 2, "{html}");
+        assert_eq!(html.matches("checked").count(), 1, "{html}");
+    }
+
+    #[test]
+    fn footnotes_share_one_section() {
+        let html = render(&crate::markdown::parse(
+            "A[^1] B[^2]\n\n[^1]: one\n[^2]: two\n",
+            1,
+        ));
+        assert_eq!(html.matches("<section").count(), 1, "{html}");
+        assert_eq!(html.matches("<ol").count(), 1, "{html}");
+        assert!(html.contains("one") && html.contains("two"), "{html}");
     }
 }
