@@ -27,6 +27,10 @@ pub enum ErrorKind {
     Config(String),
     #[error("layout `{0}` not found in the site or its theme")]
     LayoutNotFound(String),
+    #[error("invalid layout name `{0}`: a layout is a plain file name in `layouts/`")]
+    InvalidLayoutName(String),
+    #[error("internal error: a block placeholder was left in the rendered page")]
+    UnsplicedPlaceholder,
     #[error("file is not valid UTF-8")]
     NotUtf8,
     #[error("builds to {} too, which {} already builds to", file.display(), other.display())]

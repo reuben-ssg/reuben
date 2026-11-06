@@ -37,8 +37,14 @@ fn escape(s: &str) -> Cow<'_, str> {
     Cow::Owned(out)
 }
 
+/// Escapes script output. Unlike Markdown text it also maps `'`, since a layout may put a value in a
+/// single-quoted attribute.
+pub fn escape_output(s: &str) -> String {
+    escape(s).replace('\'', "&#39;")
+}
+
 /// Percent-encodes characters that are unsafe in a URL, then escapes the result for an attribute.
-fn url_attr(url: &str) -> String {
+pub(crate) fn url_attr(url: &str) -> String {
     const SAFE: &str = "-_.!~*'();/?:@&=+$,%#[]";
     let mut encoded = String::with_capacity(url.len());
     for c in url.chars() {

@@ -7,7 +7,7 @@ use std::path::{Path, PathBuf};
 
 use crate::blocks::{Block, BlockKind};
 use crate::doc::Span;
-use crate::html::escape_text;
+use crate::html::escape_output;
 use crate::splice::Output;
 
 #[derive(Clone)]
@@ -205,28 +205,35 @@ pub fn to_output(value: rhai::Dynamic) -> Result<Output, String> {
         return Ok(Output::Nothing);
     }
     let mut out = String::new();
-    write_value(value, &mut out)?;
-    Ok(Output::Html(out))
+    let mut html = false;
+    write_value(value, &mut out, &mut html)?;
+    Ok(if html {
+        Output::Html(out)
+    } else {
+        Output::Text(out)
+    })
 }
 
-fn write_value(value: rhai::Dynamic, out: &mut String) -> Result<(), String> {
+/// `html` is set when any `Html` value contributes, which makes the whole output markup.
+fn write_value(value: rhai::Dynamic, out: &mut String, html: &mut bool) -> Result<(), String> {
     if value.is_unit() {
         Ok(())
     } else if value.is_string() {
-        out.push_str(&escape_text(&value.into_string()?));
+        out.push_str(&escape_output(&value.into_string()?));
         Ok(())
     } else if value.is::<Html>() {
+        *html = true;
         out.push_str(&value.cast::<Html>().0);
         Ok(())
     } else if value.is_array() {
         let items = value.into_array().map_err(|t| t.to_string())?;
         items
             .into_iter()
-            .try_for_each(|item| write_value(item, out))
+            .try_for_each(|item| write_value(item, out, html))
     } else if value.is_map() {
         Err("can't output a map; output one of its fields".to_string())
     } else if value.is_int() || value.is_float() || value.is_bool() || value.is_char() {
-        out.push_str(&escape_text(&value.to_string()));
+        out.push_str(&escape_output(&value.to_string()));
         Ok(())
     } else {
         Err(format!(
@@ -256,7 +263,11 @@ mod tests {
 
     #[test]
     fn strings_are_escaped() {
-        assert_eq!(eval("\"<a>\"").unwrap(), Output::Html("&lt;a&gt;".into()));
+        assert_eq!(eval("\"<a>\"").unwrap(), Output::Text("&lt;a&gt;".into()));
+    }
+    #[test]
+    fn single_quotes_are_escaped() {
+        assert_eq!(eval("\"it's\"").unwrap(), Output::Text("it&#39;s".into()));
     }
     #[test]
     fn html_is_raw() {
@@ -268,6 +279,7 @@ mod tests {
             eval("[\"a\", raw(\"<b>\"), 3]").unwrap(),
             Output::Html("a<b>3".into())
         );
+        assert_eq!(eval("[\"a\", 3]").unwrap(), Output::Text("a3".into()));
     }
     #[test]
     fn unit_outputs_nothing() {
@@ -306,7 +318,7 @@ mod tests {
             engine
                 .eval_block(&mut scope, &out, Path::new("p.md"))
                 .unwrap(),
-            Output::Html("42".into())
+            Output::Text("42".into())
         );
     }
     #[test]

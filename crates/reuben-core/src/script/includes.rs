@@ -124,7 +124,7 @@ mod tests {
     #[test]
     fn site_include_overrides_theme() {
         match eval_with(&["theme", "site"], "card(\"y\")").unwrap() {
-            Output::Html(h) => assert!(h.contains("<b>site y</b>"), "{h}"),
+            Output::Html(h) | Output::Text(h) => assert!(h.contains("<b>site y</b>"), "{h}"),
             other => panic!("{other:?}"),
         }
     }

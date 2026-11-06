@@ -14,7 +14,7 @@ use crate::frontmatter::{self, FrontMatter};
 use crate::route::{Route, route_for_page};
 use crate::script::{Html, ScriptEngine};
 use crate::theme::{PageShell, builtin_page};
-use crate::{html, layout, page};
+use crate::{html, layout, page, splice};
 
 /// Written into every output directory Reuben builds. Only a directory containing it is ever cleared.
 pub const OUTPUT_MARKER: &str = ".reuben-output";
@@ -177,6 +177,10 @@ impl Site {
                     body: &body,
                 }),
             };
+            if let Err(e) = splice::ensure_no_placeholders(&page.source, &output) {
+                errors.push(e);
+                continue;
+            }
             let dest = opts.out.join(&page.route.file);
             if let Err(e) = write(&dest, output.as_bytes()) {
                 errors.push(Error::new(&dest, e));

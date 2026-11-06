@@ -16,6 +16,14 @@ pub fn find_layout(
     theme: Option<&Path>,
 ) -> Result<Option<PathBuf>, Error> {
     let stem = name.map(|n| n.strip_suffix(".html").unwrap_or(n));
+    if let Some(stem) = stem
+        && (stem.is_empty() || stem.contains(['/', '\\']) || stem.contains(".."))
+    {
+        return Err(Error::new(
+            "",
+            ErrorKind::InvalidLayoutName(stem.to_string()),
+        ));
+    }
     let file = format!("{}.html", stem.unwrap_or("default"));
     let found = [Some(root), theme]
         .into_iter()
@@ -58,7 +66,7 @@ pub fn render_layout(
     let mut result = extracted.text;
     for (n, out) in outputs.into_iter().enumerate() {
         let html = match out {
-            Output::Html(s) => s,
+            Output::Text(s) | Output::Html(s) => s,
             Output::Nothing => String::new(),
         };
         result = result.replace(&placeholder(n), &html);

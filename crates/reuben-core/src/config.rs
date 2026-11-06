@@ -36,10 +36,19 @@ pub fn load(root: &Path) -> Result<Config, Error> {
         },
         Err(e) => return Err(Error::new(&path, e)),
     };
+    let theme = raw.theme.map(|t| root.join(t));
+    if let Some(theme) = &theme
+        && !theme.is_dir()
+    {
+        return Err(Error::new(
+            &path,
+            ErrorKind::Config(format!("theme `{}` is not a directory", theme.display())),
+        ));
+    }
     Ok(Config {
         title: raw.title.unwrap_or_default(),
         base_url: raw.base_url.unwrap_or_else(|| "/".into()),
-        theme: raw.theme.map(|t| root.join(t)),
+        theme,
         params: raw.params,
     })
 }
@@ -63,6 +72,7 @@ mod tests {
     #[test]
     fn reads_keys_and_resolves_theme() {
         let tmp = TempDir::new().unwrap();
+        tmp.child("themes/a").create_dir_all().unwrap();
         tmp.child("reuben.toml")
             .write_str("title = \"T\"\nbase_url = \"/x/\"\ntheme = \"themes/a\"\n[params]\nk = 1\n")
             .unwrap();
