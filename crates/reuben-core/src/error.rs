@@ -2,7 +2,9 @@
 
 use std::path::PathBuf;
 
+use crate::blocks::BlockError;
 use crate::frontmatter::FrontMatterError;
+use crate::script::ScriptError;
 
 #[derive(Debug, thiserror::Error)]
 #[error("{}: {kind}", path.display())]
@@ -17,6 +19,10 @@ pub enum ErrorKind {
     FrontMatter(#[from] FrontMatterError),
     #[error("{0}")]
     Io(#[from] std::io::Error),
+    #[error("{0}")]
+    Script(ScriptError),
+    #[error("{0}")]
+    Block(BlockError),
     #[error("file is not valid UTF-8")]
     NotUtf8,
     #[error("builds to {} too, which {} already builds to", file.display(), other.display())]
