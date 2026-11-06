@@ -1,6 +1,7 @@
 //! The sandboxed Rhai engine that evaluates template blocks and sidecar scripts.
 
 mod helpers;
+mod includes;
 
 use std::path::{Path, PathBuf};
 
@@ -38,6 +39,8 @@ pub struct ScriptEngine {
 }
 
 thread_local! {
+    /// The include call chain at the most recent include call, for errors Rhai reports without one.
+    static CALL_CHAIN: std::cell::RefCell<Vec<Frame>> = const { std::cell::RefCell::new(Vec::new()) };
     static CURRENT_FILE: std::cell::RefCell<String> = const { std::cell::RefCell::new(String::new()) };
 }
 
@@ -76,6 +79,7 @@ impl ScriptEngine {
         file: &Path,
     ) -> Result<Output, ScriptError> {
         let file_str = file.display().to_string();
+        CALL_CHAIN.with(|c| c.borrow_mut().clear());
         CURRENT_FILE.with(|f| f.borrow_mut().clone_from(&file_str));
         let map_pos = |pos: rhai::Position| {
             let (line, col) = (pos.line()?, pos.position().unwrap_or(1));
@@ -97,14 +101,7 @@ impl ScriptEngine {
                 stack: Vec::new(),
             })?;
         ast.set_source(file_str);
-        let runtime_err = |mut e: Box<rhai::EvalAltResult>| {
-            let pos = e.take_position();
-            ScriptError {
-                message: e.to_string(),
-                location: map_pos(pos),
-                stack: Vec::new(),
-            }
-        };
+        let runtime_err = |e: Box<rhai::EvalAltResult>| runtime_error(*e, map_pos);
         match block.kind {
             BlockKind::Setup => {
                 self.engine
@@ -132,6 +129,7 @@ impl ScriptEngine {
         path: &Path,
     ) -> Result<(), ScriptError> {
         let path_str = path.display().to_string();
+        CALL_CHAIN.with(|c| c.borrow_mut().clear());
         CURRENT_FILE.with(|f| f.borrow_mut().clone_from(&path_str));
         let plain = |message: String, pos: rhai::Position| ScriptError {
             message,
@@ -148,12 +146,55 @@ impl ScriptEngine {
             .compile(&src)
             .map_err(|e| plain(e.err_type().to_string(), e.position()))?;
         ast.set_source(path_str);
-        self.engine
-            .run_ast_with_scope(scope, &ast)
-            .map_err(|mut e| {
-                let pos = e.take_position();
-                plain(e.to_string(), pos)
+        self.engine.run_ast_with_scope(scope, &ast).map_err(|e| {
+            runtime_error(*e, |pos| {
+                pos.line().map(|line| Span {
+                    line,
+                    column: pos.position().unwrap_or(1),
+                })
             })
+        })
+    }
+}
+
+/// Splits a runtime error into the failing call site, the innermost message and the include call chain.
+/// `map_pos` maps the outermost position (the caller's own source); frame positions are within include files.
+fn runtime_error(
+    mut err: rhai::EvalAltResult,
+    map_pos: impl Fn(rhai::Position) -> Option<Span>,
+) -> ScriptError {
+    let location = map_pos(err.take_position());
+    let mut calls: Vec<(String, String, rhai::Position)> = Vec::new();
+    let mut inner = err;
+    while let rhai::EvalAltResult::ErrorInFunctionCall(name, source, next, _) = inner {
+        calls.push((name, source, next.position()));
+        inner = *next;
+    }
+    let overflowed = matches!(inner, rhai::EvalAltResult::ErrorStackOverflow(_));
+    let stack = if overflowed {
+        CALL_CHAIN.with(|c| std::mem::take(&mut *c.borrow_mut()))
+    } else {
+        calls
+            .into_iter()
+            .map(|(function, file, pos)| Frame {
+                function,
+                file: PathBuf::from(file),
+                line: pos.line().unwrap_or(0),
+                column: pos.position().unwrap_or(1),
+            })
+            .collect()
+    };
+    let message = match inner {
+        rhai::EvalAltResult::ErrorStackOverflow(_) => {
+            "call stack limit exceeded (functions nest too deeply, usually runaway recursion)"
+                .to_string()
+        }
+        other => other.to_string(),
+    };
+    ScriptError {
+        message,
+        location,
+        stack,
     }
 }
 
