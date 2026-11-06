@@ -3,6 +3,8 @@
 use serde::Deserialize;
 use serde_json::{Map, Value};
 
+use crate::merge::toml_to_json;
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct FrontMatter {
     pub title: String,
@@ -134,21 +136,6 @@ fn deserialize(text: &str, format: Format) -> Result<FrontMatter, FrontMatterErr
         weight: raw.weight,
         extra: raw.extra,
     })
-}
-
-/// TOML dates become strings, matching how YAML dates arrive, so `date` works the same in both formats.
-fn toml_to_json(value: toml::Value) -> Value {
-    match value {
-        toml::Value::String(s) => Value::String(s),
-        toml::Value::Integer(i) => Value::from(i),
-        toml::Value::Float(f) => Value::from(f),
-        toml::Value::Boolean(b) => Value::Bool(b),
-        toml::Value::Datetime(d) => Value::String(d.to_string()),
-        toml::Value::Array(a) => Value::Array(a.into_iter().map(toml_to_json).collect()),
-        toml::Value::Table(t) => {
-            Value::Object(t.into_iter().map(|(k, v)| (k, toml_to_json(v))).collect())
-        }
-    }
 }
 
 #[cfg(test)]

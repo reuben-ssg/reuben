@@ -10,6 +10,7 @@ pub mod frontmatter;
 pub mod html;
 pub mod layout;
 pub mod markdown;
+pub mod merge;
 pub mod page;
 pub mod route;
 pub mod script;
