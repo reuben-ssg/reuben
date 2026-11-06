@@ -7,7 +7,7 @@ use std::path::Path;
 use super::ScriptEngine;
 use crate::doc::Span;
 use crate::error::{Error, ErrorKind};
-use crate::script::{CALL_CHAIN, Frame, ScriptError};
+use crate::script::ScriptError;
 
 impl ScriptEngine {
     /// Registers every `*.rhai` file directly in each dir, lowest precedence first.
@@ -34,38 +34,13 @@ impl ScriptEngine {
         if !errors.is_empty() {
             return Err(errors);
         }
-        let mut names = std::collections::BTreeSet::new();
-        for (module, fn_names) in modules {
-            names.extend(fn_names);
+        for module in modules {
             self.engine.register_global_module(module);
         }
-        let names: Vec<rhai::ImmutableString> = names.into_iter().map(Into::into).collect();
-        #[allow(deprecated)] // volatile API, pinned by the Cargo.lock version
-        self.engine.register_debugger(
-            move |_, mut dbg| {
-                for name in &names {
-                    dbg.break_points_mut()
-                        .push(rhai::debugger::BreakPoint::AtFunctionName {
-                            name: name.clone(),
-                            enabled: true,
-                        });
-                }
-                dbg
-            },
-            |ctx, _event, _node, _src, pos| {
-                if let Some(dbg) = ctx.debugger() {
-                    record_call_chain(dbg.call_stack(), pos);
-                }
-                Ok(rhai::debugger::DebuggerCommand::Continue)
-            },
-        );
         Ok(())
     }
 
-    fn compile_include(
-        &self,
-        path: &Path,
-    ) -> Result<(rhai::Shared<rhai::Module>, Vec<String>), Error> {
+    fn compile_include(&self, path: &Path) -> Result<rhai::Shared<rhai::Module>, Error> {
         let fail = |message: String, pos: rhai::Position| {
             Error::new(
                 path,
@@ -90,28 +65,8 @@ impl ScriptEngine {
                 let pos = e.take_position();
                 fail(e.to_string(), pos)
             })?;
-        let fn_names = ast.iter_functions().map(|f| f.name.to_string()).collect();
-        Ok((module.into(), fn_names))
+        Ok(module.into())
     }
-}
-
-/// Rhai drops the include call chain when the call-depth limit is hit, so each include call records it.
-/// A frame's position is where it makes its next call; `next_call` is that position for the last frame.
-fn record_call_chain(stack: &[rhai::debugger::CallStackFrame], next_call: rhai::Position) {
-    let frames = stack
-        .iter()
-        .enumerate()
-        .map(|(i, f)| {
-            let pos = stack.get(i + 1).map_or(next_call, |next| next.pos);
-            Frame {
-                function: f.fn_name.to_string(),
-                file: PathBuf::from(f.source.as_deref().unwrap_or("")),
-                line: pos.line().unwrap_or(0),
-                column: pos.position().unwrap_or(1),
-            }
-        })
-        .collect();
-    CALL_CHAIN.with(|c| *c.borrow_mut() = frames);
 }
 
 fn list_rhai(dir: &Path) -> std::io::Result<Vec<PathBuf>> {
@@ -177,12 +132,11 @@ mod tests {
     #[test]
     fn mutual_recursion_is_a_clean_error() {
         let err = eval_with(&["loop"], "ping(0)").unwrap_err();
-        assert!(err.message.contains("call stack limit"), "{}", err.message);
-        assert!(err.stack.len() >= 2, "{:?}", err.stack);
-        assert_eq!(err.stack[0].function, "ping");
-        assert!(err.stack[0].file.ends_with("a.rhai"));
-        assert_eq!(err.stack[1].function, "pong");
-        assert!(err.stack[1].file.ends_with("b.rhai"));
+        assert_eq!(
+            err.message,
+            "include call depth limit (32) exceeded; an include probably calls itself"
+        );
+        assert_eq!(err.location.unwrap().line, 10);
     }
 
     #[test]

@@ -39,8 +39,6 @@ pub struct ScriptEngine {
 }
 
 thread_local! {
-    /// The include call chain at the most recent include call, for errors Rhai reports without one.
-    static CALL_CHAIN: std::cell::RefCell<Vec<Frame>> = const { std::cell::RefCell::new(Vec::new()) };
     static CURRENT_FILE: std::cell::RefCell<String> = const { std::cell::RefCell::new(String::new()) };
 }
 
@@ -79,7 +77,6 @@ impl ScriptEngine {
         file: &Path,
     ) -> Result<Output, ScriptError> {
         let file_str = file.display().to_string();
-        CALL_CHAIN.with(|c| c.borrow_mut().clear());
         CURRENT_FILE.with(|f| f.borrow_mut().clone_from(&file_str));
         let map_pos = |pos: rhai::Position| {
             let (line, col) = (pos.line()?, pos.position().unwrap_or(1));
@@ -129,7 +126,6 @@ impl ScriptEngine {
         path: &Path,
     ) -> Result<(), ScriptError> {
         let path_str = path.display().to_string();
-        CALL_CHAIN.with(|c| c.borrow_mut().clear());
         CURRENT_FILE.with(|f| f.borrow_mut().clone_from(&path_str));
         let plain = |message: String, pos: rhai::Position| ScriptError {
             message,
@@ -172,7 +168,7 @@ fn runtime_error(
     }
     let overflowed = matches!(inner, rhai::EvalAltResult::ErrorStackOverflow(_));
     let stack = if overflowed {
-        CALL_CHAIN.with(|c| std::mem::take(&mut *c.borrow_mut()))
+        Vec::new()
     } else {
         calls
             .into_iter()
@@ -186,8 +182,7 @@ fn runtime_error(
     };
     let message = match inner {
         rhai::EvalAltResult::ErrorStackOverflow(_) => {
-            "call stack limit exceeded (functions nest too deeply, usually runaway recursion)"
-                .to_string()
+            "include call depth limit (32) exceeded; an include probably calls itself".to_string()
         }
         other => other.to_string(),
     };
