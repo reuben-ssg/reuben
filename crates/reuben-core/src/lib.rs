@@ -2,6 +2,7 @@
 
 #![forbid(unsafe_code)]
 
+pub mod blocks;
 pub mod doc;
 pub mod error;
 pub mod frontmatter;
