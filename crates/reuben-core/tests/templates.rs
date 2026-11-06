@@ -235,3 +235,31 @@ fn junk_and_hidden_files_are_not_copied() {
     }
     assert!(dist.join(".well-known/security.txt").exists());
 }
+
+#[test]
+fn junk_files_with_front_matter_are_never_loaded() {
+    let tmp = fixture_copy();
+    let fm = "---\ntitle: J\n---\n{{ 1 + 1 }}\n";
+    tmp.child("content/posts/a.md~").write_str(fm).unwrap();
+    tmp.child("static/site.css~").write_str(fm).unwrap();
+    build_in(&tmp, false).unwrap();
+    let dist = tmp.path().join("dist");
+    assert!(!dist.join("posts/a.md~").exists());
+    assert!(!dist.join("site.css~").exists());
+}
+
+#[test]
+fn theme_junk_is_not_copied() {
+    let tmp = fixture_copy();
+    tmp.child("reuben.toml")
+        .write_str("theme = \"mytheme\"\n")
+        .unwrap();
+    tmp.child("mytheme/static/.DS_Store")
+        .write_str("junk")
+        .unwrap();
+    tmp.child("mytheme/static/ok.txt").write_str("ok").unwrap();
+    build_in(&tmp, false).unwrap();
+    let dist = tmp.path().join("dist");
+    assert!(dist.join("ok.txt").exists());
+    assert!(!dist.join(".DS_Store").exists());
+}

@@ -150,6 +150,7 @@ impl Site {
                     if rel
                         .components()
                         .any(|c| c.as_os_str().to_string_lossy().starts_with('.'))
+                        || is_junk(&rel)
                     {
                         continue;
                     }
@@ -160,8 +161,7 @@ impl Site {
                     };
                     match loaded {
                         Ok(Some(page)) => pages.push(page),
-                        Ok(None) if !is_junk(&rel) => asset_rels.push(rel),
-                        Ok(None) => {}
+                        Ok(None) => asset_rels.push(rel),
                         Err(e) => errors.push(e),
                     }
                 }
@@ -181,13 +181,15 @@ impl Site {
         let mut static_files = Vec::new();
         if static_dir.exists() {
             for (path, rel) in walk(&static_dir, &mut errors) {
+                if is_junk(&rel) {
+                    continue;
+                }
                 match load_template(&path, &rel, None) {
                     Ok(Some(mut page)) => {
                         page.draft_excluded = page.front_matter.draft;
                         pages.push(page);
                     }
-                    Ok(None) if !is_junk(&rel) => static_files.push(rel),
-                    Ok(None) => {}
+                    Ok(None) => static_files.push(rel),
                     Err(e) => errors.push(e),
                 }
             }
@@ -198,6 +200,7 @@ impl Site {
                 walk(&theme.join("static"), &mut errors)
                     .into_iter()
                     .map(|(_, rel)| rel)
+                    .filter(|rel| !is_junk(rel))
                     .collect()
             }
             _ => Vec::new(),
@@ -337,13 +340,7 @@ impl Site {
             .static_files
             .iter()
             // A static template's sidecar script is source, not an asset.
-            .filter(|rel| {
-                let lower = |p: &Path| p.to_string_lossy().to_lowercase();
-                let file = lower(&site_dir.join(rel));
-                !self.pages.iter().any(|p| {
-                    p.from_static && p.sidecar.as_deref().is_some_and(|s| lower(s) == file)
-                })
-            })
+            .filter(|rel| !is_static_sidecar(&self.pages, &site_dir, rel))
             .map(|rel| (rel.clone(), site_dir.join(rel)));
         let content_dir = self.root.join("content");
         let assets = self
@@ -503,6 +500,16 @@ fn mark_draft_excluded(pages: &mut [Page], dirs: &DirDefaults) {
     }
 }
 
+/// True when `rel` (under `static_dir`) is the sidecar script of a static template, compared case-insensitively
+/// because a case-insensitive filesystem resolves the sidecar whatever its case.
+fn is_static_sidecar(pages: &[Page], static_dir: &Path, rel: &Path) -> bool {
+    let lower = |p: &Path| p.to_string_lossy().to_lowercase();
+    let file = lower(&static_dir.join(rel));
+    pages
+        .iter()
+        .any(|p| p.from_static && p.sidecar.as_deref().is_some_and(|s| lower(s) == file))
+}
+
 /// OS and editor leftovers that are never published, wherever they sit.
 fn is_junk(rel: &Path) -> bool {
     rel.file_name().is_some_and(|n| {
@@ -558,4 +565,44 @@ fn write(dest: &Path, bytes: &[u8]) -> std::io::Result<()> {
         fs::create_dir_all(parent)?;
     }
     fs::write(dest, bytes)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn static_template(sidecar: Option<&str>) -> Page {
+        Page {
+            kind: PageKind::Template {
+                escape: Escape::None,
+            },
+            from_static: true,
+            source: PathBuf::from("/s/static/side.css"),
+            front_matter: frontmatter::from_value(
+                serde_json::json!({"title": "T"})
+                    .as_object()
+                    .unwrap()
+                    .clone(),
+            )
+            .unwrap(),
+            body: String::new(),
+            body_line: 1,
+            rel: PathBuf::from("side.css"),
+            sidecar: sidecar.map(PathBuf::from),
+            route: route_for_template(Path::new("side.css")),
+            front_matter_sources: BTreeMap::new(),
+            draft_excluded: false,
+        }
+    }
+
+    #[test]
+    fn sidecar_match_ignores_case_without_touching_the_filesystem() {
+        let pages = [static_template(Some("/s/static/side.rhai"))];
+        let dir = Path::new("/s/static");
+        assert!(is_static_sidecar(&pages, dir, Path::new("side.RHAI")));
+        assert!(is_static_sidecar(&pages, dir, Path::new("side.rhai")));
+        assert!(!is_static_sidecar(&pages, dir, Path::new("other.rhai")));
+        let none = [static_template(None)];
+        assert!(!is_static_sidecar(&none, dir, Path::new("side.rhai")));
+    }
 }
