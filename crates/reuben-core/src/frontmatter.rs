@@ -136,7 +136,11 @@ fn to_map(text: &str, format: Format) -> Result<Map<String, Value>, FrontMatterE
         Format::Toml => FrontMatterError::Toml(e),
     };
     let value = match format {
-        Format::Yaml => serde_saphyr::from_str::<Value>(text).map_err(|e| err(e.to_string()))?,
+        Format::Yaml => serde_saphyr::from_str_with_options::<Value>(
+            text,
+            serde_saphyr::options! { strict_booleans: true },
+        )
+        .map_err(|e| err(e.to_string()))?,
         Format::Toml => toml_to_json(toml::from_str(text).map_err(|e| err(e.to_string()))?),
     };
     match value {
@@ -222,6 +226,45 @@ mod tests {
             parse("---\ntitle: [\n---\n"),
             Err(FrontMatterError::Yaml(_))
         ));
+    }
+}
+
+#[cfg(test)]
+mod raw_tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn yaml_only_treats_true_and_false_as_booleans() {
+        let p = parse("---\ntitle: No\ntags: [on, off]\n---\n").unwrap();
+        assert_eq!(p.front_matter.title, "No");
+        assert_eq!(p.front_matter.extra["tags"], json!(["on", "off"]));
+    }
+
+    #[test]
+    fn parse_raw_does_not_validate() {
+        let raw = parse_raw("---\ndraft: true\n---\nBody\n").unwrap();
+        assert_eq!(raw.value["draft"], json!(true));
+        assert!(!raw.value.contains_key("title"));
+        assert_eq!(raw.body, "Body\n");
+        assert_eq!(raw.body_line, 4);
+    }
+
+    #[test]
+    fn from_value_requires_a_title() {
+        let map = |v: Value| v.as_object().unwrap().clone();
+        assert!(matches!(
+            from_value(map(json!({"draft": true}))),
+            Err(FrontMatterError::MissingTitle)
+        ));
+        let fm = from_value(map(json!({"title": "Hi"}))).unwrap();
+        assert_eq!(fm.title, "Hi");
+    }
+
+    #[test]
+    fn from_value_rejects_wrong_types() {
+        let map = json!({"title": 5}).as_object().unwrap().clone();
+        assert!(matches!(from_value(map), Err(FrontMatterError::Invalid(_))));
     }
 }
 

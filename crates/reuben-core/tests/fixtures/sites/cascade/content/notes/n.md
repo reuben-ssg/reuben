@@ -1,4 +1,4 @@
 ---
-title: "N"
+title: N
 ---
 N

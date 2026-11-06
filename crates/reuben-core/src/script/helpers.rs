@@ -40,9 +40,11 @@ fn load_data(root: &Path, path: &str) -> RhaiResult<Dynamic> {
     let value: serde_json::Value = match full.extension().and_then(|e| e.to_str()) {
         Some("json") => serde_json::from_str(&text).map_err(|e| parse_err(e.to_string()))?,
         Some("toml") => toml::from_str(&text).map_err(|e| parse_err(e.to_string()))?,
-        Some("yaml" | "yml") => {
-            serde_saphyr::from_str(&text).map_err(|e| parse_err(e.to_string()))?
-        }
+        Some("yaml" | "yml") => serde_saphyr::from_str_with_options(
+            &text,
+            serde_saphyr::options! { strict_booleans: true },
+        )
+        .map_err(|e| parse_err(e.to_string()))?,
         _ => {
             return Err(fail(format!(
                 "load_data(\"{path}\"): only .json, .toml, .yaml and .yml files can be loaded"
@@ -78,6 +80,15 @@ mod tests {
         let engine = ScriptEngine::new(dir.path());
         let v = run(&engine, "load_data(\"data/x.json\").n").unwrap();
         assert_eq!(v.as_int().unwrap(), 1);
+    }
+
+    #[test]
+    fn load_data_yaml_only_treats_true_and_false_as_booleans() {
+        let dir = assert_fs::TempDir::new().unwrap();
+        dir.child("data/x.yaml").write_str("answer: yes\n").unwrap();
+        let engine = ScriptEngine::new(dir.path());
+        let v = run(&engine, "load_data(\"data/x.yaml\").answer").unwrap();
+        assert_eq!(v.into_string().unwrap(), "yes");
     }
 
     #[test]
