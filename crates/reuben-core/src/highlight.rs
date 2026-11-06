@@ -16,22 +16,16 @@ pub trait Highlighter: Send + Sync {
     fn highlight(&self, lang: &str, code: &str) -> Option<String>;
 }
 
-pub struct SyntectHighlighter {
-    syntaxes: SyntaxSet,
-}
+/// Highlights with syntect. Loading the syntax set is slow, so it happens on the first `highlight` call that
+/// names a language, never on construction.
+pub struct SyntectHighlighter;
 
-impl SyntectHighlighter {
-    pub fn new() -> Self {
-        SyntectHighlighter {
-            syntaxes: SyntaxSet::load_defaults_newlines(),
-        }
-    }
-}
+static SYNTAXES: OnceLock<SyntaxSet> = OnceLock::new();
 
-impl Default for SyntectHighlighter {
-    fn default() -> Self {
-        Self::new()
-    }
+/// Test probe: whether the syntax set has been loaded in this process.
+#[doc(hidden)]
+pub fn syntaxes_loaded() -> bool {
+    SYNTAXES.get().is_some()
 }
 
 impl Highlighter for SyntectHighlighter {
@@ -41,9 +35,13 @@ impl Highlighter for SyntectHighlighter {
             .next()
             .unwrap_or_default()
             .to_lowercase();
-        let syntax = self.syntaxes.find_syntax_by_token(&token)?;
+        if token.is_empty() {
+            return None;
+        }
+        let syntaxes = SYNTAXES.get_or_init(SyntaxSet::load_defaults_newlines);
+        let syntax = syntaxes.find_syntax_by_token(&token)?;
         let mut generator =
-            ClassedHTMLGenerator::new_with_class_style(syntax, &self.syntaxes, CLASS_STYLE);
+            ClassedHTMLGenerator::new_with_class_style(syntax, syntaxes, CLASS_STYLE);
         for line in LinesWithEndings::from(code) {
             generator
                 .parse_html_for_line_which_includes_newline(line)
@@ -53,10 +51,9 @@ impl Highlighter for SyntectHighlighter {
     }
 }
 
-/// The shared highlighter, built on first use because loading the syntax set is slow.
+/// The shared highlighter. Constructing it is free; see [`SyntectHighlighter`].
 pub fn default_highlighter() -> &'static dyn Highlighter {
-    static H: OnceLock<SyntectHighlighter> = OnceLock::new();
-    H.get_or_init(SyntectHighlighter::new)
+    &SyntectHighlighter
 }
 
 /// CSS for the `hl-` classes from a built-in syntect theme name or a `.tmTheme` file path.
