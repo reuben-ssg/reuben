@@ -5,6 +5,8 @@
 pub mod doc;
 pub mod error;
 pub mod frontmatter;
+pub mod html;
 pub mod markdown;
+pub mod theme;
 
 pub use error::{Error, ErrorKind};

@@ -42,6 +42,7 @@ pub enum NodeKind {
     List {
         ordered: bool,
         start: usize,
+        tight: bool,
     },
     Item,
     BlockQuote,

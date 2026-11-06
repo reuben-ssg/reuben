@@ -53,6 +53,7 @@ fn convert<'a>(node: &'a AstNode<'a>, line_offset: usize, options: &Options) -> 
         NodeValue::List(l) => NodeKind::List {
             ordered: l.list_type == ListType::Ordered,
             start: l.start,
+            tight: l.tight,
         },
         NodeValue::Item(_) => NodeKind::Item,
         NodeValue::BlockQuote => NodeKind::BlockQuote,
