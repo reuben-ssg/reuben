@@ -51,6 +51,7 @@ impl ScriptEngine {
         engine.set_max_array_size(100_000);
         engine.set_max_map_size(100_000);
         engine.disable_symbol("eval");
+        engine.set_module_resolver(rhai::module_resolvers::DummyModuleResolver::new());
         engine.on_print(|text| {
             CURRENT_FILE.with(|f| eprintln!("{}: {text}", f.borrow()));
         });
@@ -284,5 +285,14 @@ mod tests {
     #[test]
     fn eval_is_disabled() {
         assert!(eval("eval(\"1\")").is_err());
+    }
+    #[test]
+    fn import_is_disabled() {
+        use assert_fs::prelude::*;
+        let dir = assert_fs::TempDir::new().unwrap();
+        dir.child("m.rhai").write_str("fn f() { 1 }").unwrap();
+        let module = dir.path().join("m");
+        let src = format!("import {:?} as m; m::f()", module.to_str().unwrap());
+        assert!(eval(&src).is_err());
     }
 }
