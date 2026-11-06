@@ -3,6 +3,7 @@
 use std::path::PathBuf;
 
 use crate::blocks::BlockError;
+use crate::doc::Span;
 use crate::frontmatter::FrontMatterError;
 use crate::script::ScriptError;
 
@@ -23,6 +24,8 @@ pub enum ErrorKind {
     Script(ScriptError),
     #[error("{0}")]
     Block(BlockError),
+    #[error("math: {message}")]
+    Math { message: String, location: Span },
     #[error("config: {0}")]
     Config(String),
     #[error("data: {0}")]

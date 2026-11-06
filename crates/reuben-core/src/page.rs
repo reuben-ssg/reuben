@@ -8,9 +8,11 @@ use crate::collections;
 use crate::config::Config;
 use crate::doc::Document;
 use crate::error::{Error, ErrorKind};
+use crate::headings;
 use crate::markdown;
+use crate::math;
 use crate::script::ScriptEngine;
-use crate::site::Page;
+use crate::site::{Page, PageKind};
 use crate::splice::{self, Output};
 use crate::template::Escape;
 
@@ -67,7 +69,24 @@ pub(crate) fn page_map(page: &Page, config: &Config) -> Result<Map, Error> {
         "collection".into(),
         collections::public_name(&page.rel, config).into(),
     );
+    map.insert(
+        "toc".into(),
+        headings::toc_array(&pre_block_toc(page)).into(),
+    );
     Ok(map)
+}
+
+/// The table of contents before blocks run, so it's what page blocks and collection items see.
+/// A body whose blocks can't be extracted has none; the page's own render reports that error.
+fn pre_block_toc(page: &Page) -> Vec<headings::TocEntry> {
+    if page.kind != PageKind::Markdown {
+        return Vec::new();
+    }
+    let skip = markdown::code_ranges(&page.body);
+    let Ok(extracted) = blocks::extract(&page.body, page.body_line, &skip) else {
+        return Vec::new();
+    };
+    headings::assign_ids_before_blocks(&mut markdown::parse(&extracted.text, page.body_line))
 }
 
 fn opt<T: Clone + Send + Sync + 'static>(v: Option<T>) -> Dynamic {
@@ -132,5 +151,22 @@ pub fn render_body(
         return Err(errors);
     }
     splice::splice(&mut doc, &outputs);
+    // Ids are assigned first so a heading's slug reads its LaTeX, not the MathML's annotation.
+    let toc = headings::toc_array(&headings::assign_ids(&mut doc));
+    math::render_math(&mut doc).map_err(|errors| {
+        errors
+            .into_iter()
+            .map(|(location, message)| {
+                Error::new(&page.source, ErrorKind::Math { message, location })
+            })
+            .collect::<Vec<_>>()
+    })?;
+
+    // Constants can't be reassigned, so the layout's `page` is swapped for a copy carrying the final toc.
+    if let Some(mut page_map) = scope.get_value::<Map>("page") {
+        page_map.insert("toc".into(), toc.into());
+        let _ = scope.remove::<Map>("page");
+        scope.push_constant("page", page_map);
+    }
     Ok((doc, scope))
 }

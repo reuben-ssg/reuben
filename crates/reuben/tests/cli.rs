@@ -83,3 +83,21 @@ fn warnings_print_to_stderr() {
         .success()
         .stderr(predicates::str::contains("warning: sitemap.xml skipped"));
 }
+
+#[test]
+fn css_highlight_prints_css() {
+    reuben()
+        .args(["css", "highlight"])
+        .assert()
+        .success()
+        .stdout(predicates::str::contains(".hl-"));
+}
+
+#[test]
+fn css_highlight_bad_theme_fails() {
+    reuben()
+        .args(["css", "highlight", "--theme", "nope"])
+        .assert()
+        .code(1)
+        .stderr(predicates::str::contains("nope"));
+}

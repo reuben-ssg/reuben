@@ -13,7 +13,7 @@ expression: "fs::read_to_string(out.join(\"about/index.html\")).unwrap()"
 </head>
 <body>
 <main>
-<h1>About</h1>
+<h1 id="about">About</h1>
 <p>Rye, corned beef, and <a href="/notes/">notes</a>.</p>
 </main>
 </body>

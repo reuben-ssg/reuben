@@ -49,6 +49,21 @@ pub fn placeholder(n: usize) -> String {
     format!("\u{E000}{n}\u{E001}")
 }
 
+/// Removes every placeholder, for text read before the blocks have run.
+pub fn strip_placeholders(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut in_placeholder = false;
+    for c in text.chars() {
+        match c {
+            '\u{E000}' => in_placeholder = true,
+            '\u{E001}' => in_placeholder = false,
+            _ if !in_placeholder => out.push(c),
+            _ => {}
+        }
+    }
+    out
+}
+
 /// Extracts blocks from a page body. An opening delimiter that starts inside a `skip` range stays literal.
 pub fn extract(
     body: &str,

@@ -1,17 +1,19 @@
 //! Markdown to Reuben's typed document tree.
 
-use comrak::nodes::{AstNode, ListType, NodeValue};
+use comrak::nodes::{AstNode, ListType, NodeValue, TableAlignment};
 use comrak::{Arena, Options};
 
-use crate::doc::{Document, Node, NodeKind, Span};
+use crate::doc::{Alignment, Document, Node, NodeKind, Span};
 
-fn options() -> Options<'static> {
+pub(crate) fn options() -> Options<'static> {
     let mut options = Options::default();
     options.extension.strikethrough = true;
     options.extension.table = true;
     options.extension.autolink = true;
     options.extension.tasklist = true;
     options.extension.footnotes = true;
+    options.extension.math_dollars = true;
+    options.parse.smart = true;
     options.render.r#unsafe = true;
     options
 }
@@ -22,36 +24,25 @@ pub fn parse(body: &str, body_line: usize) -> Document {
     let options = options();
     let root = comrak::parse_document(&arena, body, &options);
     let mut doc = convert(root, body_line - 1, &options);
-    if let Some(footnotes) = footnotes_section(root, body_line - 1, &options) {
-        doc.children.push(footnotes);
+    // comrak numbers footnotes by first reference and moves the definitions to the end of the document in that order.
+    let definitions = doc
+        .children
+        .iter()
+        .position(|c| matches!(c.kind, NodeKind::FootnoteDefinition { .. }));
+    if let Some(first) = definitions {
+        let mut section = Node {
+            kind: NodeKind::FootnoteSection,
+            span: doc.children[first].span,
+            children: doc.children.split_off(first),
+        };
+        for (i, def) in section.children.iter_mut().enumerate() {
+            if let NodeKind::FootnoteDefinition { index, .. } = &mut def.kind {
+                *index = i + 1;
+            }
+        }
+        doc.children.push(section);
     }
     doc
-}
-
-fn is_footnote_definition(node: &AstNode<'_>) -> bool {
-    matches!(node.data.borrow().value, NodeValue::FootnoteDefinition(_))
-}
-
-/// All footnote definitions as one `<section>`. comrak only numbers and wraps them correctly when it renders the
-/// whole document, so render it once and keep the footnotes section. `convert` skips the individual definitions.
-fn footnotes_section<'a>(
-    root: &'a AstNode<'a>,
-    line_offset: usize,
-    options: &Options,
-) -> Option<Node> {
-    let first = root.children().find(|c| is_footnote_definition(c))?;
-    let span = Span {
-        line: first.data.borrow().sourcepos.start.line + line_offset,
-        column: 1,
-    };
-    let mut html = String::new();
-    comrak::format_html(root, options, &mut html).expect("writing to a String cannot fail");
-    let start = html.find("<section class=\"footnotes\"")?;
-    Some(Node {
-        kind: NodeKind::Raw(html[start..].to_string()),
-        span,
-        children: Vec::new(),
-    })
 }
 
 fn convert<'a>(node: &'a AstNode<'a>, line_offset: usize, options: &Options) -> Node {
@@ -63,7 +54,10 @@ fn convert<'a>(node: &'a AstNode<'a>, line_offset: usize, options: &Options) -> 
     let kind = match &ast.value {
         NodeValue::Document => NodeKind::Document,
         NodeValue::Paragraph => NodeKind::Paragraph,
-        NodeValue::Heading(h) => NodeKind::Heading { level: h.level },
+        NodeValue::Heading(h) => NodeKind::Heading {
+            level: h.level,
+            id: String::new(),
+        },
         NodeValue::Text(t) => NodeKind::Text(t.to_string()),
         NodeValue::Emph => NodeKind::Emphasis,
         NodeValue::Strong => NodeKind::Strong,
@@ -95,6 +89,35 @@ fn convert<'a>(node: &'a AstNode<'a>, line_offset: usize, options: &Options) -> 
         NodeValue::LineBreak => NodeKind::LineBreak,
         NodeValue::HtmlBlock(h) => NodeKind::HtmlBlock(h.literal.clone()),
         NodeValue::HtmlInline(h) => NodeKind::HtmlInline(h.clone()),
+        NodeValue::Table(t) => NodeKind::Table {
+            alignments: t
+                .alignments
+                .iter()
+                .map(|a| match a {
+                    TableAlignment::None => Alignment::None,
+                    TableAlignment::Left => Alignment::Left,
+                    TableAlignment::Center => Alignment::Center,
+                    TableAlignment::Right => Alignment::Right,
+                })
+                .collect(),
+        },
+        NodeValue::TableRow(header) => NodeKind::TableRow { header: *header },
+        NodeValue::TableCell => NodeKind::TableCell,
+        NodeValue::Strikethrough => NodeKind::Strikethrough,
+        NodeValue::FootnoteReference(r) => NodeKind::FootnoteReference {
+            label: r.name.clone(),
+            index: r.ix as usize,
+        },
+        // `parse` numbers the definitions once they're gathered into a section.
+        NodeValue::FootnoteDefinition(d) => NodeKind::FootnoteDefinition {
+            label: d.name.clone(),
+            index: 0,
+        },
+        NodeValue::Math(m) => NodeKind::Math {
+            display: m.display_math,
+            // A `$$` block's literal keeps the newlines around the formula.
+            latex: m.literal.trim().to_string(),
+        },
         _ => {
             drop(ast);
             let mut html = String::new();
@@ -112,13 +135,12 @@ fn convert<'a>(node: &'a AstNode<'a>, line_offset: usize, options: &Options) -> 
         span,
         children: node
             .children()
-            .filter(|child| !is_footnote_definition(child))
             .map(|child| convert(child, line_offset, options))
             .collect(),
     }
 }
 
-/// Byte ranges of `body` covered by code blocks and inline code, where `{{` must stay literal.
+/// Byte ranges of `body` covered by code blocks, inline code and math, where `{{` must stay literal.
 pub fn code_ranges(body: &str) -> Vec<std::ops::Range<usize>> {
     let mut line_starts = vec![0];
     line_starts.extend(body.match_indices('\n').map(|(i, _)| i + 1));
@@ -131,7 +153,10 @@ pub fn code_ranges(body: &str) -> Vec<std::ops::Range<usize>> {
     root.descendants()
         .filter_map(|node| {
             let ast = node.data.borrow();
-            if !matches!(ast.value, NodeValue::CodeBlock(_) | NodeValue::Code(_)) {
+            if !matches!(
+                ast.value,
+                NodeValue::CodeBlock(_) | NodeValue::Code(_) | NodeValue::Math(_)
+            ) {
                 return None;
             }
             let (start, end) = (ast.sourcepos.start, ast.sourcepos.end);
@@ -143,12 +168,35 @@ pub fn code_ranges(body: &str) -> Vec<std::ops::Range<usize>> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::doc::{NodeKind, Span};
+    use crate::doc::{Alignment, NodeKind, Span};
+
+    #[test]
+    fn smart_punctuation_in_text() {
+        let html = crate::html::render(&parse("\"Rye\" -- it's good...\n", 1));
+        assert_eq!(html, "<p>“Rye” – it’s good…</p>\n");
+    }
+
+    #[test]
+    fn smart_punctuation_leaves_code_html_and_urls() {
+        let render = |s: &str| crate::html::render(&parse(s, 1));
+        assert!(render("`\"a\" -- b`").contains("<code>&quot;a&quot; -- b</code>"));
+        assert!(render("```\n\"a\" -- b\n```").contains("&quot;a&quot; -- b\n</code>"));
+        assert!(
+            render("<span title=\"a -- b\">x</span>").contains("<span title=\"a -- b\">x</span>")
+        );
+        assert!(render("[x](/a--b \"t\")").contains("href=\"/a--b\""));
+    }
 
     #[test]
     fn heading_and_paragraph_with_spans() {
         let d = parse("# Title\n\nHello *you*.\n", 4);
-        assert_eq!(d.children[0].kind, NodeKind::Heading { level: 1 });
+        assert_eq!(
+            d.children[0].kind,
+            NodeKind::Heading {
+                level: 1,
+                id: String::new()
+            }
+        );
         assert_eq!(d.children[0].span, Span { line: 4, column: 1 });
         assert_eq!(d.children[1].kind, NodeKind::Paragraph);
         assert_eq!(d.children[1].span.line, 6);
@@ -188,9 +236,92 @@ mod tests {
     }
 
     #[test]
-    fn unmodeled_nodes_become_raw() {
-        let d = parse("| a |\n|---|\n| b |\n", 1);
-        assert!(matches!(&d.children[0].kind, NodeKind::Raw(h) if h.contains("<table>")));
+    fn tables_are_tree_nodes() {
+        let d = parse("| a | b |\n|:-|-:|\n| 1 | 2 |\n", 1);
+        assert_eq!(
+            d.children[0].kind,
+            NodeKind::Table {
+                alignments: vec![Alignment::Left, Alignment::Right]
+            }
+        );
+        assert_eq!(
+            d.children[0].children[0].kind,
+            NodeKind::TableRow { header: true }
+        );
+        assert_eq!(
+            d.children[0].children[1].kind,
+            NodeKind::TableRow { header: false }
+        );
+        assert_eq!(
+            d.children[0].children[1].children[0].kind,
+            NodeKind::TableCell
+        );
+    }
+
+    #[test]
+    fn footnotes_are_tree_nodes() {
+        let d = parse("A[^x] B[^y]\n\n[^x]: one\n[^y]: two\n", 1);
+        let section = d.children.last().unwrap();
+        assert!(matches!(section.kind, NodeKind::FootnoteSection));
+        assert_eq!(section.children.len(), 2);
+        assert_eq!(
+            section.children[1].kind,
+            NodeKind::FootnoteDefinition {
+                label: "y".into(),
+                index: 2
+            }
+        );
+        assert_eq!(
+            d.children[0].children[1].kind,
+            NodeKind::FootnoteReference {
+                label: "x".into(),
+                index: 1
+            }
+        );
+    }
+
+    fn math_nodes(n: &Node, out: &mut Vec<NodeKind>) {
+        if matches!(n.kind, NodeKind::Math { .. }) {
+            out.push(n.kind.clone());
+        }
+        n.children.iter().for_each(|c| math_nodes(c, out));
+    }
+
+    #[test]
+    fn dollars_in_prose_stay_text() {
+        let mut found = Vec::new();
+        let d = parse("costs $5 and $10\n", 1);
+        math_nodes(&d, &mut found);
+        assert!(found.is_empty());
+        assert_eq!(crate::html::render(&d), "<p>costs $5 and $10</p>\n");
+        let d = parse("\\$100 and $ x $\n", 1);
+        math_nodes(&d, &mut found);
+        assert!(found.is_empty());
+    }
+
+    #[test]
+    fn math_nodes_parse() {
+        let mut found = Vec::new();
+        math_nodes(&parse("$a$ and\n\n$$\nb\n$$\n", 1), &mut found);
+        assert_eq!(
+            found,
+            vec![
+                NodeKind::Math {
+                    display: false,
+                    latex: "a".into()
+                },
+                NodeKind::Math {
+                    display: true,
+                    latex: "b".into()
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn strikethrough_is_a_node() {
+        let d = parse("~~gone~~\n", 1);
+        assert_eq!(d.children[0].children[0].kind, NodeKind::Strikethrough);
     }
 
     #[test]
@@ -207,5 +338,12 @@ mod tests {
         let r = code_ranges(body);
         assert!(r.iter().any(|r| body[r.clone()].contains("{{ x }}")));
         assert!(r.iter().any(|r| body[r.clone()].contains("{{ y }}")));
+    }
+
+    #[test]
+    fn code_ranges_cover_whole_math_spans() {
+        let body = "a $x^{{2}}$ b\n\n$$\nq {{n}}\n$$\n";
+        let slices: Vec<&str> = code_ranges(body).iter().map(|r| &body[r.clone()]).collect();
+        assert_eq!(slices, ["$x^{{2}}$", "$$\nq {{n}}\n$$"]);
     }
 }

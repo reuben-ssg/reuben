@@ -7,6 +7,7 @@ use rhai::{Array, Dynamic, Engine, EvalAltResult};
 use super::{Html, collection};
 use crate::html::{escape_text, render};
 use crate::markdown::parse;
+use crate::math::render_math;
 
 type RhaiResult<T> = Result<T, Box<EvalAltResult>>;
 
@@ -16,7 +17,14 @@ pub fn register(engine: &mut Engine, site_root: &Path) {
         .register_fn("raw", |s: &str| Html(s.to_string()))
         .register_fn("escape", |s: &str| escape_text(s).into_owned())
         // Never runs `{{ }}` blocks: it only parses and renders Markdown.
-        .register_fn("markdown", |s: &str| Html(render(&parse(s, 1))))
+        .register_fn("markdown", |s: &str| -> RhaiResult<Html> {
+            let mut doc = parse(s, 1);
+            render_math(&mut doc).map_err(|errors| {
+                let (span, message) = &errors[0];
+                format!("math at {}:{}: {message}", span.line, span.column)
+            })?;
+            Ok(Html(render(&doc)))
+        })
         .register_fn("sort_by", |items: &mut Array, key: &str| {
             collection::sorted(items, key)
         })
