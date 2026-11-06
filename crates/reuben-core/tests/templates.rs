@@ -173,3 +173,65 @@ fn assets_in_drafted_folders_need_drafts_flag() {
     build_in(&tmp, true).unwrap();
     assert!(tmp.path().join("dist/wip/pic.png").exists());
 }
+
+#[test]
+fn uppercase_rhai_in_content_is_not_copied() {
+    let tmp = fixture_copy();
+    tmp.child("content/notes.RHAI")
+        .write_str("let x = 1;")
+        .unwrap();
+    build_in(&tmp, false).unwrap();
+    assert!(!tmp.path().join("dist/notes.RHAI").exists());
+}
+
+// Whether `side.RHAI` resolves as the sidecar of `side.css` depends on the filesystem's case sensitivity, so the
+// check only runs where it does (macOS default). Elsewhere the file is an ordinary asset.
+#[test]
+fn uppercase_static_sidecar_is_not_published() {
+    let tmp = fixture_copy();
+    tmp.child("static/side.css")
+        .write_str("---\ntitle: S\n---\na { color: {{ accent }}; }\n")
+        .unwrap();
+    tmp.child("static/side.RHAI")
+        .write_str("let accent = \"red\";\n")
+        .unwrap();
+    let site = Site::load(tmp.path()).unwrap();
+    if !site.pages.iter().any(|p| p.sidecar.is_some()) {
+        return;
+    }
+    build_in(&tmp, false).unwrap();
+    assert!(dist(&tmp, "side.css").contains("red"));
+    assert!(!tmp.path().join("dist/side.RHAI").exists());
+}
+
+#[test]
+fn junk_and_hidden_files_are_not_copied() {
+    let tmp = fixture_copy();
+    for junk in [
+        "content/.DS_Store",
+        "content/.git/config",
+        "content/posts/draft.md.swp",
+        "content/posts/a.png~",
+        "content/Thumbs.db",
+        "static/.DS_Store",
+        "static/x.swp",
+    ] {
+        tmp.child(junk).write_str("junk").unwrap();
+    }
+    tmp.child("static/.well-known/security.txt")
+        .write_str("Contact: x")
+        .unwrap();
+    build_in(&tmp, false).unwrap();
+    let dist = tmp.path().join("dist");
+    for gone in [
+        ".DS_Store",
+        ".git/config",
+        "posts/draft.md.swp",
+        "posts/a.png~",
+        "Thumbs.db",
+        "x.swp",
+    ] {
+        assert!(!dist.join(gone).exists(), "{gone}");
+    }
+    assert!(dist.join(".well-known/security.txt").exists());
+}

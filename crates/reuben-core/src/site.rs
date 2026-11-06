@@ -141,7 +141,16 @@ impl Site {
                         continue;
                     }
                     // Sidecars hold build scripts, which must never be published.
-                    if path.extension().is_some_and(|e| e == "rhai") {
+                    if path
+                        .extension()
+                        .is_some_and(|e| e.eq_ignore_ascii_case("rhai"))
+                    {
+                        continue;
+                    }
+                    if rel
+                        .components()
+                        .any(|c| c.as_os_str().to_string_lossy().starts_with('.'))
+                    {
                         continue;
                     }
                     let loaded = if is_markdown {
@@ -151,7 +160,8 @@ impl Site {
                     };
                     match loaded {
                         Ok(Some(page)) => pages.push(page),
-                        Ok(None) => asset_rels.push(rel),
+                        Ok(None) if !is_junk(&rel) => asset_rels.push(rel),
+                        Ok(None) => {}
                         Err(e) => errors.push(e),
                     }
                 }
@@ -176,7 +186,8 @@ impl Site {
                         page.draft_excluded = page.front_matter.draft;
                         pages.push(page);
                     }
-                    Ok(None) => static_files.push(rel),
+                    Ok(None) if !is_junk(&rel) => static_files.push(rel),
+                    Ok(None) => {}
                     Err(e) => errors.push(e),
                 }
             }
@@ -327,10 +338,11 @@ impl Site {
             .iter()
             // A static template's sidecar script is source, not an asset.
             .filter(|rel| {
-                !self
-                    .pages
-                    .iter()
-                    .any(|p| p.from_static && p.rel.with_extension("rhai") == **rel)
+                let lower = |p: &Path| p.to_string_lossy().to_lowercase();
+                let file = lower(&site_dir.join(rel));
+                !self.pages.iter().any(|p| {
+                    p.from_static && p.sidecar.as_deref().is_some_and(|s| lower(s) == file)
+                })
             })
             .map(|rel| (rel.clone(), site_dir.join(rel)));
         let content_dir = self.root.join("content");
@@ -489,6 +501,14 @@ fn mark_draft_excluded(pages: &mut [Page], dirs: &DirDefaults) {
     for (page, excluded) in pages.iter_mut().zip(excluded) {
         page.draft_excluded = excluded;
     }
+}
+
+/// OS and editor leftovers that are never published, wherever they sit.
+fn is_junk(rel: &Path) -> bool {
+    rel.file_name().is_some_and(|n| {
+        let n = n.to_string_lossy();
+        n == ".DS_Store" || n == "Thumbs.db" || n.ends_with(".swp") || n.ends_with('~')
+    })
 }
 
 /// Whether a drafted folder (by `_dir.toml` or a draft `index.md`) hides the asset at `rel`.
