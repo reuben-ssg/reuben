@@ -4,6 +4,7 @@
 
 pub mod blocks;
 pub mod config;
+pub mod data;
 pub mod dirs;
 pub mod doc;
 pub mod error;

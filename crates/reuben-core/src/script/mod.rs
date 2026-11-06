@@ -131,14 +131,30 @@ impl ScriptEngine {
         scope: &mut rhai::Scope<'static>,
         path: &Path,
     ) -> Result<(), ScriptError> {
+        let ast = self.compile_file(path)?;
+        self.engine
+            .run_ast_with_scope(scope, &ast)
+            .map_err(|e| runtime_error(*e, file_span))
+    }
+
+    /// Runs a whole file and returns its final expression.
+    pub fn eval_file(
+        &self,
+        scope: &mut rhai::Scope<'static>,
+        path: &Path,
+    ) -> Result<rhai::Dynamic, ScriptError> {
+        let ast = self.compile_file(path)?;
+        self.engine
+            .eval_ast_with_scope::<rhai::Dynamic>(scope, &ast)
+            .map_err(|e| runtime_error(*e, file_span))
+    }
+
+    fn compile_file(&self, path: &Path) -> Result<rhai::AST, ScriptError> {
         let path_str = path.display().to_string();
         CURRENT_FILE.with(|f| f.borrow_mut().clone_from(&path_str));
         let plain = |message: String, pos: rhai::Position| ScriptError {
             message,
-            location: pos.line().map(|line| Span {
-                line,
-                column: pos.position().unwrap_or(1),
-            }),
+            location: file_span(pos),
             stack: Vec::new(),
         };
         let src = std::fs::read_to_string(path)
@@ -148,15 +164,15 @@ impl ScriptEngine {
             .compile(&src)
             .map_err(|e| plain(e.err_type().to_string(), e.position()))?;
         ast.set_source(path_str);
-        self.engine.run_ast_with_scope(scope, &ast).map_err(|e| {
-            runtime_error(*e, |pos| {
-                pos.line().map(|line| Span {
-                    line,
-                    column: pos.position().unwrap_or(1),
-                })
-            })
-        })
+        Ok(ast)
     }
+}
+
+fn file_span(pos: rhai::Position) -> Option<Span> {
+    pos.line().map(|line| Span {
+        line,
+        column: pos.position().unwrap_or(1),
+    })
 }
 
 /// Splits a runtime error into the failing call site, the innermost message and the include call chain.

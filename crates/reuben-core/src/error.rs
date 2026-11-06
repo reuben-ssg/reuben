@@ -25,6 +25,8 @@ pub enum ErrorKind {
     Block(BlockError),
     #[error("config: {0}")]
     Config(String),
+    #[error("data: {0}")]
+    Data(String),
     #[error("layout `{0}` not found in the site or its theme")]
     LayoutNotFound(String),
     #[error("invalid layout name `{0}`: a layout is a plain file name in `layouts/`")]

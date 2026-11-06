@@ -74,10 +74,12 @@ pub fn render_body(
     page: &Page,
     engine: &ScriptEngine,
     site: &Map,
+    data: &Map,
 ) -> Result<(Document, Scope<'static>), Vec<Error>> {
     let mut scope = Scope::new();
     scope.push_constant("page", page_map(page).map_err(|e| vec![e])?);
     scope.push_constant("site", site.clone());
+    scope.push_constant("data", data.clone());
 
     if let Some(sidecar) = &page.sidecar {
         engine

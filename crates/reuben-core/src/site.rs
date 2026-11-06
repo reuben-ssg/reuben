@@ -9,6 +9,7 @@ use walkdir::WalkDir;
 use std::sync::Arc;
 
 use crate::config::{self, Config};
+use crate::data::{self, SiteData};
 use crate::dirs::{self, DirDefaults};
 use crate::error::{Error, ErrorKind};
 use crate::frontmatter::{self, FrontMatter};
@@ -49,6 +50,7 @@ pub struct Site {
     pub theme_static_files: Vec<PathBuf>,
     pub config: Config,
     pub engine: Arc<ScriptEngine>,
+    pub data: SiteData,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -100,6 +102,19 @@ impl Site {
             }
         }
 
+        let site_data = config.as_ref().and_then(|config| {
+            let result = page::site_map(config)
+                .map_err(|e| vec![e])
+                .and_then(|site| data::load(root, &engine, &site));
+            match result {
+                Ok(d) => Some(d),
+                Err(mut e) => {
+                    errors.append(&mut e);
+                    None
+                }
+            }
+        });
+
         let content = root.join("content");
         // Pages without their folder defaults would report misleading missing-title errors, so skip them.
         match dirs::load(&content) {
@@ -139,6 +154,7 @@ impl Site {
 
         match config {
             Some(config) if errors.is_empty() => Ok(Site {
+                data: site_data.unwrap_or_default(),
                 root: root.to_path_buf(),
                 pages,
                 static_files,
@@ -162,13 +178,14 @@ impl Site {
         let mut errors = Vec::new();
         let site_map = page::site_map(&self.config).map_err(|e| vec![e])?;
         for page in &pages {
-            let (doc, mut scope) = match page::render_body(page, &self.engine, &site_map) {
-                Ok(rendered) => rendered,
-                Err(mut e) => {
-                    errors.append(&mut e);
-                    continue;
-                }
-            };
+            let (doc, mut scope) =
+                match page::render_body(page, &self.engine, &site_map, &self.data.value) {
+                    Ok(rendered) => rendered,
+                    Err(mut e) => {
+                        errors.append(&mut e);
+                        continue;
+                    }
+                };
             let body = html::render(&doc);
             let layout = match layout::find_layout(
                 page.front_matter.layout.as_deref(),
