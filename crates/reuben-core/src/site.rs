@@ -1,6 +1,6 @@
 //! Loading a site from disk and building it.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -9,6 +9,7 @@ use walkdir::WalkDir;
 use std::sync::Arc;
 
 use crate::config::{self, Config};
+use crate::dirs::{self, DirDefaults};
 use crate::error::{Error, ErrorKind};
 use crate::frontmatter::{self, FrontMatter};
 use crate::route::{Route, route_for_page};
@@ -32,6 +33,10 @@ pub struct Page {
     /// The sibling `<stem>.rhai`, if present.
     pub sidecar: Option<PathBuf>,
     pub route: Route,
+    /// The file that set each front matter value, keyed by dotted path.
+    pub front_matter_sources: BTreeMap<String, PathBuf>,
+    /// Hidden from normal builds: the page or a folder above it is a draft.
+    pub draft_excluded: bool,
 }
 
 #[derive(Debug)]
@@ -96,13 +101,20 @@ impl Site {
         }
 
         let content = root.join("content");
-        for (path, rel) in walk(&content, &mut errors) {
-            if path.extension().is_some_and(|e| e == "md") {
-                match load_page(&path, &rel) {
-                    Ok(page) => pages.push(page),
-                    Err(e) => errors.push(e),
+        // Pages without their folder defaults would report misleading missing-title errors, so skip them.
+        match dirs::load(&content) {
+            Ok(dirs) => {
+                for (path, rel) in walk(&content, &mut errors) {
+                    if path.extension().is_some_and(|e| e == "md") {
+                        match load_page(&path, &rel, &dirs) {
+                            Ok(page) => pages.push(page),
+                            Err(e) => errors.push(e),
+                        }
+                    }
                 }
+                mark_draft_excluded(&mut pages, &dirs);
             }
+            Err(mut e) => errors.append(&mut e),
         }
 
         let static_dir = root.join("static");
@@ -142,7 +154,7 @@ impl Site {
         let (pages, drafts): (Vec<&Page>, Vec<&Page>) = self
             .pages
             .iter()
-            .partition(|p| opts.drafts || !p.front_matter.draft);
+            .partition(|p| opts.drafts || !p.draft_excluded);
 
         self.check_collisions(&pages)?;
         prepare_out_dir(&opts.out).map_err(|e| vec![e])?;
@@ -292,20 +304,46 @@ fn walk(dir: &Path, errors: &mut Vec<Error>) -> Vec<(PathBuf, PathBuf)> {
     files
 }
 
-fn load_page(path: &Path, rel: &Path) -> Result<Page, Error> {
+fn load_page(path: &Path, rel: &Path, dirs: &DirDefaults) -> Result<Page, Error> {
     let bytes = fs::read(path).map_err(|e| Error::new(path, e))?;
     let src = String::from_utf8(bytes).map_err(|_| Error::new(path, ErrorKind::NotUtf8))?;
-    let parsed = frontmatter::parse(&src).map_err(|e| Error::new(path, e))?;
+    let raw = frontmatter::parse_raw(&src).map_err(|e| Error::new(path, e))?;
+    let mut merged = dirs.defaults_for(rel.parent().unwrap_or(Path::new("")));
+    merged.merge(raw.value, path);
+    let front_matter = frontmatter::from_value(merged.value).map_err(|e| Error::new(path, e))?;
     let sidecar = Some(path.with_extension("rhai")).filter(|p| p.is_file());
     Ok(Page {
         source: path.to_path_buf(),
-        body: parsed.body.to_string(),
-        body_line: parsed.body_line,
+        body: raw.body.to_string(),
+        body_line: raw.body_line,
         rel: rel.to_path_buf(),
         sidecar,
-        front_matter: parsed.front_matter,
+        front_matter,
         route: route_for_page(rel),
+        front_matter_sources: merged.sources,
+        draft_excluded: false,
     })
+}
+
+/// A page is excluded when it is a draft itself or sits under a folder drafted by `_dir.toml` or by its `index.md`.
+fn mark_draft_excluded(pages: &mut [Page], dirs: &DirDefaults) {
+    let drafted_by_index: HashSet<&Path> = pages
+        .iter()
+        .filter(|p| p.front_matter.draft && p.rel.file_name().is_some_and(|n| n == "index.md"))
+        .filter_map(|p| p.rel.parent())
+        .collect();
+    let excluded: Vec<bool> = pages
+        .iter()
+        .map(|p| {
+            let dir = p.rel.parent().unwrap_or(Path::new(""));
+            p.front_matter.draft
+                || dirs.folder_drafted(dir)
+                || dir.ancestors().any(|d| drafted_by_index.contains(d))
+        })
+        .collect();
+    for (page, excluded) in pages.iter_mut().zip(excluded) {
+        page.draft_excluded = excluded;
+    }
 }
 
 /// Creates the output directory, or clears it only if a previous Reuben build created it.
