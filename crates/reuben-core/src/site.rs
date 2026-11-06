@@ -8,6 +8,7 @@ use walkdir::WalkDir;
 
 use std::sync::Arc;
 
+use crate::collections;
 use crate::config::{self, Config};
 use crate::data::{self, SiteData};
 use crate::dirs::{self, DirDefaults};
@@ -177,28 +178,37 @@ impl Site {
 
         let mut errors = Vec::new();
         let site_map = page::site_map(&self.config).map_err(|e| vec![e])?;
+        let collections = collections::build(&pages, &self.config)?;
         for page in &pages {
-            let (doc, mut scope) =
-                match page::render_body(page, &self.engine, &site_map, &self.data.value) {
-                    Ok(rendered) => rendered,
-                    Err(mut e) => {
-                        errors.append(&mut e);
-                        continue;
-                    }
-                };
-            let body = html::render(&doc);
-            let layout = match layout::find_layout(
-                page.front_matter.layout.as_deref(),
-                &self.root,
-                self.config.theme.as_deref(),
+            let (doc, mut scope) = match page::render_body(
+                page,
+                &self.engine,
+                &self.config,
+                &site_map,
+                &self.data.value,
+                &collections,
             ) {
-                Ok(layout) => layout,
+                Ok(rendered) => rendered,
                 Err(mut e) => {
-                    e.path.clone_from(&page.source);
-                    errors.push(e);
+                    errors.append(&mut e);
                     continue;
                 }
             };
+            let body = html::render(&doc);
+            let layout_name = page
+                .front_matter
+                .layout
+                .as_deref()
+                .or_else(|| collections::layout_of(&page.rel, &self.config));
+            let layout =
+                match layout::find_layout(layout_name, &self.root, self.config.theme.as_deref()) {
+                    Ok(layout) => layout,
+                    Err(mut e) => {
+                        e.path.clone_from(&page.source);
+                        errors.push(e);
+                        continue;
+                    }
+                };
             let output = match layout {
                 Some(path) => {
                     match layout::render_layout(&path, &self.engine, &mut scope, Html(body)) {

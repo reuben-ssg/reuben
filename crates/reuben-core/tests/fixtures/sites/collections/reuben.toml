@@ -1,0 +1,4 @@
+[collections.posts]
+name = "blog"
+sort = "-date"
+layout = "post"

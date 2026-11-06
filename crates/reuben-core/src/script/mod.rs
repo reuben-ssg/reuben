@@ -1,5 +1,6 @@
 //! The sandboxed Rhai engine that evaluates template blocks and sidecar scripts.
 
+pub mod collection;
 mod helpers;
 mod includes;
 
@@ -72,6 +73,7 @@ impl ScriptEngine {
         engine
             .register_type_with_name::<Html>("Html")
             .register_fn("to_string", |h: &mut Html| h.0.clone());
+        collection::register(&mut engine);
         helpers::register(&mut engine, site_root);
         Self { engine }
     }

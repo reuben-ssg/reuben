@@ -4,6 +4,7 @@ use rhai::serde::to_dynamic;
 use rhai::{Dynamic, Map, Scope};
 
 use crate::blocks::{self};
+use crate::collections;
 use crate::config::Config;
 use crate::doc::Document;
 use crate::error::{Error, ErrorKind};
@@ -27,7 +28,7 @@ pub fn site_map(config: &Config) -> Result<Map, Error> {
     Ok(map)
 }
 
-fn page_map(page: &Page) -> Result<Map, Error> {
+pub(crate) fn page_map(page: &Page, config: &Config) -> Result<Map, Error> {
     let fm = &page.front_matter;
     let fail = |e: Box<rhai::EvalAltResult>| {
         Error::new(
@@ -61,6 +62,10 @@ fn page_map(page: &Page) -> Result<Map, Error> {
         .next()
         .unwrap_or("");
     map.insert("slug".into(), slug.to_string().into());
+    map.insert(
+        "collection".into(),
+        collections::public_name(&page.rel, config).into(),
+    );
     Ok(map)
 }
 
@@ -73,13 +78,16 @@ fn opt<T: Clone + Send + Sync + 'static>(v: Option<T>) -> Dynamic {
 pub fn render_body(
     page: &Page,
     engine: &ScriptEngine,
+    config: &Config,
     site: &Map,
     data: &Map,
+    collections: &Map,
 ) -> Result<(Document, Scope<'static>), Vec<Error>> {
     let mut scope = Scope::new();
-    scope.push_constant("page", page_map(page).map_err(|e| vec![e])?);
+    scope.push_constant("page", page_map(page, config).map_err(|e| vec![e])?);
     scope.push_constant("site", site.clone());
     scope.push_constant("data", data.clone());
+    scope.push_constant("collections", collections.clone());
 
     if let Some(sidecar) = &page.sidecar {
         engine

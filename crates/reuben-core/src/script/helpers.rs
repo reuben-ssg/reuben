@@ -1,10 +1,10 @@
-//! Helper functions exposed to scripts: `raw`, `escape`, `markdown` and `load_data`.
+//! Helper functions exposed to scripts: `raw`, `escape`, `markdown`, `sort_by` and `load_data`.
 
 use std::path::{Path, PathBuf};
 
-use rhai::{Dynamic, Engine, EvalAltResult};
+use rhai::{Array, Dynamic, Engine, EvalAltResult};
 
-use super::Html;
+use super::{Html, collection};
 use crate::html::{escape_text, render};
 use crate::markdown::parse;
 
@@ -17,6 +17,9 @@ pub fn register(engine: &mut Engine, site_root: &Path) {
         .register_fn("escape", |s: &str| escape_text(s).into_owned())
         // Never runs `{{ }}` blocks: it only parses and renders Markdown.
         .register_fn("markdown", |s: &str| Html(render(&parse(s, 1))))
+        .register_fn("sort_by", |items: &mut Array, key: &str| {
+            collection::sorted(items, key)
+        })
         .register_fn("load_data", move |path: &str| load_data(&root, path));
 }
 
