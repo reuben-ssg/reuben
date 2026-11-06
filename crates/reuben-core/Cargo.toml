@@ -1,0 +1,11 @@
+[package]
+name = "reuben-core"
+version = "0.0.0"
+description = "Core build pipeline for the Reuben static site generator."
+publish = false
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]

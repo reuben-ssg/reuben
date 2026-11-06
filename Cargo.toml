@@ -1,11 +1,24 @@
-[package]
-name = "reuben"
-version = "0.0.0"
+[workspace]
+resolver = "3"
+members = ["crates/*"]
+
+[workspace.package]
 edition = "2024"
-description = "The tastiest SSG. A static site generator with Rhai scripting in Markdown."
+rust-version = "1.85"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/reuben-ssg/reuben"
-readme = "README.md"
-keywords = ["static-site","ssg", "markdown", "rhai"]
-categories = ["command-line-utilities", "web-programming"]
-include = ["src/**", "Cargo.toml", "README.md", "LICENSE-MIT", "LICENSE-APACHE"]
+
+[workspace.dependencies]
+reuben-core = { path = "crates/reuben-core" }
+comrak = { version = "0.59", default-features = false }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = { version = "1.0", features = ["preserve_order"] }
+serde-saphyr = "2.1"
+toml = "1.2"
+clap = { version = "4.6", features = ["derive"] }
+thiserror = "2.0"
+walkdir = "2.5"
+insta = "1.49"
+assert_cmd = "2.2"
+assert_fs = "1.1"
+predicates = "3.1"
