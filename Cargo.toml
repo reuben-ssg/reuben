@@ -1,0 +1,11 @@
+[package]
+name = "reuben"
+version = "0.0.0"
+edition = "2024"
+description = "The tastiest SSG. A static site generator with Rhai scripting in Markdown."
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/reuben-ssg/reuben"
+readme = "README.md"
+keywords = ["static-site","ssg", "markdown", "rhai"]
+categories = ["command-line-utilities", "web-programming"]
+include = ["src/**", "Cargo.toml", "README.md", "LICENSE-MIT", "LICENSE-APACHE"]
