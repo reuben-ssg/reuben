@@ -10,6 +10,7 @@ use crate::blocks::{Block, BlockKind};
 use crate::doc::Span;
 use crate::html::escape_output;
 use crate::splice::Output;
+use crate::template::Escape;
 
 #[derive(Clone)]
 pub struct Html(pub String);
@@ -83,6 +84,7 @@ impl ScriptEngine {
         scope: &mut rhai::Scope<'static>,
         block: &Block,
         file: &Path,
+        escape: Escape,
     ) -> Result<Output, ScriptError> {
         let file_str = file.display().to_string();
         CURRENT_FILE.with(|f| f.borrow_mut().clone_from(&file_str));
@@ -119,7 +121,7 @@ impl ScriptEngine {
                     .engine
                     .eval_ast_with_scope::<rhai::Dynamic>(scope, &ast)
                     .map_err(runtime_err)?;
-                to_output(value).map_err(|message| ScriptError {
+                to_output(value, escape).map_err(|message| ScriptError {
                     message,
                     location: Some(block.span),
                     stack: Vec::new(),
@@ -217,14 +219,15 @@ fn runtime_error(
     }
 }
 
-/// Applies the output rules: strings are escaped, `Html` is raw, arrays concatenate, maps are an error.
-pub fn to_output(value: rhai::Dynamic) -> Result<Output, String> {
+/// Applies the output rules: strings are escaped unless `escape` is `None`, `Html` is raw, arrays concatenate,
+/// maps are an error.
+pub fn to_output(value: rhai::Dynamic, escape: Escape) -> Result<Output, String> {
     if value.is_unit() {
         return Ok(Output::Nothing);
     }
     let mut out = String::new();
     let mut html = false;
-    write_value(value, &mut out, &mut html)?;
+    write_value(value, escape, &mut out, &mut html)?;
     Ok(if html {
         Output::Html(out)
     } else {
@@ -233,11 +236,20 @@ pub fn to_output(value: rhai::Dynamic) -> Result<Output, String> {
 }
 
 /// `html` is set when any `Html` value contributes, which makes the whole output markup.
-fn write_value(value: rhai::Dynamic, out: &mut String, html: &mut bool) -> Result<(), String> {
+fn write_value(
+    value: rhai::Dynamic,
+    escape: Escape,
+    out: &mut String,
+    html: &mut bool,
+) -> Result<(), String> {
+    let text = |s: String| match escape {
+        Escape::Html => escape_output(&s),
+        Escape::None => s,
+    };
     if value.is_unit() {
         Ok(())
     } else if value.is_string() {
-        out.push_str(&escape_output(&value.into_string()?));
+        out.push_str(&text(value.into_string()?));
         Ok(())
     } else if value.is::<Html>() {
         *html = true;
@@ -247,11 +259,11 @@ fn write_value(value: rhai::Dynamic, out: &mut String, html: &mut bool) -> Resul
         let items = value.into_array().map_err(|t| t.to_string())?;
         items
             .into_iter()
-            .try_for_each(|item| write_value(item, out, html))
+            .try_for_each(|item| write_value(item, escape, out, html))
     } else if value.is_map() {
         Err("can't output a map; output one of its fields".to_string())
     } else if value.is_int() || value.is_float() || value.is_bool() || value.is_char() {
-        out.push_str(&escape_output(&value.to_string()));
+        out.push_str(&text(value.to_string()));
         Ok(())
     } else {
         Err(format!(
@@ -276,7 +288,33 @@ mod tests {
                 column: 4,
             },
         };
-        engine.eval_block(&mut scope, &block, Path::new("page.md"))
+        engine.eval_block(&mut scope, &block, Path::new("page.md"), Escape::Html)
+    }
+    #[test]
+    fn no_escape_writes_strings_and_scalars_raw() {
+        let engine = ScriptEngine::new(Path::new("."));
+        let mut scope = rhai::Scope::new();
+        let block = Block {
+            kind: BlockKind::Output,
+            source: "[\"<a>\", 1, raw(\"<b>\")]".into(),
+            span: Span::default(),
+        };
+        assert_eq!(
+            engine
+                .eval_block(&mut scope, &block, Path::new("p.json"), Escape::None)
+                .unwrap(),
+            Output::Html("<a>1<b>".into())
+        );
+        let block = Block {
+            source: "\"<a>\"".into(),
+            ..block
+        };
+        assert_eq!(
+            engine
+                .eval_block(&mut scope, &block, Path::new("p.json"), Escape::None)
+                .unwrap(),
+            Output::Text("<a>".into())
+        );
     }
 
     #[test]
@@ -328,13 +366,13 @@ mod tests {
         };
         assert_eq!(
             engine
-                .eval_block(&mut scope, &setup, Path::new("p.md"))
+                .eval_block(&mut scope, &setup, Path::new("p.md"), Escape::Html)
                 .unwrap(),
             Output::Nothing
         );
         assert_eq!(
             engine
-                .eval_block(&mut scope, &out, Path::new("p.md"))
+                .eval_block(&mut scope, &out, Path::new("p.md"), Escape::Html)
                 .unwrap(),
             Output::Text("42".into())
         );

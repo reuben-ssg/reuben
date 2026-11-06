@@ -12,7 +12,7 @@ use crate::html::plain_text;
 use crate::markdown;
 use crate::page::page_map;
 use crate::script::collection::{Collection, compare, sort_array};
-use crate::site::Page;
+use crate::site::{Page, PageKind};
 
 /// The first folder under `content/` when the page is inside one; root-level files belong to no collection.
 pub fn collection_of(rel: &Path) -> Option<String> {
@@ -48,6 +48,9 @@ pub fn summary(page: &Page) -> String {
     if let Some(d) = &page.front_matter.description {
         return d.clone();
     }
+    if page.kind != PageKind::Markdown {
+        return String::new();
+    }
     let skip = markdown::code_ranges(&page.body);
     let Ok(extracted) = blocks::extract(&page.body, page.body_line, &skip) else {
         return String::new();
@@ -73,10 +76,21 @@ pub fn summary(page: &Page) -> String {
     text.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
+/// Markdown pages and `.html` templates under `content/` are collection members; other templates are not.
+fn joins_collection(page: &Page) -> bool {
+    if page.from_static {
+        return false;
+    }
+    match page.kind {
+        PageKind::Markdown => true,
+        PageKind::Template { .. } => page.rel.extension().is_some_and(|e| e == "html"),
+    }
+}
+
 /// Builds every collection from the pages that are in the build. Callers exclude drafts first.
 pub fn build(pages: &[&Page], config: &Config) -> Result<Map, Vec<Error>> {
     let mut folders: BTreeMap<String, Vec<&Page>> = BTreeMap::new();
-    for page in pages {
+    for page in pages.iter().filter(|p| joins_collection(p)) {
         if let Some(folder) = collection_of(&page.rel) {
             folders.entry(folder).or_default().push(page);
         }
@@ -230,6 +244,8 @@ mod tests {
 
     fn page(rel: &str, description: Option<&str>, body: &str) -> Page {
         Page {
+            kind: PageKind::Markdown,
+            from_static: false,
             source: PathBuf::from("content").join(rel),
             front_matter: FrontMatter {
                 title: "T".into(),

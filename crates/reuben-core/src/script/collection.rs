@@ -159,6 +159,8 @@ pub fn register(engine: &mut Engine) {
 mod tests {
     use rhai::Dynamic;
 
+    use crate::template::Escape;
+
     use super::*;
 
     fn engine() -> Engine {
@@ -261,7 +263,7 @@ mod tests {
             source: src.into(),
             span: Default::default(),
         };
-        engine.eval_block(&mut s, &block, std::path::Path::new("p.md"))
+        engine.eval_block(&mut s, &block, std::path::Path::new("p.md"), Escape::Html)
     }
 
     #[test]

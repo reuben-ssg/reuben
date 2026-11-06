@@ -1,0 +1,4 @@
+---
+title: Search
+---
+{{ collections.posts.map(|p| p.title + " & \"x\"") }}

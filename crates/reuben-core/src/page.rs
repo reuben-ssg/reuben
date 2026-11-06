@@ -12,6 +12,7 @@ use crate::markdown;
 use crate::script::ScriptEngine;
 use crate::site::Page;
 use crate::splice::{self, Output};
+use crate::template::Escape;
 
 /// The `site` scope variable: `title`, `base_url` and `params`.
 pub fn site_map(config: &Config) -> Result<Map, Error> {
@@ -73,27 +74,43 @@ fn opt<T: Clone + Send + Sync + 'static>(v: Option<T>) -> Dynamic {
     v.map_or(Dynamic::UNIT, Dynamic::from)
 }
 
-/// Returns the scope so the layout sees sidecar and setup variables.
-/// Every block's error is collected rather than stopping at the first.
-pub fn render_body(
+/// The site-wide scope variables every page and template sees.
+pub struct SiteScopes<'a> {
+    pub site: &'a Map,
+    pub data: &'a Map,
+    pub collections: &'a Map,
+}
+
+/// The scope for a page or template: its constants, then the sidecar script's variables.
+pub fn build_scope(
     page: &Page,
     engine: &ScriptEngine,
     config: &Config,
-    site: &Map,
-    data: &Map,
-    collections: &Map,
-) -> Result<(Document, Scope<'static>), Vec<Error>> {
+    scopes: &SiteScopes<'_>,
+) -> Result<Scope<'static>, Vec<Error>> {
     let mut scope = Scope::new();
     scope.push_constant("page", page_map(page, config).map_err(|e| vec![e])?);
-    scope.push_constant("site", site.clone());
-    scope.push_constant("data", data.clone());
-    scope.push_constant("collections", collections.clone());
+    scope.push_constant("site", scopes.site.clone());
+    scope.push_constant("data", scopes.data.clone());
+    scope.push_constant("collections", scopes.collections.clone());
 
     if let Some(sidecar) = &page.sidecar {
         engine
             .run_file(&mut scope, sidecar)
             .map_err(|e| vec![Error::new(sidecar, ErrorKind::Script(e))])?;
     }
+    Ok(scope)
+}
+
+/// Returns the scope so the layout sees sidecar and setup variables.
+/// Every block's error is collected rather than stopping at the first.
+pub fn render_body(
+    page: &Page,
+    engine: &ScriptEngine,
+    config: &Config,
+    scopes: &SiteScopes<'_>,
+) -> Result<(Document, Scope<'static>), Vec<Error>> {
+    let mut scope = build_scope(page, engine, config, scopes)?;
 
     let skip = markdown::code_ranges(&page.body);
     let extracted = blocks::extract(&page.body, page.body_line, &skip)
@@ -103,7 +120,7 @@ pub fn render_body(
     let mut outputs = Vec::with_capacity(extracted.blocks.len());
     let mut errors = Vec::new();
     for block in &extracted.blocks {
-        match engine.eval_block(&mut scope, block, &page.source) {
+        match engine.eval_block(&mut scope, block, &page.source, Escape::Html) {
             Ok(out) => outputs.push(out),
             Err(e) => {
                 errors.push(Error::new(&page.source, ErrorKind::Script(e)));

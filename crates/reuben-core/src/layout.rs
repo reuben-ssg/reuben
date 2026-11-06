@@ -3,10 +3,11 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use crate::blocks::{self, placeholder};
+use crate::blocks;
 use crate::error::{Error, ErrorKind};
 use crate::script::{Html, ScriptEngine};
 use crate::splice::Output;
+use crate::template::{Escape, substitute};
 
 /// `name` is front matter `layout`, with or without `.html`. Only an explicit name that can't be found is an error;
 /// a missing `default` means the built-in shell.
@@ -51,7 +52,7 @@ pub fn render_layout(
     let mut outputs = Vec::with_capacity(extracted.blocks.len());
     let mut errors = Vec::new();
     for block in &extracted.blocks {
-        match engine.eval_block(scope, block, path) {
+        match engine.eval_block(scope, block, path, Escape::Html) {
             Ok(out) => outputs.push(out),
             Err(e) => {
                 errors.push(Error::new(path, ErrorKind::Script(e)));
@@ -63,13 +64,5 @@ pub fn render_layout(
         return Err(errors);
     }
 
-    let mut result = extracted.text;
-    for (n, out) in outputs.into_iter().enumerate() {
-        let html = match out {
-            Output::Text(s) | Output::Html(s) => s,
-            Output::Nothing => String::new(),
-        };
-        result = result.replace(&placeholder(n), &html);
-    }
-    Ok(result)
+    Ok(substitute(&extracted.text, &outputs))
 }

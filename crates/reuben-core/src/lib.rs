@@ -19,6 +19,7 @@ pub mod route;
 pub mod script;
 pub mod site;
 pub mod splice;
+pub mod template;
 pub mod theme;
 
 pub use error::{Error, ErrorKind};

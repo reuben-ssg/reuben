@@ -2,6 +2,7 @@
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs;
+use std::io::Read;
 use std::path::{Path, PathBuf};
 
 use walkdir::WalkDir;
@@ -14,16 +15,26 @@ use crate::data::{self, SiteData};
 use crate::dirs::{self, DirDefaults};
 use crate::error::{Error, ErrorKind};
 use crate::frontmatter::{self, FrontMatter};
-use crate::route::{Route, route_for_page};
+use crate::route::{Route, route_for_page, route_for_template};
 use crate::script::{Html, ScriptEngine};
+use crate::template::{self, Escape};
 use crate::theme::{PageShell, builtin_page};
 use crate::{html, layout, page, splice};
 
 /// Written into every output directory Reuben builds. Only a directory containing it is ever cleared.
 pub const OUTPUT_MARKER: &str = ".reuben-output";
 
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum PageKind {
+    Markdown,
+    Template { escape: Escape },
+}
+
 #[derive(Debug)]
 pub struct Page {
+    pub kind: PageKind,
+    /// Found under `static/`: no folder defaults, and never part of a collection.
+    pub from_static: bool,
     pub source: PathBuf,
     pub front_matter: FrontMatter,
     /// Raw Markdown after the front matter, with blocks unevaluated.
@@ -121,11 +132,19 @@ impl Site {
         match dirs::load(&content) {
             Ok(dirs) => {
                 for (path, rel) in walk(&content, &mut errors) {
-                    if path.extension().is_some_and(|e| e == "md") {
-                        match load_page(&path, &rel, &dirs) {
-                            Ok(page) => pages.push(page),
-                            Err(e) => errors.push(e),
-                        }
+                    let is_markdown = path.extension().is_some_and(|e| e == "md");
+                    if !is_markdown && path.file_name().is_some_and(|n| n == "_dir.toml") {
+                        continue;
+                    }
+                    let loaded = if is_markdown {
+                        load_page(&path, &rel, Some(&dirs), PageKind::Markdown).map(Some)
+                    } else {
+                        load_template(&path, &rel, Some(&dirs))
+                    };
+                    match loaded {
+                        Ok(Some(page)) => pages.push(page),
+                        Ok(None) => {}
+                        Err(e) => errors.push(e),
                     }
                 }
                 mark_draft_excluded(&mut pages, &dirs);
@@ -134,14 +153,19 @@ impl Site {
         }
 
         let static_dir = root.join("static");
-        let static_files = if static_dir.exists() {
-            walk(&static_dir, &mut errors)
-                .into_iter()
-                .map(|(_, rel)| rel)
-                .collect()
-        } else {
-            Vec::new()
-        };
+        let mut static_files = Vec::new();
+        if static_dir.exists() {
+            for (path, rel) in walk(&static_dir, &mut errors) {
+                match load_template(&path, &rel, None) {
+                    Ok(Some(mut page)) => {
+                        page.draft_excluded = page.front_matter.draft;
+                        pages.push(page);
+                    }
+                    Ok(None) => static_files.push(rel),
+                    Err(e) => errors.push(e),
+                }
+            }
+        }
 
         let theme_static_files = match config.as_ref().and_then(|c| c.theme.as_ref()) {
             Some(theme) if theme.join("static").exists() => {
@@ -179,52 +203,18 @@ impl Site {
         let mut errors = Vec::new();
         let site_map = page::site_map(&self.config).map_err(|e| vec![e])?;
         let collections = collections::build(&pages, &self.config)?;
+        let scopes = page::SiteScopes {
+            site: &site_map,
+            data: &self.data.value,
+            collections: &collections,
+        };
         for page in &pages {
-            let (doc, mut scope) = match page::render_body(
-                page,
-                &self.engine,
-                &self.config,
-                &site_map,
-                &self.data.value,
-                &collections,
-            ) {
-                Ok(rendered) => rendered,
+            let output = match self.render_page(page, &scopes) {
+                Ok(output) => output,
                 Err(mut e) => {
                     errors.append(&mut e);
                     continue;
                 }
-            };
-            let body = html::render(&doc);
-            let layout_name = page
-                .front_matter
-                .layout
-                .as_deref()
-                .or_else(|| collections::layout_of(&page.rel, &self.config));
-            let layout =
-                match layout::find_layout(layout_name, &self.root, self.config.theme.as_deref()) {
-                    Ok(layout) => layout,
-                    Err(mut e) => {
-                        e.path.clone_from(&page.source);
-                        errors.push(e);
-                        continue;
-                    }
-                };
-            let output = match layout {
-                Some(path) => {
-                    match layout::render_layout(&path, &self.engine, &mut scope, Html(body)) {
-                        Ok(html) => html,
-                        Err(mut e) => {
-                            errors.append(&mut e);
-                            continue;
-                        }
-                    }
-                }
-                None => builtin_page(&PageShell {
-                    title: &page.front_matter.title,
-                    lang: "en",
-                    description: page.front_matter.description.as_deref(),
-                    body: &body,
-                }),
             };
             if let Err(e) = splice::ensure_no_placeholders(&page.source, &output) {
                 errors.push(e);
@@ -257,14 +247,61 @@ impl Site {
         })
     }
 
+    /// Renders one page or template to its final output text, layout included.
+    fn render_page(
+        &self,
+        page: &Page,
+        scopes: &page::SiteScopes<'_>,
+    ) -> Result<String, Vec<Error>> {
+        let (body, mut scope, layout_name) = match page.kind {
+            PageKind::Markdown => {
+                let (doc, scope) = page::render_body(page, &self.engine, &self.config, scopes)?;
+                let name = page
+                    .front_matter
+                    .layout
+                    .as_deref()
+                    .or_else(|| collections::layout_of(&page.rel, &self.config));
+                (html::render(&doc), scope, name)
+            }
+            PageKind::Template { escape } => {
+                let (text, scope) =
+                    template::render(page, escape, &self.engine, &self.config, scopes)?;
+                (text, scope, page.front_matter.layout.as_deref())
+            }
+        };
+        let layout = layout::find_layout(layout_name, &self.root, self.config.theme.as_deref())
+            .map_err(|mut e| {
+                e.path.clone_from(&page.source);
+                vec![e]
+            })?;
+        match (layout, page.kind) {
+            (Some(path), _) => layout::render_layout(&path, &self.engine, &mut scope, Html(body)),
+            (None, PageKind::Markdown) => Ok(builtin_page(&PageShell {
+                title: &page.front_matter.title,
+                lang: "en",
+                description: page.front_matter.description.as_deref(),
+                body: &body,
+            })),
+            (None, PageKind::Template { .. }) => Ok(body),
+        }
+    }
+
     /// Every file to copy as (path relative to the output, source). Theme files come first and a site file at the
     /// same path replaces one, so only two files within the site can collide.
     fn static_sources(&self) -> Vec<(PathBuf, PathBuf)> {
         let theme_dir = self.config.theme.as_ref().map(|t| t.join("static"));
+        let templated: HashSet<&Path> = self
+            .pages
+            .iter()
+            .filter(|p| p.from_static)
+            .map(|p| p.rel.as_path())
+            .collect();
         let theme = theme_dir.iter().flat_map(|dir| {
             self.theme_static_files
                 .iter()
-                .filter(|rel| !self.static_files.contains(rel))
+                .filter(|rel| {
+                    !self.static_files.contains(rel) && !templated.contains(rel.as_path())
+                })
                 .map(|rel| (rel.clone(), dir.join(rel)))
         });
         let site_dir = self.root.join("static");
@@ -331,22 +368,73 @@ fn walk(dir: &Path, errors: &mut Vec<Error>) -> Vec<(PathBuf, PathBuf)> {
     files
 }
 
-fn load_page(path: &Path, rel: &Path, dirs: &DirDefaults) -> Result<Page, Error> {
+/// Reads a content or static file. Markdown always becomes a page; other files do only if they start with front
+/// matter, and `Ok(None)` means the file is not a template.
+fn load_template(
+    path: &Path,
+    rel: &Path,
+    dirs: Option<&DirDefaults>,
+) -> Result<Option<Page>, Error> {
+    let io = |e: std::io::Error| Error::new(path, e);
+    // Most static files are binary, so read just enough to rule them out before loading the rest.
+    let mut file = fs::File::open(path).map_err(io)?;
+    let mut head = [0u8; 8];
+    let n = file.read(&mut head).map_err(io)?;
+    let head = head[..n]
+        .strip_prefix(b"\xef\xbb\xbf")
+        .unwrap_or(&head[..n]);
+    if !(head.starts_with(b"---") || head.starts_with(b"+++")) {
+        return Ok(None);
+    }
+    let bytes = fs::read(path).map_err(io)?;
+    if !template::starts_with_front_matter(&bytes) {
+        return Ok(None);
+    }
+    let kind = PageKind::Template {
+        escape: template::escape_for(rel),
+    };
+    load_page_from(path, rel, bytes, dirs, kind).map(Some)
+}
+
+fn load_page(
+    path: &Path,
+    rel: &Path,
+    dirs: Option<&DirDefaults>,
+    kind: PageKind,
+) -> Result<Page, Error> {
     let bytes = fs::read(path).map_err(|e| Error::new(path, e))?;
+    load_page_from(path, rel, bytes, dirs, kind)
+}
+
+fn load_page_from(
+    path: &Path,
+    rel: &Path,
+    bytes: Vec<u8>,
+    dirs: Option<&DirDefaults>,
+    kind: PageKind,
+) -> Result<Page, Error> {
     let src = String::from_utf8(bytes).map_err(|_| Error::new(path, ErrorKind::NotUtf8))?;
     let raw = frontmatter::parse_raw(&src).map_err(|e| Error::new(path, e))?;
-    let mut merged = dirs.defaults_for(rel.parent().unwrap_or(Path::new("")));
+    let mut merged = dirs.map_or_else(Default::default, |d| {
+        d.defaults_for(rel.parent().unwrap_or(Path::new("")))
+    });
     merged.merge(raw.value, path);
     let front_matter = frontmatter::from_value(merged.value).map_err(|e| Error::new(path, e))?;
     let sidecar = Some(path.with_extension("rhai")).filter(|p| p.is_file());
+    let route = match kind {
+        PageKind::Markdown => route_for_page(rel),
+        PageKind::Template { .. } => route_for_template(rel),
+    };
     Ok(Page {
+        kind,
+        from_static: dirs.is_none(),
         source: path.to_path_buf(),
         body: raw.body.to_string(),
         body_line: raw.body_line,
         rel: rel.to_path_buf(),
         sidecar,
         front_matter,
-        route: route_for_page(rel),
+        route,
         front_matter_sources: merged.sources,
         draft_excluded: false,
     })
