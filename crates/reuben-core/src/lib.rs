@@ -5,6 +5,7 @@
 pub mod blocks;
 pub mod collections;
 pub mod config;
+pub mod css;
 pub mod data;
 pub mod dirs;
 pub mod doc;

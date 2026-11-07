@@ -26,6 +26,11 @@ pub enum ErrorKind {
     Block(BlockError),
     #[error("math: {message}")]
     Math { message: String, location: Span },
+    #[error("css: {message}")]
+    Css {
+        message: String,
+        location: Option<Span>,
+    },
     #[error("config: {0}")]
     Config(String),
     #[error("data: {0}")]
@@ -54,6 +59,7 @@ impl Error {
             ErrorKind::Script(e) => e.location,
             ErrorKind::Block(e) => Some(e.span),
             ErrorKind::Math { location, .. } => Some(*location),
+            ErrorKind::Css { location, .. } => *location,
             _ => None,
         }
     }

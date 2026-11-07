@@ -23,6 +23,8 @@ thiserror = "2.0"
 walkdir = "2.5"
 rayon = "1.12"
 glob = "0.3"
+lightningcss = { version = "1.0.0-alpha.72", default-features = false, features = ["browserslist", "bundler"] }
+elsa = "1.11"
 jiff = "0.2"
 insta = "1.49"
 assert_cmd = "2.2"

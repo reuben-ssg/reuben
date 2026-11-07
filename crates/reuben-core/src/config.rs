@@ -16,7 +16,29 @@ pub struct Config {
     pub params: toml::Table,
     pub collections: BTreeMap<String, CollectionConfig>,
     pub sitemap: bool,
+    pub css: CssConfig,
     pub sources: BTreeMap<String, PathBuf>,
+}
+
+/// The `[css]` table: how every CSS file in the output is processed.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct CssConfig {
+    pub minify: bool,
+    /// A Browserslist query naming the browsers CSS is lowered for.
+    pub targets: String,
+    /// Inline local `@import`s.
+    pub bundle: bool,
+}
+
+impl Default for CssConfig {
+    fn default() -> Self {
+        Self {
+            minify: true,
+            targets: "defaults".into(),
+            bundle: true,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Default, serde::Deserialize)]
@@ -38,6 +60,8 @@ struct Raw {
     #[serde(default)]
     collections: BTreeMap<String, CollectionConfig>,
     sitemap: Option<bool>,
+    #[serde(default)]
+    css: CssConfig,
 }
 
 fn read_layer(path: &Path) -> Result<Option<Map<String, Value>>, Error> {
@@ -95,6 +119,13 @@ pub fn load(root: &Path, env: Option<&str>) -> Result<Config, Error> {
             ErrorKind::Config(format!("theme `{}` is not a directory", theme.display())),
         ));
     }
+    if let Err(message) = crate::css::targets(&raw.css.targets) {
+        let blamed = layered.sources.get("css.targets").unwrap_or(&path);
+        return Err(Error::new(
+            blamed,
+            ErrorKind::Config(format!("css.targets: {message}")),
+        ));
+    }
     Ok(Config {
         title: raw.title.unwrap_or_default(),
         base_url: raw.base_url.unwrap_or_else(|| "/".into()),
@@ -102,6 +133,7 @@ pub fn load(root: &Path, env: Option<&str>) -> Result<Config, Error> {
         params: raw.params,
         collections: raw.collections,
         sitemap: raw.sitemap.unwrap_or(true),
+        css: raw.css,
         sources: layered.sources,
     })
 }
@@ -168,6 +200,34 @@ mod tests {
     use super::*;
     use assert_fs::TempDir;
     use assert_fs::prelude::*;
+
+    #[test]
+    fn css_config_defaults_and_validation() {
+        let tmp = TempDir::new().unwrap();
+        let c = load(tmp.path(), None).unwrap();
+        assert_eq!(c.css, CssConfig::default());
+        assert!(c.css.minify && c.css.bundle);
+        assert_eq!(c.css.targets, "defaults");
+
+        tmp.child("reuben.toml")
+            .write_str("[css]\nminify = false\ntargets = \"last 2 versions\"\n")
+            .unwrap();
+        let c = load(tmp.path(), None).unwrap();
+        assert!(!c.css.minify && c.css.bundle);
+        assert_eq!(c.css.targets, "last 2 versions");
+
+        tmp.child("reuben.toml")
+            .write_str("[css]\ntargets = \"not a query ###\"\n")
+            .unwrap();
+        let err = load(tmp.path(), None).unwrap_err();
+        assert!(err.path.ends_with("reuben.toml"), "{err}");
+        assert!(err.to_string().contains("targets"), "{err}");
+
+        tmp.child("reuben.toml")
+            .write_str("[css]\nminfy = true\n")
+            .unwrap();
+        assert!(load(tmp.path(), None).is_err());
+    }
 
     #[test]
     fn missing_file_gives_defaults() {

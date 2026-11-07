@@ -280,6 +280,7 @@ mod tests {
             params: toml::Table::new(),
             collections,
             sitemap: false,
+            css: Default::default(),
             sources: Default::default(),
         }
     }

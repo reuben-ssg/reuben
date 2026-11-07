@@ -22,6 +22,8 @@ walkdir.workspace = true
 rayon.workspace = true
 glob.workspace = true
 jiff.workspace = true
+lightningcss.workspace = true
+elsa.workspace = true
 
 [dev-dependencies]
 insta.workspace = true

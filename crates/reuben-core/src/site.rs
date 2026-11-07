@@ -273,10 +273,10 @@ impl Site {
             splice::ensure_no_placeholders(&page.source, &html).map_err(|e| vec![e])?;
             Ok(html)
         };
-        let rendered: Vec<Result<String, Vec<Error>>> = match opts.jobs {
-            None => pages.par_iter().map(render_one).collect(),
-            Some(n) => {
-                let pool = rayon::ThreadPoolBuilder::new()
+        let pool = opts
+            .jobs
+            .map(|n| {
+                rayon::ThreadPoolBuilder::new()
                     .num_threads(n)
                     .build()
                     .map_err(|e| {
@@ -284,13 +284,25 @@ impl Site {
                             "reuben.toml",
                             ErrorKind::Config(format!("can't start {n} render threads: {e}")),
                         )]
-                    })?;
-                pool.install(|| pages.par_iter().map(render_one).collect())
-            }
-        };
+                    })
+            })
+            .transpose()?;
+        let rendered: Vec<Result<String, Vec<Error>>> =
+            in_pool(pool.as_ref(), || pages.par_iter().map(render_one).collect());
+        let mut css_jobs: Vec<CssJob> = Vec::new();
         // Merged in page order so neither output nor errors depend on which thread finished first.
         for (page, result) in pages.iter().zip(rendered) {
             match result {
+                Ok(_) if is_partial_css(&page.route.file) => {}
+                Ok(html) if is_css(&page.route.file) => {
+                    // Line numbers in the rendered text don't match the template, so errors there carry none.
+                    css_jobs.push(CssJob {
+                        rel: page.route.file.clone(),
+                        path: page.source.clone(),
+                        root: self.css_root(&page.source, page.from_static),
+                        input: CssInput::Text(html),
+                    });
+                }
                 Ok(html) => {
                     output.files.insert(
                         page.route.file.clone(),
@@ -301,15 +313,45 @@ impl Site {
             }
         }
         let statics = self.static_sources(opts.drafts);
+        let mut static_copied = 0;
         for (rel, src) in &statics {
+            if is_partial_css(rel) {
+                continue;
+            }
             // Opened read-only now so unreadable sources are reported with the page errors, not at write time.
             if let Err(e) = fs::File::open(src) {
                 errors.push(Error::new(src, e));
                 continue;
             }
-            output
-                .files
-                .insert(rel.clone(), OutputFile::Copy(src.clone()));
+            static_copied += 1;
+            if is_css(rel) {
+                css_jobs.push(CssJob {
+                    rel: rel.clone(),
+                    path: src.clone(),
+                    root: self.css_root(src, false),
+                    input: CssInput::File,
+                });
+            } else {
+                output
+                    .files
+                    .insert(rel.clone(), OutputFile::Copy(src.clone()));
+            }
+        }
+        let processed = in_pool(pool.as_ref(), || {
+            css_jobs
+                .par_iter()
+                .map(|job| job.run(&self.config.css))
+                .collect::<Vec<_>>()
+        });
+        for (job, result) in css_jobs.into_iter().zip(processed) {
+            match result {
+                Ok(css) => {
+                    output
+                        .files
+                        .insert(job.rel, OutputFile::Bytes(css.into_bytes()));
+                }
+                Err(e) => errors.push(e),
+            }
         }
 
         let mut warnings = Vec::new();
@@ -348,7 +390,7 @@ impl Site {
         }
         let report = BuildReport {
             pages_written: pages.len(),
-            static_copied: statics.len(),
+            static_copied,
             drafts_skipped: drafts.len(),
             warnings,
         };
@@ -420,6 +462,20 @@ impl Site {
         }
     }
 
+    /// Where `@import`s in the CSS file `src` may reach: the folder it lives in the site, theme or content tree.
+    fn css_root(&self, src: &Path, template_from_static: bool) -> PathBuf {
+        let site_static = self.root.join("static");
+        if template_from_static {
+            return site_static;
+        }
+        let theme_static = self.config.theme.as_ref().map(|t| t.join("static"));
+        match theme_static {
+            Some(dir) if src.starts_with(&dir) => dir,
+            _ if src.starts_with(&site_static) => site_static,
+            _ => self.root.join("content"),
+        }
+    }
+
     /// Every file to copy as (path relative to the output, source). Theme files come first and a site file at the
     /// same path replaces one, so only two files within the site can collide.
     /// Content assets are included unless a drafted folder hides them and `drafts` is off.
@@ -485,6 +541,64 @@ impl Site {
         } else {
             Err(errors)
         }
+    }
+}
+
+fn in_pool<R: Send>(pool: Option<&rayon::ThreadPool>, f: impl FnOnce() -> R + Send) -> R {
+    match pool {
+        Some(pool) => pool.install(f),
+        None => f(),
+    }
+}
+
+fn is_css(rel: &Path) -> bool {
+    rel.extension()
+        .is_some_and(|e| e.eq_ignore_ascii_case("css"))
+}
+
+/// `_name.css` files can be imported but are never written out.
+fn is_partial_css(rel: &Path) -> bool {
+    is_css(rel)
+        && rel
+            .file_name()
+            .is_some_and(|n| n.to_string_lossy().starts_with('_'))
+}
+
+enum CssInput {
+    /// Template output, already rendered.
+    Text(String),
+    /// Read from `CssJob::path`.
+    File,
+}
+
+struct CssJob {
+    rel: PathBuf,
+    path: PathBuf,
+    root: PathBuf,
+    input: CssInput,
+}
+
+impl CssJob {
+    fn run(&self, cfg: &config::CssConfig) -> Result<String, Error> {
+        let text;
+        let (css, is_template) = match &self.input {
+            CssInput::Text(t) => (t.as_str(), true),
+            CssInput::File => {
+                let bytes = fs::read(&self.path).map_err(|e| Error::new(&self.path, e))?;
+                text = String::from_utf8(bytes)
+                    .map_err(|_| Error::new(&self.path, ErrorKind::NotUtf8))?;
+                (text.as_str(), false)
+            }
+        };
+        crate::css::process(&self.path, css, Some(&self.root), cfg).map_err(|mut e| {
+            if is_template
+                && e.path == self.path
+                && let ErrorKind::Css { location, .. } = &mut e.kind
+            {
+                *location = None;
+            }
+            e
+        })
     }
 }
 

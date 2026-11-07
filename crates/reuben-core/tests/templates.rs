@@ -51,7 +51,7 @@ fn html_template_gets_trailing_slash_route() {
 #[test]
 fn static_template_is_processed() {
     let tmp = build();
-    assert_eq!(dist(&tmp, "theme.css"), ":root { --x: 2; }\n");
+    assert_eq!(dist(&tmp, "theme.css"), ":root{--x:2}");
 }
 
 #[test]
@@ -60,13 +60,14 @@ fn plain_and_binary_static_are_copied_verbatim() {
     let src = Path::new(env!("CARGO_MANIFEST_DIR"))
         .join(FIXTURE)
         .join("static");
-    for name in ["site.css", "logo.png", "dashes.bin"] {
+    for name in ["logo.png", "dashes.bin"] {
         assert_eq!(
             fs::read(tmp.path().join("dist").join(name)).unwrap(),
             fs::read(src.join(name)).unwrap(),
             "{name}"
         );
     }
+    assert_eq!(dist(&tmp, "site.css"), "body{color:red}");
 }
 
 #[test]
@@ -291,11 +292,11 @@ fn templates_without_their_own_layout_are_not_wrapped() {
         ("layouts/default.html", WRAP),
         ("content/feed.xml", "---\ntitle: F\n---\n<feed/>"),
         ("content/p.md", "---\ntitle: P\n---\nhi"),
-        ("static/css/s.css", "---\ntitle: S\n---\nbody{}"),
+        ("static/css/s.css", "---\ntitle: S\n---\nbody{color:red}"),
     ]);
     run_build(&tmp).unwrap();
     assert_eq!(dist(&tmp, "feed.xml"), "<feed/>");
-    assert_eq!(dist(&tmp, "css/s.css"), "body{}");
+    assert_eq!(dist(&tmp, "css/s.css"), "body{color:red}");
     assert!(dist(&tmp, "p/index.html").contains("<html><body>"));
 }
 
@@ -331,11 +332,11 @@ fn yaml_starting_with_dashes_is_copied() {
 #[test]
 fn template_title_is_optional_but_markdown_title_is_not() {
     let tmp = site_of(&[
-        ("static/s.css", "---\n---\nbody{}"),
+        ("static/s.css", "---\n---\nbody{color:red}"),
         ("content/index.md", "---\ntitle: H\n---\nhi"),
     ]);
     run_build(&tmp).unwrap();
-    assert_eq!(dist(&tmp, "s.css"), "body{}");
+    assert_eq!(dist(&tmp, "s.css"), "body{color:red}");
     let tmp = site_of(&[("content/p.md", "---\n---\nhi")]);
     assert!(Site::load(tmp.path()).is_err());
 }
