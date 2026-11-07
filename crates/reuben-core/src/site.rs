@@ -1,6 +1,6 @@
 //! Loading a site from disk and building it.
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fs;
 use std::io::Read;
 use std::path::{Path, PathBuf};
@@ -76,6 +76,9 @@ pub struct Site {
     pub data: SiteData,
     /// Per-file problems found while loading. The site holds everything that did load; any entry fails the build.
     pub load_errors: Vec<Error>,
+    /// Folders (relative to `content/`) whose `_dir.toml` failed to load. Their pages stay in the site, but their
+    /// render errors are dropped because the `_dir.toml` error already explains them.
+    broken_dirs: BTreeSet<PathBuf>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -164,9 +167,11 @@ impl Site {
                 Ok(Some(page)) => pages.push(page),
                 Ok(None) => asset_rels.push(rel),
                 // The broken `_dir.toml` is already reported, and without its defaults a page would only add
-                // misleading errors (a missing title, say).
-                Err(_) if dirs.folder_broken(rel.parent().unwrap_or(Path::new(""))) => {}
-                Err(e) => errors.push(e),
+                // misleading errors (a missing title, say). Problems in the file itself are its own.
+                Err(f)
+                    if f.from_defaults
+                        && dirs.folder_broken(rel.parent().unwrap_or(Path::new(""))) => {}
+                Err(f) => errors.push(f.error),
             }
         }
         mark_draft_excluded(&mut pages, &dirs);
@@ -191,7 +196,7 @@ impl Site {
                         pages.push(page);
                     }
                     Ok(None) => static_files.push(rel),
-                    Err(e) => errors.push(e),
+                    Err(f) => errors.push(f.error),
                 }
             }
         }
@@ -227,6 +232,7 @@ impl Site {
             config,
             engine: Arc::new(engine),
             load_errors: errors,
+            broken_dirs: dirs.broken().clone(),
         })
     }
 
@@ -240,7 +246,15 @@ impl Site {
         // Everything below adds to one list, sorted once at the end, so no stage hides another's errors.
         let mut errors = self.load_errors.clone();
         errors.append(&mut self.check_collisions(&pages, opts.drafts));
-        let site_map = page::site_map(&self.config).map_err(|e| vec![e])?;
+        let site_map = match page::site_map(&self.config) {
+            Ok(map) => map,
+            Err(e) => {
+                // Nothing can render without the `site` scope, so this is the last stage to contribute.
+                errors.push(e);
+                Error::sort(&mut errors);
+                return Err(errors);
+            }
+        };
         let (collections, mut collection_errors) = collections::build(&pages, &self.config);
         errors.append(&mut collection_errors);
 
@@ -255,31 +269,40 @@ impl Site {
             splice::ensure_no_placeholders(&page.source, &html).map_err(|e| vec![e])?;
             Ok(html)
         };
-        let pool = opts
-            .jobs
-            .map(|n| {
-                rayon::ThreadPoolBuilder::new()
-                    .num_threads(n)
-                    .build()
-                    .map_err(|e| {
-                        vec![Error::new(
+        // A pool that can't start is reported, and the build carries on with rayon's default pool.
+        let pool =
+            opts.jobs.and_then(
+                |n| match rayon::ThreadPoolBuilder::new().num_threads(n).build() {
+                    Ok(pool) => Some(pool),
+                    Err(e) => {
+                        errors.push(Error::new(
                             "reuben.toml",
                             ErrorKind::Config(format!("can't start {n} render threads: {e}")),
-                        )]
-                    })
-            })
-            .transpose()?;
+                        ));
+                        None
+                    }
+                },
+            );
         let rendered: Vec<Result<String, Vec<Error>>> =
             in_pool(pool.as_ref(), || pages.par_iter().map(render_one).collect());
         let mut css_jobs: Vec<CssJob> = Vec::new();
         // Templated partials are imported as their rendered text. A partial that failed to render is imported as
         // empty, since its own error is already reported and importers would only add noise.
-        let mut partials: HashMap<PathBuf, String> = HashMap::new();
+        let mut partials: HashMap<PathBuf, String> = self
+            .load_errors
+            .iter()
+            .filter(|e| is_partial_css(&e.path))
+            .map(|e| (crate::css::normalize(&e.path), String::new()))
+            .collect();
         let mut partial_pages = 0;
         // Merged in page order so neither output nor errors depend on which thread finished first.
         for (page, result) in pages.iter().zip(rendered) {
             let is_partial = is_partial_css(&page.route.file);
             partial_pages += usize::from(is_partial);
+            let result = match result {
+                Err(_) if self.in_broken_dir(page) => Err(Vec::new()),
+                other => other,
+            };
             match result {
                 Ok(html) if is_partial => {
                     partials.insert(crate::css::normalize(&page.source), html);
@@ -408,6 +431,14 @@ impl Site {
         };
         write_atomic(&output, &opts.out)?;
         Ok(report)
+    }
+
+    fn in_broken_dir(&self, page: &Page) -> bool {
+        !page.from_static
+            && page
+                .rel
+                .parent()
+                .is_some_and(|dir| dir.ancestors().any(|d| self.broken_dirs.contains(d)))
     }
 
     /// A page or copied file that already writes `sitemap.xml` (any case) takes the place of the generated one.
@@ -638,13 +669,29 @@ fn walk(dir: &Path, errors: &mut Vec<Error>) -> Vec<(PathBuf, PathBuf)> {
     files
 }
 
+/// Why a page didn't load. `from_defaults` marks a failure in the merged front matter, which a broken `_dir.toml`
+/// can cause; reading and parsing the file itself never depends on folder defaults.
+struct LoadFailure {
+    error: Error,
+    from_defaults: bool,
+}
+
+impl From<Error> for LoadFailure {
+    fn from(error: Error) -> Self {
+        Self {
+            error,
+            from_defaults: false,
+        }
+    }
+}
+
 /// Reads a content or static file. Markdown always becomes a page; other files do only if they start with front
 /// matter, and `Ok(None)` means the file is not a template.
 fn load_template(
     path: &Path,
     rel: &Path,
     dirs: Option<&DirDefaults>,
-) -> Result<Option<Page>, Error> {
+) -> Result<Option<Page>, LoadFailure> {
     let io = |e: std::io::Error| Error::new(path, e);
     // Most static files are binary, so read just enough to rule them out before loading the rest.
     let mut file = fs::File::open(path).map_err(io)?;
@@ -671,7 +718,7 @@ fn load_page(
     rel: &Path,
     dirs: Option<&DirDefaults>,
     kind: PageKind,
-) -> Result<Page, Error> {
+) -> Result<Page, LoadFailure> {
     let bytes = fs::read(path).map_err(|e| Error::new(path, e))?;
     load_page_from(path, rel, bytes, dirs, kind)
 }
@@ -682,7 +729,7 @@ fn load_page_from(
     bytes: Vec<u8>,
     dirs: Option<&DirDefaults>,
     kind: PageKind,
-) -> Result<Page, Error> {
+) -> Result<Page, LoadFailure> {
     let src = String::from_utf8(bytes).map_err(|_| Error::new(path, ErrorKind::NotUtf8))?;
     let raw = frontmatter::parse_raw(&src).map_err(|e| Error::new(path, e))?;
     let mut merged = dirs.map_or_else(Default::default, |d| {
@@ -701,7 +748,10 @@ fn load_page_from(
             .map_or_else(String::new, |n| n.to_string_lossy().into_owned());
         merged.value.insert("title".into(), name.into());
     }
-    let front_matter = frontmatter::from_value(merged.value).map_err(|e| Error::new(path, e))?;
+    let front_matter = frontmatter::from_value(merged.value).map_err(|e| LoadFailure {
+        error: Error::new(path, e),
+        from_defaults: true,
+    })?;
     let sidecar = Some(path.with_extension("rhai")).filter(|p| p.is_file());
     let route = match kind {
         PageKind::Markdown => route_for_page(rel),

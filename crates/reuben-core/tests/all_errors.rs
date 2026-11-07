@@ -3,7 +3,7 @@
 use assert_fs::TempDir;
 use assert_fs::prelude::*;
 use reuben_core::Error;
-use reuben_core::site::{BuildOptions, Site};
+use reuben_core::site::{BuildOptions, RenderOptions, Site};
 
 fn site_of(files: &[(&str, &str)]) -> TempDir {
     let tmp = TempDir::new().unwrap();
@@ -114,14 +114,120 @@ fn broken_dir_toml_is_reported_once_not_per_page() {
 }
 
 #[test]
-fn errors_are_sorted_and_not_interleaved_at_one_location() {
+fn errors_are_ordered_by_path_then_line_with_several_per_file() {
     let tmp = site_of(&[
         ("content/z.md", "---\n---\nx\n"),
+        (
+            "content/m.md",
+            "---\ntitle: M\n---\n{{ nope2( }}\n\n{{ nope1( }}\n\n$\\frac{1}{$\n",
+        ),
         ("content/b.md", "---\n---\nx\n"),
     ]);
     let errors = build(&tmp).unwrap_err();
-    let paths: Vec<_> = errors.iter().map(|e| e.path.clone()).collect();
-    let mut sorted = paths.clone();
+    let keys: Vec<_> = errors
+        .iter()
+        .map(|e| (e.path.clone(), e.location().map_or(0, |l| l.line)))
+        .collect();
+    let mut sorted = keys.clone();
     sorted.sort();
-    assert_eq!(paths, sorted);
+    assert_eq!(keys, sorted);
+    let in_m: Vec<_> = keys.iter().filter(|(p, _)| p.ends_with("m.md")).collect();
+    assert!(in_m.len() >= 2, "{errors:?}");
+}
+
+#[test]
+fn broken_dir_toml_still_reports_unreadable_and_unparsable_pages() {
+    let tmp = site_of(&[
+        ("content/g/_dir.toml", "layout = [\n"),
+        ("content/g/yaml.md", "---\ntitle: [\n---\nx\n"),
+        ("content/g/sub/open.md", "---\ntitle: T\nno closing\n"),
+        ("content/g/notitle.md", "---\n---\nx\n"),
+    ]);
+    std::fs::write(tmp.path().join("content/g/bin.md"), [0xff, 0xfe, 0x00]).unwrap();
+    let errors = build(&tmp).unwrap_err();
+    for file in ["g/_dir.toml", "g/yaml.md", "g/sub/open.md", "g/bin.md"] {
+        assert!(
+            errors.iter().any(|e| e.path.ends_with(file)),
+            "no error for {file}: {errors:?}"
+        );
+    }
+    assert!(
+        !errors.iter().any(|e| e.path.ends_with("g/notitle.md")),
+        "{errors:?}"
+    );
+}
+
+#[test]
+fn broken_dir_toml_hides_render_errors_that_only_follow_from_it() {
+    let tmp = site_of(&[
+        ("content/g/_dir.toml", "[params\nx = 1\n"),
+        (
+            "content/g/one.md",
+            "---\ntitle: One\n---\n{{ page.params.sub.y }}\n",
+        ),
+        (
+            "content/g/two.md",
+            "---\ntitle: Two\n---\n{{ page.params.sub.y }}\n",
+        ),
+    ]);
+    let errors = build(&tmp).unwrap_err();
+    assert_eq!(errors.len(), 1, "{errors:?}");
+    assert!(errors[0].path.ends_with("g/_dir.toml"));
+}
+
+#[test]
+fn templated_css_partial_that_fails_to_load_adds_no_css_error() {
+    let tmp = site_of(&[
+        ("content/index.md", "---\ntitle: H\n---\nhi\n"),
+        ("static/_vars.css", "---\ntitle: [\n---\n:root{--c:red}\n"),
+        (
+            "static/main.css",
+            "@import \"_vars.css\";\na{color:var(--c)}\n",
+        ),
+    ]);
+    let errors = build(&tmp).unwrap_err();
+    assert_eq!(errors.len(), 1, "{errors:?}");
+    assert!(errors[0].path.ends_with("static/_vars.css"));
+}
+
+#[test]
+fn error_list_is_identical_whatever_the_thread_count() {
+    let tmp = site_of(&[
+        ("content/a.md", "---\n---\nno title\n"),
+        ("content/b.md", "---\ntitle: B\n---\n{{ nope( }}\n"),
+        ("content/c.md", "---\ntitle: C\n---\n\n$\\frac{1}{$\n"),
+        ("content/d.md", "---\ntitle: D\n---\nd\n"),
+        ("content/d/index.md", "---\ntitle: D2\n---\nd\n"),
+        ("data/bad.toml", "x = [\n"),
+        ("static/bad.css", "a {\n}}} x {{\n"),
+    ]);
+    let site = Site::load(tmp.path()).unwrap();
+    let run = |jobs| {
+        site.render(&RenderOptions {
+            drafts: false,
+            jobs: Some(jobs),
+        })
+        .map(|_| ())
+        .unwrap_err()
+        .iter()
+        .map(ToString::to_string)
+        .collect::<Vec<_>>()
+    };
+    let one = run(1);
+    assert!(one.len() >= 5, "{one:?}");
+    assert_eq!(one, run(8));
+}
+
+#[test]
+fn broken_include_still_stops_early() {
+    let tmp = site_of(&[
+        ("includes/bad.rhai", "fn (\n"),
+        ("content/a.md", "---\n---\nno title\n"),
+    ]);
+    let errors = Site::load(tmp.path()).unwrap_err();
+    assert!(!errors.is_empty());
+    assert!(
+        errors.iter().all(|e| e.path.ends_with("includes/bad.rhai")),
+        "{errors:?}"
+    );
 }

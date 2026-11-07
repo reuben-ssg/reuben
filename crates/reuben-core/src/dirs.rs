@@ -103,6 +103,10 @@ impl DirDefaults {
         layered
     }
 
+    pub fn broken(&self) -> &BTreeSet<PathBuf> {
+        &self.broken
+    }
+
     /// True when `rel_dir` or a folder above it has a `_dir.toml` that failed to load.
     /// Pages there are reported through that file, not again for what its defaults would have supplied.
     pub fn folder_broken(&self, rel_dir: &Path) -> bool {
