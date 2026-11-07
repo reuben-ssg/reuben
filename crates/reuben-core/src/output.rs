@@ -27,10 +27,19 @@ pub struct Output {
 /// The staging and old directories are siblings of `out` so the renames stay on one filesystem. They sit beside the
 /// output, never under `content/` or `static/`, so a site walk can't pick them up. An `out` with no final component
 /// (`.`, `/`) has no sibling to stage in and is refused.
-pub fn write_atomic(output: &Output, out: &Path) -> Result<(), Error> {
-    let (staging, old) = sibling_dirs(out)?;
-    check_out_dir(out)?;
-    let result = stage(output, &staging).and_then(|()| swap(&staging, out, &old));
+pub fn write_atomic(output: &Output, out: &Path) -> Result<(), Vec<Error>> {
+    // A symlinked output is swapped at its real location so the link keeps pointing at the new build.
+    let real;
+    let out = if fs::symlink_metadata(out).is_ok_and(|m| m.is_symlink()) {
+        real = fs::canonicalize(out).map_err(|e| vec![Error::new(out, e)])?;
+        real.as_path()
+    } else {
+        out
+    };
+    let (staging, old) = sibling_dirs(out).map_err(|e| vec![e])?;
+    check_out_dir(out).map_err(|e| vec![e])?;
+    let result =
+        stage(output, &staging).and_then(|()| swap(&staging, out, &old).map_err(|e| vec![e]));
     if result.is_err() {
         let _ = fs::remove_dir_all(&staging);
     }
@@ -67,22 +76,35 @@ fn sibling_dirs(out: &Path) -> Result<(PathBuf, PathBuf), Error> {
     ))
 }
 
-fn stage(output: &Output, staging: &Path) -> Result<(), Error> {
-    remove_dir(staging)?;
-    fs::create_dir_all(staging).map_err(|e| Error::new(staging, e))?;
+/// Writes every file, collecting every failure rather than stopping at the first.
+fn stage(output: &Output, staging: &Path) -> Result<(), Vec<Error>> {
+    remove_dir(staging).map_err(|e| vec![e])?;
+    fs::create_dir_all(staging).map_err(|e| vec![Error::new(staging, e)])?;
+    let mut errors = Vec::new();
     for (rel, file) in &output.files {
         let dest = staging.join(rel);
-        let written = dest
-            .parent()
-            .map_or(Ok(()), fs::create_dir_all)
+        let made = dest.parent().map_or(Ok(()), fs::create_dir_all);
+        let written = made
+            .map_err(|e| (dest.clone(), e))
             .and_then(|()| match file {
-                OutputFile::Bytes(bytes) => fs::write(&dest, bytes),
-                OutputFile::Copy(src) => fs::copy(src, &dest).map(|_| ()),
+                OutputFile::Bytes(bytes) => fs::write(&dest, bytes).map_err(|e| (dest.clone(), e)),
+                OutputFile::Copy(src) => fs::copy(src, &dest)
+                    .map(|_| ())
+                    .map_err(|e| (src.clone(), e)),
             });
-        written.map_err(|e| Error::new(&dest, e))?;
+        if let Err((path, e)) = written {
+            errors.push(Error::new(path, e));
+        }
     }
     let marker = staging.join(OUTPUT_MARKER);
-    fs::write(&marker, "").map_err(|e| Error::new(&marker, e))
+    if let Err(e) = fs::write(&marker, "") {
+        errors.push(Error::new(&marker, e));
+    }
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(errors)
+    }
 }
 
 fn swap(staging: &Path, out: &Path, old: &Path) -> Result<(), Error> {
@@ -142,7 +164,7 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         tmp.child("dist/keep.txt").write_str("mine").unwrap();
         let err = write_atomic(&one_page(), &tmp.path().join("dist")).unwrap_err();
-        assert!(matches!(err.kind, ErrorKind::UnsafeOutputDir));
+        assert!(matches!(err[0].kind, ErrorKind::UnsafeOutputDir));
         assert_eq!(
             std::fs::read_to_string(tmp.path().join("dist/keep.txt")).unwrap(),
             "mine"
@@ -165,6 +187,26 @@ mod tests {
     #[test]
     fn nameless_out_is_refused() {
         let err = write_atomic(&one_page(), Path::new(".")).unwrap_err();
-        assert!(matches!(err.kind, ErrorKind::Io(_)));
+        assert!(matches!(err[0].kind, ErrorKind::Io(_)));
+    }
+
+    #[test]
+    fn missing_copy_source_names_the_source_and_changes_nothing() {
+        let tmp = TempDir::new().unwrap();
+        tmp.child("dist/.reuben-output").write_str("").unwrap();
+        tmp.child("dist/keep.html").write_str("old").unwrap();
+        let mut output = one_page();
+        let src = tmp.path().join("missing.css");
+        output
+            .files
+            .insert("m.css".into(), OutputFile::Copy(src.clone()));
+        let errs = write_atomic(&output, &tmp.path().join("dist")).unwrap_err();
+        assert_eq!(errs.len(), 1);
+        assert_eq!(errs[0].path, src);
+        assert_eq!(
+            std::fs::read_to_string(tmp.path().join("dist/keep.html")).unwrap(),
+            "old"
+        );
+        assert!(!tmp.path().join(".dist.reuben-staging").exists());
     }
 }

@@ -269,6 +269,11 @@ impl Site {
         }
         let statics = self.static_sources(opts.drafts);
         for (rel, src) in &statics {
+            // Opened read-only now so unreadable sources are reported with the page errors, not at write time.
+            if let Err(e) = fs::File::open(src) {
+                errors.push(Error::new(src, e));
+                continue;
+            }
             output
                 .files
                 .insert(rel.clone(), OutputFile::Copy(src.clone()));
@@ -324,7 +329,7 @@ impl Site {
             drafts: opts.drafts,
             jobs: None,
         })?;
-        write_atomic(&output, &opts.out).map_err(|e| vec![e])?;
+        write_atomic(&output, &opts.out)?;
         Ok(report)
     }
 

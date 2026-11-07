@@ -29,7 +29,7 @@ fn failed_build_leaves_previous_output() {
     build(tmp.path()).unwrap();
     let before = fs::read(tmp.path().join("dist/index.html")).unwrap();
     tmp.child("content/broken.md")
-        .write_str("---\ntitle: Broken\n---\n{{ nope( }}\n")
+        .write_str("---\ntitle: Broken\n---\nok\n\n{{ nope( }}\n")
         .unwrap();
     assert!(build(tmp.path()).is_err());
     assert_eq!(
@@ -52,4 +52,73 @@ fn render_writes_nothing() {
         .unwrap();
     assert!(output.files.contains_key(Path::new("index.html")));
     assert!(!tmp.path().join("dist").exists());
+}
+
+#[cfg(unix)]
+#[test]
+fn every_unreadable_static_and_page_error_is_reported() {
+    use std::os::unix::fs::PermissionsExt;
+    let tmp = fixture("basic");
+    build(tmp.path()).unwrap();
+    let before = fs::read(tmp.path().join("dist/index.html")).unwrap();
+    for name in ["a.png", "b.png", "c.png"] {
+        tmp.child(format!("static/{name}")).write_str("x").unwrap();
+    }
+    tmp.child("content/broken.md")
+        .write_str("---\ntitle: Broken\n---\nok\n\n{{ nope() }}\n")
+        .unwrap();
+    // Load opens every static file, so they only become unreadable after it, as with a theme's files or a race.
+    let site = Site::load(tmp.path()).unwrap();
+    let mut locked = Vec::new();
+    for name in ["a.png", "b.png", "c.png"] {
+        let f = tmp.path().join("static").join(name);
+        fs::set_permissions(&f, fs::Permissions::from_mode(0o000)).unwrap();
+        locked.push(f);
+    }
+    let errs = site
+        .build(&BuildOptions {
+            drafts: false,
+            out: tmp.path().join("dist"),
+        })
+        .unwrap_err();
+    for p in &locked {
+        assert!(errs.iter().any(|e| &e.path == p), "{p:?} in {errs:?}");
+    }
+    assert!(
+        errs.iter().any(|e| e.path.ends_with("broken.md")),
+        "{errs:?}"
+    );
+    assert_eq!(
+        fs::read(tmp.path().join("dist/index.html")).unwrap(),
+        before
+    );
+    assert!(!tmp.path().join(".dist.reuben-staging").exists());
+}
+
+#[cfg(unix)]
+#[test]
+fn symlinked_out_dir_keeps_its_link() {
+    let site = fixture("basic");
+    let other = TempDir::new().unwrap();
+    let target = other.path().join("www");
+    fs::create_dir_all(&target).unwrap();
+    fs::write(target.join(".reuben-output"), "").unwrap();
+    fs::write(target.join("index.html"), "old").unwrap();
+    std::os::unix::fs::symlink(&target, site.path().join("dist")).unwrap();
+    build(site.path()).unwrap();
+    let dist = site.path().join("dist");
+    assert!(fs::symlink_metadata(&dist).unwrap().is_symlink());
+    assert_ne!(
+        fs::read_to_string(target.join("index.html")).unwrap(),
+        "old"
+    );
+    for dir in [site.path(), other.path()] {
+        for e in fs::read_dir(dir).unwrap() {
+            let n = e.unwrap().file_name().to_string_lossy().into_owned();
+            assert!(
+                !n.contains("reuben-staging") && !n.contains("reuben-old"),
+                "{n}"
+            );
+        }
+    }
 }
