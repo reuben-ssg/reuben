@@ -101,3 +101,14 @@ fn css_highlight_bad_theme_fails() {
         .code(1)
         .stderr(predicates::str::contains("nope"));
 }
+
+#[test]
+fn build_accepts_jobs_flag() {
+    let tmp = fixture("basic");
+    reuben()
+        .args(["build", "--jobs", "2", "--root"])
+        .arg(tmp.path())
+        .assert()
+        .success();
+    assert!(tmp.path().join("dist/about/index.html").is_file());
+}

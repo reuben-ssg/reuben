@@ -19,6 +19,7 @@ pulldown-latex.workspace = true
 syntect.workspace = true
 rhai.workspace = true
 walkdir.workspace = true
+rayon.workspace = true
 glob.workspace = true
 jiff.workspace = true
 

@@ -5,6 +5,7 @@ use std::fs;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 
+use rayon::prelude::*;
 use walkdir::WalkDir;
 
 use std::sync::Arc;
@@ -15,6 +16,7 @@ use crate::data::{self, SiteData};
 use crate::dirs::{self, DirDefaults};
 use crate::error::{Error, ErrorKind};
 use crate::frontmatter::{self, FrontMatter};
+use crate::headings::TocEntry;
 use crate::output::{Output, OutputFile, check_out_dir, write_atomic};
 use crate::route::{Route, route_for_page, route_for_template};
 use crate::script::helpers::url_for;
@@ -53,6 +55,10 @@ pub struct Page {
     pub front_matter_sources: BTreeMap<String, PathBuf>,
     /// Hidden from normal builds: the page or a folder above it is a draft.
     pub draft_excluded: bool,
+    /// The table of contents before blocks run, computed once at load.
+    pub pre_block_toc: Vec<TocEntry>,
+    /// Front matter `description`, else the first paragraph's text, computed once at load.
+    pub summary: String,
 }
 
 #[derive(Debug)]
@@ -79,6 +85,8 @@ pub struct LoadOptions {
 pub struct BuildOptions {
     pub drafts: bool,
     pub out: PathBuf,
+    /// Worker threads for rendering; `None` lets the renderer choose.
+    pub jobs: Option<usize>,
 }
 
 pub struct RenderOptions {
@@ -217,6 +225,16 @@ impl Site {
             _ => Vec::new(),
         };
 
+        pages.par_iter_mut().for_each(|page| {
+            page.pre_block_toc = page::compute_pre_block_toc(page.kind, &page.body, page.body_line);
+            page.summary = collections::compute_summary(
+                page.kind,
+                page.front_matter.description.as_deref(),
+                &page.body,
+                page.body_line,
+            );
+        });
+
         match config {
             Some(config) if errors.is_empty() => Ok(Site {
                 data: site_data.unwrap_or_default(),
@@ -250,22 +268,37 @@ impl Site {
             data: &self.data.value,
             collections: &collections,
         };
-        for page in &pages {
-            let html = match self.render_page(page, &scopes) {
-                Ok(html) => html,
-                Err(mut e) => {
-                    errors.append(&mut e);
-                    continue;
-                }
-            };
-            if let Err(e) = splice::ensure_no_placeholders(&page.source, &html) {
-                errors.push(e);
-                continue;
+        let render_one = |page: &&Page| -> Result<String, Vec<Error>> {
+            let html = self.render_page(page, &scopes)?;
+            splice::ensure_no_placeholders(&page.source, &html).map_err(|e| vec![e])?;
+            Ok(html)
+        };
+        let rendered: Vec<Result<String, Vec<Error>>> = match opts.jobs {
+            None => pages.par_iter().map(render_one).collect(),
+            Some(n) => {
+                let pool = rayon::ThreadPoolBuilder::new()
+                    .num_threads(n)
+                    .build()
+                    .map_err(|e| {
+                        vec![Error::new(
+                            "reuben.toml",
+                            ErrorKind::Config(format!("can't start {n} render threads: {e}")),
+                        )]
+                    })?;
+                pool.install(|| pages.par_iter().map(render_one).collect())
             }
-            output.files.insert(
-                page.route.file.clone(),
-                OutputFile::Bytes(html.into_bytes()),
-            );
+        };
+        // Merged in page order so neither output nor errors depend on which thread finished first.
+        for (page, result) in pages.iter().zip(rendered) {
+            match result {
+                Ok(html) => {
+                    output.files.insert(
+                        page.route.file.clone(),
+                        OutputFile::Bytes(html.into_bytes()),
+                    );
+                }
+                Err(mut e) => errors.append(&mut e),
+            }
         }
         let statics = self.static_sources(opts.drafts);
         for (rel, src) in &statics {
@@ -310,6 +343,7 @@ impl Site {
         }
 
         if !errors.is_empty() {
+            Error::sort(&mut errors);
             return Err(errors);
         }
         let report = BuildReport {
@@ -327,7 +361,7 @@ impl Site {
         check_out_dir(&opts.out).map_err(|e| vec![e])?;
         let (output, report) = self.render(&RenderOptions {
             drafts: opts.drafts,
-            jobs: None,
+            jobs: opts.jobs,
         })?;
         write_atomic(&output, &opts.out)?;
         Ok(report)
@@ -558,6 +592,8 @@ fn load_page_from(
         route,
         front_matter_sources: merged.sources,
         draft_excluded: false,
+        pre_block_toc: Vec::new(),
+        summary: String::new(),
     })
 }
 
@@ -641,6 +677,8 @@ mod tests {
             route: route_for_template(Path::new("side.css")),
             front_matter_sources: BTreeMap::new(),
             draft_excluded: false,
+            pre_block_toc: Vec::new(),
+            summary: String::new(),
         }
     }
 

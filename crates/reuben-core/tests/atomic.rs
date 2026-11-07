@@ -19,6 +19,7 @@ fn build(root: &Path) -> Result<(), Vec<reuben_core::Error>> {
         .build(&BuildOptions {
             drafts: false,
             out: root.join("dist"),
+            jobs: None,
         })
         .map(|_| ())
 }
@@ -79,6 +80,7 @@ fn every_unreadable_static_and_page_error_is_reported() {
         .build(&BuildOptions {
             drafts: false,
             out: tmp.path().join("dist"),
+            jobs: None,
         })
         .unwrap_err();
     for p in &locked {

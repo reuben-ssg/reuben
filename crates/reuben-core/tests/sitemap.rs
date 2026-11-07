@@ -17,6 +17,7 @@ fn build(config: &str, files: &[(&str, &str)]) -> (TempDir, BuildReport) {
         .build(&BuildOptions {
             drafts: false,
             out: tmp.path().join("dist"),
+            jobs: None,
         })
         .unwrap();
     (tmp, report)

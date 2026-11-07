@@ -48,6 +48,21 @@ pub enum ErrorKind {
 }
 
 impl Error {
+    /// Where in `path` the error points, for kinds that carry a position.
+    pub fn location(&self) -> Option<Span> {
+        match &self.kind {
+            ErrorKind::Script(e) => e.location,
+            ErrorKind::Block(e) => Some(e.span),
+            ErrorKind::Math { location, .. } => Some(*location),
+            _ => None,
+        }
+    }
+
+    /// Orders errors by path, then line and column, with position-less errors first within a path.
+    pub fn sort(errors: &mut [Error]) {
+        errors.sort_by_cached_key(|e| (e.path.clone(), e.location().map(|s| (s.line, s.column))));
+    }
+
     pub fn new(path: impl Into<PathBuf>, kind: impl Into<ErrorKind>) -> Self {
         Self {
             path: path.into(),

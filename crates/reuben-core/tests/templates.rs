@@ -15,6 +15,7 @@ fn build() -> TempDir {
     site.build(&BuildOptions {
         drafts: false,
         out: tmp.path().join("dist"),
+        jobs: None,
     })
     .unwrap();
     tmp
@@ -86,6 +87,7 @@ fn only_html_templates_join_collections() {
     site.build(&BuildOptions {
         drafts: false,
         out: tmp.path().join("dist"),
+        jobs: None,
     })
     .unwrap();
     let home = dist(&tmp, "index.html");
@@ -105,6 +107,7 @@ fn build_in(tmp: &TempDir, drafts: bool) -> Result<(), Vec<reuben_core::Error>> 
         .build(&BuildOptions {
             drafts,
             out: tmp.path().join("dist"),
+            jobs: None,
         })
         .map(|_| ())
 }
@@ -276,6 +279,7 @@ fn run_build(tmp: &TempDir) -> Result<reuben_core::site::BuildReport, Vec<reuben
     Site::load(tmp.path())?.build(&BuildOptions {
         drafts: false,
         out: tmp.path().join("dist"),
+        jobs: None,
     })
 }
 

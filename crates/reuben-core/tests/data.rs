@@ -20,6 +20,7 @@ fn data_files_nest_and_scripts_compute() {
     site.build(&BuildOptions {
         drafts: false,
         out: tmp.path().join("dist"),
+        jobs: None,
     })
     .unwrap();
     let html = fs::read_to_string(tmp.path().join("dist/index.html")).unwrap();
@@ -96,6 +97,7 @@ fn hidden_and_junk_data_files_are_skipped() {
         .build(&BuildOptions {
             drafts: false,
             out: tmp.path().join("dist"),
+            jobs: None,
         })
         .unwrap();
     let html = fs::read_to_string(tmp.path().join("dist/index.html")).unwrap();

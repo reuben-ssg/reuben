@@ -17,6 +17,7 @@ fn build(root: &Path, drafts: bool) -> Result<BuildReport, Vec<Error>> {
     Site::load(root)?.build(&BuildOptions {
         drafts,
         out: root.join("dist"),
+        jobs: None,
     })
 }
 

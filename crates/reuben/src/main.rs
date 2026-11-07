@@ -34,6 +34,9 @@ enum Command {
         /// Merge `reuben.<name>.toml` over `reuben.toml` if it exists.
         #[arg(long)]
         env: Option<String>,
+        /// Render with this many threads. Defaults to one per core.
+        #[arg(long, value_name = "N")]
+        jobs: Option<usize>,
     },
     /// Print stylesheets that go with build output.
     #[command(subcommand)]
@@ -57,7 +60,8 @@ fn main() -> ExitCode {
             out,
             drafts,
             env,
-        } => build(root, out, drafts, env),
+            jobs,
+        } => build(root, out, drafts, env, jobs),
         Command::Css(CssCommand::Highlight { theme }) => match highlight::theme_css(&theme) {
             Ok(css) => {
                 print!("{css}");
@@ -71,11 +75,18 @@ fn main() -> ExitCode {
     }
 }
 
-fn build(root: PathBuf, out: Option<PathBuf>, drafts: bool, env: Option<String>) -> ExitCode {
+fn build(
+    root: PathBuf,
+    out: Option<PathBuf>,
+    drafts: bool,
+    env: Option<String>,
+    jobs: Option<usize>,
+) -> ExitCode {
     let started = Instant::now();
     let opts = BuildOptions {
         drafts,
         out: out.unwrap_or_else(|| root.join("dist")),
+        jobs,
     };
     match Site::load_with(&root, &LoadOptions { env }).and_then(|site| site.build(&opts)) {
         Ok(report) => {

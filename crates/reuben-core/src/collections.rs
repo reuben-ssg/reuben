@@ -44,18 +44,23 @@ pub fn layout_of<'a>(rel: &Path, config: &'a Config) -> Option<&'a str> {
 
 /// Front matter `description`, else the plain text of the first paragraph with block placeholders removed.
 /// A body whose blocks can't be extracted has no summary; the page's own render reports that error.
-pub fn summary(page: &Page) -> String {
-    if let Some(d) = &page.front_matter.description {
-        return d.clone();
+pub(crate) fn compute_summary(
+    kind: PageKind,
+    description: Option<&str>,
+    body: &str,
+    body_line: usize,
+) -> String {
+    if let Some(d) = description {
+        return d.to_string();
     }
-    if page.kind != PageKind::Markdown {
+    if kind != PageKind::Markdown {
         return String::new();
     }
-    let skip = markdown::code_ranges(&page.body);
-    let Ok(extracted) = blocks::extract(&page.body, page.body_line, &skip) else {
+    let skip = markdown::code_ranges(body);
+    let Ok(extracted) = blocks::extract(body, body_line, &skip) else {
         return String::new();
     };
-    let doc = markdown::parse(&extracted.text, page.body_line);
+    let doc = markdown::parse(&extracted.text, body_line);
     let Some(paragraph) = doc
         .children
         .iter()
@@ -100,7 +105,7 @@ pub fn build(pages: &[&Page], config: &Config) -> Result<Map, Vec<Error>> {
         for page in group {
             match page_map(page, config) {
                 Ok(mut map) => {
-                    map.insert("summary".into(), summary(page).into());
+                    map.insert("summary".into(), page.summary.clone().into());
                     entries.push((page.rel.as_path(), map));
                 }
                 Err(e) => errors.push(e),
@@ -254,6 +259,8 @@ mod tests {
             route: route_for_page(Path::new(rel)),
             front_matter_sources: Default::default(),
             draft_excluded: false,
+            pre_block_toc: Vec::new(),
+            summary: compute_summary(PageKind::Markdown, description, body, 1),
         }
     }
 
@@ -293,9 +300,9 @@ mod tests {
     #[test]
     fn summary_prefers_description_then_first_paragraph() {
         let p = page("guide/v.md", Some("Tone."), "Other.");
-        assert_eq!(summary(&p), "Tone.");
+        assert_eq!(p.summary, "Tone.");
         let p = page("guide/v.md", None, "Intro {{ x }} text.\n\nMore");
-        assert_eq!(summary(&p), "Intro text.");
+        assert_eq!(p.summary, "Intro text.");
     }
 
     #[test]

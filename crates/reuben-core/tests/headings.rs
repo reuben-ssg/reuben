@@ -13,6 +13,7 @@ fn build(files: &[(&str, &str)], out: &str) -> String {
     site.build(&BuildOptions {
         drafts: false,
         out: tmp.path().join("dist"),
+        jobs: None,
     })
     .unwrap();
     fs::read_to_string(tmp.path().join("dist").join(out)).unwrap()
@@ -129,6 +130,7 @@ fn try_build(files: &[(&str, &str)]) -> (TempDir, Result<(), Vec<reuben_core::Er
         .build(&BuildOptions {
             drafts: false,
             out: tmp.path().join("dist"),
+            jobs: None,
         })
         .map(|_| ());
     (tmp, result)

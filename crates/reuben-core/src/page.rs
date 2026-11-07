@@ -71,22 +71,26 @@ pub(crate) fn page_map(page: &Page, config: &Config) -> Result<Map, Error> {
     );
     map.insert(
         "toc".into(),
-        headings::toc_array(&pre_block_toc(page)).into(),
+        headings::toc_array(&page.pre_block_toc).into(),
     );
     Ok(map)
 }
 
 /// The table of contents before blocks run, so it's what page blocks and collection items see.
 /// A body whose blocks can't be extracted has none; the page's own render reports that error.
-fn pre_block_toc(page: &Page) -> Vec<headings::TocEntry> {
-    if page.kind != PageKind::Markdown {
+pub(crate) fn compute_pre_block_toc(
+    kind: PageKind,
+    body: &str,
+    body_line: usize,
+) -> Vec<headings::TocEntry> {
+    if kind != PageKind::Markdown {
         return Vec::new();
     }
-    let skip = markdown::code_ranges(&page.body);
-    let Ok(extracted) = blocks::extract(&page.body, page.body_line, &skip) else {
+    let skip = markdown::code_ranges(body);
+    let Ok(extracted) = blocks::extract(body, body_line, &skip) else {
         return Vec::new();
     };
-    headings::assign_ids_before_blocks(&mut markdown::parse(&extracted.text, page.body_line))
+    headings::assign_ids_before_blocks(&mut markdown::parse(&extracted.text, body_line))
 }
 
 fn opt<T: Clone + Send + Sync + 'static>(v: Option<T>) -> Dynamic {
