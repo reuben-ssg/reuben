@@ -24,6 +24,7 @@ glob.workspace = true
 jiff.workspace = true
 lightningcss.workspace = true
 elsa.workspace = true
+tiny_http.workspace = true
 
 [dev-dependencies]
 insta.workspace = true

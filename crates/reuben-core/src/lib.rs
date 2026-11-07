@@ -22,6 +22,7 @@ pub mod output;
 pub mod page;
 pub mod route;
 pub mod script;
+pub mod serve;
 pub mod site;
 pub mod sitemap;
 pub mod splice;
