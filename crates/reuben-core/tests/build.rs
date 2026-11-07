@@ -126,10 +126,7 @@ fn clears_own_out_dir() {
 #[test]
 fn reports_all_bad_files() {
     let tmp = fixture("bad");
-    let errors = match Site::load(tmp.path()) {
-        Err(e) => e,
-        Ok(_) => panic!("expected load errors"),
-    };
+    let errors = Site::load(tmp.path()).unwrap().load_errors;
     let paths: Vec<PathBuf> = errors.iter().map(|e| e.path.clone()).collect();
     let got = names(&paths.iter().map(PathBuf::as_path).collect::<Vec<_>>());
     assert_eq!(got.len(), 2, "{errors:?}");

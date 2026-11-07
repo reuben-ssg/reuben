@@ -1,6 +1,6 @@
 //! Folder defaults: `_dir.toml` files under `content/` that supply front matter for every page beneath them.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -16,6 +16,8 @@ const FILE_NAME: &str = "_dir.toml";
 pub struct DirDefaults {
     /// Keyed by folder path relative to `content/`; the root folder is the empty path.
     folders: BTreeMap<PathBuf, FolderFile>,
+    /// Folders whose `_dir.toml` failed to load, so their pages are missing defaults.
+    broken: BTreeSet<PathBuf>,
 }
 
 #[derive(Debug)]
@@ -25,9 +27,10 @@ struct FolderFile {
     drafted: bool,
 }
 
-/// Reads every `_dir.toml` under `content`, reporting all bad ones at once.
-pub fn load(content: &Path) -> Result<DirDefaults, Vec<Error>> {
+/// Reads every `_dir.toml` under `content`. A bad one is reported and its folder loads without defaults.
+pub fn load(content: &Path) -> (DirDefaults, Vec<Error>) {
     let mut folders = BTreeMap::new();
+    let mut broken = BTreeSet::new();
     let mut errors = Vec::new();
     if content.is_dir() {
         for entry in WalkDir::new(content).sort_by_file_name() {
@@ -52,15 +55,14 @@ pub fn load(content: &Path) -> Result<DirDefaults, Vec<Error>> {
                 Ok(file) => {
                     folders.insert(dir, file);
                 }
-                Err(e) => errors.push(e),
+                Err(e) => {
+                    broken.insert(dir);
+                    errors.push(e);
+                }
             }
         }
     }
-    if errors.is_empty() {
-        Ok(DirDefaults { folders })
-    } else {
-        Err(errors)
-    }
+    (DirDefaults { folders, broken }, errors)
 }
 
 fn read_folder_file(path: &Path) -> Result<FolderFile, Error> {
@@ -101,6 +103,12 @@ impl DirDefaults {
         layered
     }
 
+    /// True when `rel_dir` or a folder above it has a `_dir.toml` that failed to load.
+    /// Pages there are reported through that file, not again for what its defaults would have supplied.
+    pub fn folder_broken(&self, rel_dir: &Path) -> bool {
+        rel_dir.ancestors().any(|dir| self.broken.contains(dir))
+    }
+
     /// True when `rel_dir` or any folder above it has a `_dir.toml` with `draft = true`.
     pub fn folder_drafted(&self, rel_dir: &Path) -> bool {
         rel_dir
@@ -130,7 +138,8 @@ mod tests {
             ("_dir.toml", "layout = \"a\"\n[params]\nx = 1\ny = 1\n"),
             ("g/_dir.toml", "layout = \"b\"\n[params]\ny = 2\n"),
         ]);
-        let dirs = load(tmp.path()).unwrap();
+        let (dirs, errors) = load(tmp.path());
+        assert!(errors.is_empty());
         let l = dirs.defaults_for(Path::new("g/sub"));
         assert_eq!(
             Value::Object(l.value),
@@ -144,7 +153,8 @@ mod tests {
     #[test]
     fn drafted_folder_covers_descendants_only() {
         let tmp = site(&[("g/old/_dir.toml", "draft = true\n"), ("h/x", "")]);
-        let dirs = load(tmp.path()).unwrap();
+        let (dirs, errors) = load(tmp.path());
+        assert!(errors.is_empty());
         assert!(dirs.folder_drafted(Path::new("g/old")));
         assert!(dirs.folder_drafted(Path::new("g/old/deep")));
         assert!(!dirs.folder_drafted(Path::new("g")));
@@ -154,7 +164,8 @@ mod tests {
     #[test]
     fn bad_toml_and_bad_draft_name_their_files() {
         let tmp = site(&[("a/_dir.toml", "x = [\n"), ("b/_dir.toml", "draft = 1\n")]);
-        let errors = load(tmp.path()).unwrap_err();
+        let (dirs, errors) = load(tmp.path());
+        assert!(dirs.folder_broken(Path::new("a/x")));
         assert_eq!(errors.len(), 2);
         assert!(errors[0].path.ends_with("a/_dir.toml"));
         assert!(errors[1].path.ends_with("b/_dir.toml"));
@@ -163,7 +174,8 @@ mod tests {
     #[test]
     fn missing_content_dir_is_empty() {
         let tmp = TempDir::new().unwrap();
-        let dirs = load(&tmp.path().join("content")).unwrap();
+        let (dirs, errors) = load(&tmp.path().join("content"));
+        assert!(errors.is_empty());
         assert!(dirs.defaults_for(Path::new("a")).value.is_empty());
     }
 }

@@ -27,10 +27,11 @@ enum Claim {
 }
 
 /// Plain files nest by folder and stem, then each `.rhai` runs once with `data` (plain files only) and `site`.
-pub fn load(root: &Path, engine: &ScriptEngine, site: &Map) -> Result<SiteData, Vec<Error>> {
+/// A file that fails is reported and its key left out; the rest still load.
+pub fn load(root: &Path, engine: &ScriptEngine, site: &Map) -> (SiteData, Vec<Error>) {
     let dir = root.join("data");
     if !dir.is_dir() {
-        return Ok(SiteData::default());
+        return (SiteData::default(), Vec::new());
     }
     let mut errors = Vec::new();
     let mut files = Vec::new();
@@ -96,11 +97,7 @@ pub fn load(root: &Path, engine: &ScriptEngine, site: &Map) -> Result<SiteData, 
         }
     }
 
-    if errors.is_empty() {
-        Ok(SiteData { value, sources })
-    } else {
-        Err(errors)
-    }
+    (SiteData { value, sources }, errors)
 }
 
 /// `data/team/members.toml` becomes `["team", "members"]`.
@@ -211,7 +208,10 @@ mod tests {
     use assert_fs::prelude::*;
 
     fn load_in(dir: &TempDir) -> Result<SiteData, Vec<Error>> {
-        load(dir.path(), &ScriptEngine::new(dir.path()), &Map::new())
+        match load(dir.path(), &ScriptEngine::new(dir.path()), &Map::new()) {
+            (data, errors) if errors.is_empty() => Ok(data),
+            (_, errors) => Err(errors),
+        }
     }
 
     #[test]

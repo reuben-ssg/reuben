@@ -7,7 +7,7 @@ use crate::doc::Span;
 use crate::frontmatter::FrontMatterError;
 use crate::script::ScriptError;
 
-#[derive(Debug, thiserror::Error)]
+#[derive(Debug, Clone, thiserror::Error)]
 #[error("{}: {kind}", path.display())]
 pub struct Error {
     pub path: PathBuf,
@@ -52,6 +52,37 @@ pub enum ErrorKind {
     UnsafeOutputDir,
 }
 
+/// `std::io::Error` isn't `Clone`, so an I/O error is rebuilt from its kind and message.
+impl Clone for ErrorKind {
+    fn clone(&self) -> Self {
+        match self {
+            Self::FrontMatter(e) => Self::FrontMatter(e.clone()),
+            Self::Io(e) => Self::Io(std::io::Error::new(e.kind(), e.to_string())),
+            Self::Script(e) => Self::Script(e.clone()),
+            Self::Block(e) => Self::Block(e.clone()),
+            Self::Math { message, location } => Self::Math {
+                message: message.clone(),
+                location: *location,
+            },
+            Self::Css { message, location } => Self::Css {
+                message: message.clone(),
+                location: *location,
+            },
+            Self::Config(s) => Self::Config(s.clone()),
+            Self::Data(s) => Self::Data(s.clone()),
+            Self::LayoutNotFound(s) => Self::LayoutNotFound(s.clone()),
+            Self::InvalidLayoutName(s) => Self::InvalidLayoutName(s.clone()),
+            Self::UnsplicedPlaceholder => Self::UnsplicedPlaceholder,
+            Self::NotUtf8 => Self::NotUtf8,
+            Self::OutputCollision { other, file } => Self::OutputCollision {
+                other: other.clone(),
+                file: file.clone(),
+            },
+            Self::UnsafeOutputDir => Self::UnsafeOutputDir,
+        }
+    }
+}
+
 impl Error {
     /// Where in `path` the error points, for kinds that carry a position.
     pub fn location(&self) -> Option<Span> {
@@ -66,8 +97,15 @@ impl Error {
 
     /// Orders errors by path, then line and column, with position-less errors first within a path, and drops repeats.
     /// A problem in a file that several others import is found once per importer but is one problem.
+    /// The message is the last key so repeats at one position end up adjacent however the errors arrived.
     pub fn sort(errors: &mut Vec<Error>) {
-        errors.sort_by_cached_key(|e| (e.path.clone(), e.location().map(|s| (s.line, s.column))));
+        errors.sort_by_cached_key(|e| {
+            (
+                e.path.clone(),
+                e.location().map(|s| (s.line, s.column)),
+                e.kind.to_string(),
+            )
+        });
         errors.dedup_by(|a, b| {
             a.path == b.path
                 && a.location() == b.location()
@@ -80,5 +118,19 @@ impl Error {
             path: path.into(),
             kind: kind.into(),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn sort_drops_repeats_that_arrived_interleaved() {
+        let e = |m: &str| Error::new("a.md", ErrorKind::Config(m.into()));
+        let mut errors = vec![e("A"), e("B"), e("A")];
+        Error::sort(&mut errors);
+        let messages: Vec<_> = errors.iter().map(ToString::to_string).collect();
+        assert_eq!(messages, ["a.md: config: A", "a.md: config: B"]);
     }
 }

@@ -112,3 +112,37 @@ fn build_accepts_jobs_flag() {
         .success();
     assert!(tmp.path().join("dist/about/index.html").is_file());
 }
+
+fn broken_site(files: &[(&str, &str)]) -> assert_fs::TempDir {
+    use assert_fs::prelude::*;
+    let tmp = assert_fs::TempDir::new().unwrap();
+    for (path, text) in files {
+        tmp.child(path).write_str(text).unwrap();
+    }
+    tmp
+}
+
+#[test]
+fn summary_line_counts_errors_and_files() {
+    let tmp = broken_site(&[
+        ("content/a.md", "---\n---\nx\n"),
+        (
+            "content/b.md",
+            "---\ntitle: B\n---\n{{ nope( }}\n\n{{ nope2( }}\n",
+        ),
+    ]);
+    reuben()
+        .args(["build", "--root"])
+        .arg(tmp.path())
+        .assert()
+        .code(1)
+        .stderr(predicates::str::ends_with("Found 3 errors in 2 files\n"));
+
+    let tmp = broken_site(&[("content/a.md", "---\n---\nx\n")]);
+    reuben()
+        .args(["build", "--root"])
+        .arg(tmp.path())
+        .assert()
+        .code(1)
+        .stderr(predicates::str::ends_with("Found 1 error in 1 file\n"));
+}

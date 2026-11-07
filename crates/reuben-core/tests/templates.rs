@@ -338,5 +338,5 @@ fn template_title_is_optional_but_markdown_title_is_not() {
     run_build(&tmp).unwrap();
     assert_eq!(dist(&tmp, "s.css"), "body{color:red}");
     let tmp = site_of(&[("content/p.md", "---\n---\nhi")]);
-    assert!(Site::load(tmp.path()).is_err());
+    assert!(!Site::load(tmp.path()).unwrap().load_errors.is_empty());
 }

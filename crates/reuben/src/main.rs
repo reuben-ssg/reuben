@@ -2,11 +2,13 @@
 
 mod diagnostic;
 
-use std::path::PathBuf;
+use std::collections::HashSet;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::time::Instant;
 
 use clap::{Parser, Subcommand};
+use reuben_core::Error;
 use reuben_core::highlight;
 use reuben_core::site::{BuildOptions, BuildReport, LoadOptions, Site};
 
@@ -101,10 +103,11 @@ fn build(
             ExitCode::SUCCESS
         }
         Err(errors) => {
-            for e in errors {
+            for e in &errors {
                 let source = std::fs::read_to_string(&e.path).ok();
-                eprint!("{}", diagnostic::render(&e, source.as_deref()));
+                eprint!("{}", diagnostic::render(e, source.as_deref()));
             }
+            eprintln!("{}", error_summary(&errors));
             ExitCode::FAILURE
         }
     }
@@ -120,6 +123,15 @@ fn summary(r: &BuildReport) -> String {
         s += &format!(" ({} skipped)", plural(r.drafts_skipped, "draft", "drafts"));
     }
     s
+}
+
+fn error_summary(errors: &[Error]) -> String {
+    let files: HashSet<&Path> = errors.iter().map(|e| e.path.as_path()).collect();
+    format!(
+        "Found {} in {}",
+        plural(errors.len(), "error", "errors"),
+        plural(files.len(), "file", "files"),
+    )
 }
 
 fn plural(n: usize, one: &str, many: &str) -> String {

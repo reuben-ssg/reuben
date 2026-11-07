@@ -84,7 +84,8 @@ fn joins_collection(page: &Page) -> bool {
 }
 
 /// Builds every collection from the pages that are in the build. Callers exclude drafts first.
-pub fn build(pages: &[&Page], config: &Config) -> Result<Map, Vec<Error>> {
+/// A collection that can't be built is reported and left out; the others are still returned.
+pub fn build(pages: &[&Page], config: &Config) -> (Map, Vec<Error>) {
     let mut folders: BTreeMap<String, Vec<&Page>> = BTreeMap::new();
     for page in pages.iter().filter(|p| joins_collection(p)) {
         if let Some(folder) = collection_of(&page.rel) {
@@ -132,11 +133,7 @@ pub fn build(pages: &[&Page], config: &Config) -> Result<Map, Vec<Error>> {
             );
         }
     }
-    if errors.is_empty() {
-        Ok(out)
-    } else {
-        Err(errors)
-    }
+    (out, errors)
 }
 
 struct TreeNode {

@@ -74,6 +74,8 @@ pub struct Site {
     pub config: Config,
     pub engine: Arc<ScriptEngine>,
     pub data: SiteData,
+    /// Per-file problems found while loading. The site holds everything that did load; any entry fails the build.
+    pub load_errors: Vec<Error>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -108,93 +110,73 @@ impl Site {
         Self::load_with(root, &LoadOptions::default())
     }
 
-    /// Reads every page and static file, reporting all bad files at once rather than stopping at the first.
+    /// Reads every page and static file. Only a broken config (`reuben.toml`, includes) stops the load; a bad page,
+    /// data file or `_dir.toml` is kept in `load_errors` and the rest of the site still loads.
     pub fn load_with(root: &Path, opts: &LoadOptions) -> Result<Site, Vec<Error>> {
         let mut errors = Vec::new();
         let mut pages = Vec::new();
 
-        let config = match config::load(root, opts.env.as_deref()) {
-            Ok(c) => Some(c),
-            Err(e) => {
-                errors.push(e);
-                None
-            }
-        };
+        let config = config::load(root, opts.env.as_deref()).map_err(|e| vec![e])?;
         let mut engine = ScriptEngine::new(root);
-        if let Some(config) = &config {
-            engine.set_base_url(&config.base_url);
-            let dirs: Vec<PathBuf> = config
-                .theme
-                .iter()
-                .map(|t| t.join("includes"))
-                .chain([root.join("includes")])
-                .filter(|d| d.is_dir())
-                .collect();
-            if let Err(mut e) = engine.load_includes(&dirs) {
-                errors.append(&mut e);
-            }
-        }
+        engine.set_base_url(&config.base_url);
+        let include_dirs: Vec<PathBuf> = config
+            .theme
+            .iter()
+            .map(|t| t.join("includes"))
+            .chain([root.join("includes")])
+            .filter(|d| d.is_dir())
+            .collect();
+        engine.load_includes(&include_dirs)?;
+        let site_scope = page::site_map(&config).map_err(|e| vec![e])?;
 
-        let site_data = config.as_ref().and_then(|config| {
-            let result = page::site_map(config)
-                .map_err(|e| vec![e])
-                .and_then(|site| data::load(root, &engine, &site));
-            match result {
-                Ok(d) => Some(d),
-                Err(mut e) => {
-                    errors.append(&mut e);
-                    None
-                }
-            }
-        });
+        let (site_data, mut data_errors) = data::load(root, &engine, &site_scope);
+        errors.append(&mut data_errors);
 
         let content = root.join("content");
-        let mut content_assets = Vec::new();
-        // Pages without their folder defaults would report misleading missing-title errors, so skip them.
-        match dirs::load(&content) {
-            Ok(dirs) => {
-                let mut asset_rels = Vec::new();
-                for (path, rel) in walk(&content, &mut errors) {
-                    let is_markdown = path.extension().is_some_and(|e| e == "md");
-                    if !is_markdown && path.file_name().is_some_and(|n| n == "_dir.toml") {
-                        continue;
-                    }
-                    // Sidecars hold build scripts, which must never be published.
-                    if path
-                        .extension()
-                        .is_some_and(|e| e.eq_ignore_ascii_case("rhai"))
-                    {
-                        continue;
-                    }
-                    if rel
-                        .components()
-                        .any(|c| c.as_os_str().to_string_lossy().starts_with('.'))
-                        || is_junk(&rel)
-                    {
-                        continue;
-                    }
-                    let loaded = if is_markdown {
-                        load_page(&path, &rel, Some(&dirs), PageKind::Markdown).map(Some)
-                    } else {
-                        load_template(&path, &rel, Some(&dirs))
-                    };
-                    match loaded {
-                        Ok(Some(page)) => pages.push(page),
-                        Ok(None) => asset_rels.push(rel),
-                        Err(e) => errors.push(e),
-                    }
-                }
-                mark_draft_excluded(&mut pages, &dirs);
-                content_assets = asset_rels
-                    .into_iter()
-                    .map(|rel| {
-                        let hidden = asset_drafted(&rel, &pages, &dirs);
-                        (rel, hidden)
-                    })
-                    .collect();
+        let (dirs, mut dir_errors) = dirs::load(&content);
+        errors.append(&mut dir_errors);
+        let mut asset_rels = Vec::new();
+        for (path, rel) in walk(&content, &mut errors) {
+            let is_markdown = path.extension().is_some_and(|e| e == "md");
+            if !is_markdown && path.file_name().is_some_and(|n| n == "_dir.toml") {
+                continue;
             }
-            Err(mut e) => errors.append(&mut e),
+            // Sidecars hold build scripts, which must never be published.
+            if path
+                .extension()
+                .is_some_and(|e| e.eq_ignore_ascii_case("rhai"))
+            {
+                continue;
+            }
+            if rel
+                .components()
+                .any(|c| c.as_os_str().to_string_lossy().starts_with('.'))
+                || is_junk(&rel)
+            {
+                continue;
+            }
+            let loaded = if is_markdown {
+                load_page(&path, &rel, Some(&dirs), PageKind::Markdown).map(Some)
+            } else {
+                load_template(&path, &rel, Some(&dirs))
+            };
+            match loaded {
+                Ok(Some(page)) => pages.push(page),
+                Ok(None) => asset_rels.push(rel),
+                // The broken `_dir.toml` is already reported, and without its defaults a page would only add
+                // misleading errors (a missing title, say).
+                Err(_) if dirs.folder_broken(rel.parent().unwrap_or(Path::new(""))) => {}
+                Err(e) => errors.push(e),
+            }
         }
+        mark_draft_excluded(&mut pages, &dirs);
+        let content_assets = asset_rels
+            .into_iter()
+            .map(|rel| {
+                let hidden = asset_drafted(&rel, &pages, &dirs);
+                (rel, hidden)
+            })
+            .collect();
 
         let static_dir = root.join("static");
         let mut static_files = Vec::new();
@@ -214,7 +196,7 @@ impl Site {
             }
         }
 
-        let theme_static_files = match config.as_ref().and_then(|c| c.theme.as_ref()) {
+        let theme_static_files = match config.theme.as_ref() {
             Some(theme) if theme.join("static").exists() => {
                 walk(&theme.join("static"), &mut errors)
                     .into_iter()
@@ -235,19 +217,17 @@ impl Site {
             );
         });
 
-        match config {
-            Some(config) if errors.is_empty() => Ok(Site {
-                data: site_data.unwrap_or_default(),
-                root: root.to_path_buf(),
-                pages,
-                static_files,
-                content_assets,
-                theme_static_files,
-                config,
-                engine: Arc::new(engine),
-            }),
-            _ => Err(errors),
-        }
+        Ok(Site {
+            data: site_data,
+            root: root.to_path_buf(),
+            pages,
+            static_files,
+            content_assets,
+            theme_static_files,
+            config,
+            engine: Arc::new(engine),
+            load_errors: errors,
+        })
     }
 
     /// Renders the whole site into memory. Nothing touches the disk.
@@ -257,11 +237,13 @@ impl Site {
             .iter()
             .partition(|p| opts.drafts || !p.draft_excluded);
 
-        self.check_collisions(&pages, opts.drafts)?;
+        // Everything below adds to one list, sorted once at the end, so no stage hides another's errors.
+        let mut errors = self.load_errors.clone();
+        errors.append(&mut self.check_collisions(&pages, opts.drafts));
         let site_map = page::site_map(&self.config).map_err(|e| vec![e])?;
-        let collections = collections::build(&pages, &self.config)?;
+        let (collections, mut collection_errors) = collections::build(&pages, &self.config);
+        errors.append(&mut collection_errors);
 
-        let mut errors = Vec::new();
         let mut output = Output::default();
         let scopes = page::SiteScopes {
             site: &site_map,
@@ -410,12 +392,20 @@ impl Site {
 
     /// Renders the site and swaps it into `opts.out`. A failed build leaves the previous output untouched.
     pub fn build(&self, opts: &BuildOptions) -> Result<BuildReport, Vec<Error>> {
-        // Refuse a foreign directory before spending time rendering.
-        check_out_dir(&opts.out).map_err(|e| vec![e])?;
-        let (output, report) = self.render(&RenderOptions {
+        let out_error = check_out_dir(&opts.out).err();
+        let rendered = self.render(&RenderOptions {
             drafts: opts.drafts,
             jobs: opts.jobs,
-        })?;
+        });
+        let (output, report) = match (rendered, out_error) {
+            (Ok(done), None) => done,
+            (Ok(_), Some(e)) => return Err(vec![e]),
+            (Err(mut errors), out_error) => {
+                errors.extend(out_error);
+                Error::sort(&mut errors);
+                return Err(errors);
+            }
+        };
         write_atomic(&output, &opts.out)?;
         Ok(report)
     }
@@ -523,7 +513,7 @@ impl Site {
     }
 
     /// Fails if two sources (pages or static files) would write the same output file.
-    fn check_collisions(&self, pages: &[&Page], drafts: bool) -> Result<(), Vec<Error>> {
+    fn check_collisions(&self, pages: &[&Page], drafts: bool) -> Vec<Error> {
         let sources = pages
             .iter()
             .map(|p| (p.route.file.clone(), p.source.clone()))
@@ -547,11 +537,7 @@ impl Site {
                 seen.insert(key, source);
             }
         }
-        if errors.is_empty() {
-            Ok(())
-        } else {
-            Err(errors)
-        }
+        errors
     }
 }
 
