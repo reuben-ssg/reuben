@@ -1,6 +1,6 @@
 //! CSS processing with Lightning CSS: bundling local imports, minifying and lowering for browser targets.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fmt::Display;
 use std::path::{Component, Path, PathBuf};
 use std::sync::Mutex;
@@ -38,6 +38,18 @@ pub fn process(
     imports_root: Option<&Path>,
     cfg: &CssConfig,
 ) -> Result<String, Error> {
+    process_with(source_path, css, imports_root, cfg, &HashMap::new())
+}
+
+/// Like [`process`], but an import of any path in `rendered` (keyed by [`normalize`]d path) gets that text instead of
+/// the file's bytes. That is how a templated partial is imported as its rendered output.
+pub(crate) fn process_with(
+    source_path: &Path,
+    css: &str,
+    imports_root: Option<&Path>,
+    cfg: &CssConfig,
+    rendered: &HashMap<PathBuf, String>,
+) -> Result<String, Error> {
     let fail = |message: String| {
         Error::new(
             source_path,
@@ -69,80 +81,66 @@ pub fn process(
         )
     };
 
-    let run = |hoist: bool| -> Result<String, Failure> {
-        let bundle_root = imports_root.filter(|_| cfg.bundle);
-        let provider = Provider::new(
-            normalize(bundle_root.unwrap_or(Path::new(""))),
-            entry.clone(),
-            css,
-            hoist,
-        );
-        let mut sheet = match bundle_root {
-            Some(_) => {
-                let options = ParserOptions {
-                    filename: entry.to_string_lossy().into_owned(),
-                    ..ParserOptions::default()
-                };
-                let mut bundler = Bundler::new(&provider, None, options);
-                let sheet = bundler.bundle(&entry).map_err(|e| {
-                    if matches!(e.kind, BundleErrorKind::ExternalImportAfterBundledImport) {
-                        Failure::ExternalAfterBundled
-                    } else {
-                        Failure::Error(locate(&e.kind, e.loc.as_ref()))
-                    }
-                })?;
-                if let Some(cycle) = provider.find_cycle() {
-                    return Err(fail(format!("import cycle: {cycle}")).into());
+    let bundle_root = imports_root.filter(|_| cfg.bundle);
+    let provider = Provider::new(
+        normalize(bundle_root.unwrap_or(Path::new(""))),
+        entry.clone(),
+        css,
+        rendered,
+    );
+    let mut sheet = match bundle_root {
+        Some(_) => {
+            let options = ParserOptions {
+                filename: entry.to_string_lossy().into_owned(),
+                ..ParserOptions::default()
+            };
+            let mut bundler = Bundler::new(&provider, None, options);
+            let sheet = bundler.bundle(&entry).map_err(|e| {
+                if matches!(e.kind, BundleErrorKind::ExternalImportAfterBundledImport) {
+                    let message = "remote `@import` must come before local `@import`s";
+                    locate(&message, e.loc.as_ref())
+                } else {
+                    locate(&e.kind, e.loc.as_ref())
                 }
-                sheet
-            }
-            None => {
-                let options = ParserOptions {
-                    filename: source_path.to_string_lossy().into_owned(),
-                    ..ParserOptions::default()
+            })?;
+            if let Some(cycle) = provider.find_cycle() {
+                let path = if cycle.importer == entry {
+                    source_path.to_path_buf()
+                } else {
+                    cycle.importer
                 };
-                StyleSheet::parse(css, options).map_err(|e| locate(&e.kind, e.loc.as_ref()))?
+                return Err(Error::new(
+                    path,
+                    ErrorKind::Css {
+                        message: format!("import cycle: {}", cycle.names),
+                        location: cycle.location,
+                    },
+                ));
             }
-        };
-        sheet
-            .minify(MinifyOptions {
-                targets,
-                ..MinifyOptions::default()
-            })
-            .map_err(|e| locate(&e.kind, e.loc.as_ref()))?;
-        let printed = sheet
-            .to_css(PrinterOptions {
-                minify: cfg.minify,
-                targets,
-                ..PrinterOptions::default()
-            })
-            .map_err(|e| locate(&e.kind, e.loc.as_ref()))?;
-        let mut code = printed.code;
-        if hoist {
-            code = format!("{}{code}", provider.hoisted(cfg.minify));
+            sheet
         }
-        Ok(code)
+        None => {
+            let options = ParserOptions {
+                filename: source_path.to_string_lossy().into_owned(),
+                ..ParserOptions::default()
+            };
+            StyleSheet::parse(css, options).map_err(|e| locate(&e.kind, e.loc.as_ref()))?
+        }
     };
-    match run(false) {
-        Ok(code) => Ok(code),
-        Err(Failure::Error(e)) => Err(e),
-        Err(Failure::ExternalAfterBundled) => run(true).map_err(|f| match f {
-            Failure::Error(e) => e,
-            Failure::ExternalAfterBundled => fail("remote `@import` after a local one".into()),
-        }),
-    }
-}
-
-enum Failure {
-    /// Retried with remote imports hoisted to the top.
-    ExternalAfterBundled,
-    Error(Error),
-}
-
-impl From<Error> for Failure {
-    fn from(e: Error) -> Self {
-        Failure::Error(e)
-    }
+    sheet
+        .minify(MinifyOptions {
+            targets,
+            ..MinifyOptions::default()
+        })
+        .map_err(|e| locate(&e.kind, e.loc.as_ref()))?;
+    let printed = sheet
+        .to_css(PrinterOptions {
+            minify: cfg.minify,
+            targets,
+            ..PrinterOptions::default()
+        })
+        .map_err(|e| locate(&e.kind, e.loc.as_ref()))?;
+    Ok(printed.code)
 }
 
 #[derive(Debug)]
@@ -156,41 +154,42 @@ impl Display for ProviderError {
 
 impl std::error::Error for ProviderError {}
 
+/// An `@import` loop, with the import that closes it.
+struct Cycle {
+    names: String,
+    importer: PathBuf,
+    location: Option<Span>,
+}
+
+/// One resolved local `@import`.
+struct Edge {
+    from: PathBuf,
+    to: PathBuf,
+    specifier: String,
+}
+
 /// Serves the entry from memory and its imports from disk, refusing anything outside `root`.
 struct Provider {
     root: PathBuf,
     sources: FrozenMap<PathBuf, String>,
-    /// Every resolved `@import`, importer to imported, for cycle detection.
-    edges: Mutex<Vec<(PathBuf, PathBuf)>>,
+    /// Every resolved `@import`, for cycle detection. Collected in parallel, so sorted before use.
+    edges: Mutex<Vec<Edge>>,
     entry: PathBuf,
-    /// The bundler refuses a remote import after a local one, so on retry remote imports are lifted out and
-    /// re-emitted first. Any media, layer or supports condition on them is not carried over.
-    hoist: bool,
-    remote: Mutex<Vec<String>>,
 }
 
 impl Provider {
-    fn new(root: PathBuf, entry: PathBuf, css: &str, hoist: bool) -> Self {
+    fn new(root: PathBuf, entry: PathBuf, css: &str, rendered: &HashMap<PathBuf, String>) -> Self {
         let sources = FrozenMap::new();
+        for (path, text) in rendered {
+            sources.insert(path.clone(), text.clone());
+        }
         sources.insert(entry.clone(), css.to_string());
         Self {
             root,
             sources,
             edges: Mutex::new(Vec::new()),
             entry,
-            hoist,
-            remote: Mutex::new(Vec::new()),
         }
-    }
-
-    /// The remote imports moved to the front, as the CSS spec requires of every `@import`.
-    fn hoisted(&self, minify: bool) -> String {
-        let remote = self.remote.lock().unwrap_or_else(|e| e.into_inner());
-        let sep = if minify { "" } else { "\n" };
-        remote
-            .iter()
-            .map(|url| format!("@import url(\"{url}\");{sep}"))
-            .collect()
     }
 
     fn display(&self, path: &Path) -> String {
@@ -200,43 +199,62 @@ impl Provider {
             .to_string()
     }
 
-    fn find_cycle(&self) -> Option<String> {
-        let edges = self.edges.lock().unwrap_or_else(|e| e.into_inner());
-        let mut graph: HashMap<&Path, Vec<&Path>> = HashMap::new();
-        for (from, to) in edges.iter() {
-            graph.entry(from).or_default().push(to);
+    fn find_cycle(&self) -> Option<Cycle> {
+        let mut edges = self.edges.lock().unwrap_or_else(|e| e.into_inner());
+        edges.sort_by(|a, b| (&a.from, &a.to, &a.specifier).cmp(&(&b.from, &b.to, &b.specifier)));
+        let mut graph: HashMap<&Path, Vec<&Edge>> = HashMap::new();
+        for edge in edges.iter() {
+            graph.entry(&edge.from).or_default().push(edge);
         }
-        let mut done = std::collections::HashSet::new();
+        let mut done = HashSet::new();
         let mut stack = Vec::new();
-        self.visit(&self.entry, &graph, &mut stack, &mut done)
+        self.visit(&self.entry, None, &graph, &mut stack, &mut done)
     }
 
     fn visit<'p>(
         &self,
         node: &'p Path,
-        graph: &HashMap<&'p Path, Vec<&'p Path>>,
+        via: Option<&'p Edge>,
+        graph: &HashMap<&'p Path, Vec<&'p Edge>>,
         stack: &mut Vec<&'p Path>,
-        done: &mut std::collections::HashSet<&'p Path>,
-    ) -> Option<String> {
+        done: &mut HashSet<&'p Path>,
+    ) -> Option<Cycle> {
         if let Some(at) = stack.iter().position(|p| *p == node) {
             let names: Vec<String> = stack[at..]
                 .iter()
                 .chain([&node])
                 .map(|p| self.display(p))
                 .collect();
-            return Some(names.join(" -> "));
+            let closing = via?;
+            return Some(Cycle {
+                names: names.join(" -> "),
+                importer: closing.from.clone(),
+                location: self.import_location(&closing.from, &closing.specifier),
+            });
         }
         if !done.insert(node) {
             return None;
         }
         stack.push(node);
-        for next in graph.get(node).into_iter().flatten() {
-            if let Some(found) = self.visit(next, graph, stack, done) {
+        for edge in graph.get(node).into_iter().flatten() {
+            if let Some(found) = self.visit(&edge.to, Some(edge), graph, stack, done) {
                 return Some(found);
             }
         }
         stack.pop();
         None
+    }
+
+    /// The first `@import` line of `file` that mentions `specifier`.
+    fn import_location(&self, file: &Path, specifier: &str) -> Option<Span> {
+        let text = self.sources.get(file)?;
+        text.lines().enumerate().find_map(|(i, line)| {
+            let at = line.find("@import")?;
+            line.contains(specifier).then_some(Span {
+                line: i + 1,
+                column: line[..at].chars().count() + 1,
+            })
+        })
     }
 }
 
@@ -244,9 +262,6 @@ impl SourceProvider for Provider {
     type Error = ProviderError;
 
     fn read<'a>(&'a self, file: &Path) -> Result<&'a str, ProviderError> {
-        if file == self.root.join(".reuben-remote") {
-            return Ok("");
-        }
         if let Some(text) = self.sources.get(file) {
             return Ok(text);
         }
@@ -261,14 +276,6 @@ impl SourceProvider for Provider {
             .iter()
             .any(|p| lower.starts_with(p))
         {
-            if self.hoist {
-                let mut remote = self.remote.lock().unwrap_or_else(|e| e.into_inner());
-                if !remote.iter().any(|u| u == specifier) {
-                    remote.push(specifier.to_string());
-                }
-                drop(remote);
-                return Ok(ResolveResult::File(self.root.join(".reuben-remote")));
-            }
             return Ok(ResolveResult::External(specifier.to_string()));
         }
         let outside = || {
@@ -289,13 +296,17 @@ impl SourceProvider for Provider {
         self.edges
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .push((originating.to_path_buf(), target.clone()));
+            .push(Edge {
+                from: originating.to_path_buf(),
+                to: target.clone(),
+                specifier: specifier.to_string(),
+            });
         Ok(ResolveResult::File(target))
     }
 }
 
 /// Resolves `.` and `..` without touching the disk, so a missing file can still be confined to the root.
-fn normalize(path: &Path) -> PathBuf {
+pub(crate) fn normalize(path: &Path) -> PathBuf {
     let mut out = PathBuf::new();
     for component in path.components() {
         match component {
@@ -357,14 +368,58 @@ mod tests {
     #[test]
     fn bundles_local_imports_and_skips_remote() {
         let tmp = TempDir::new().unwrap();
-        let main = "@import \"_vars.css\";\n@import url(https://fonts.example/x.css);\nbody{color:var(--c)}";
+        let main = "@import url(https://fonts.example/x.css) print;\n@import \"_vars.css\";\nbody{color:var(--c)}";
         tmp.child("static/main.css").write_str(main).unwrap();
         tmp.child("static/_vars.css")
             .write_str(":root{--c:red}")
             .unwrap();
         let out = run(&tmp, "main.css", main).unwrap();
         assert!(out.contains("--c:red"), "{out}");
-        assert!(out.contains("https://fonts.example/x.css"), "{out}");
+        let remote = out.split(';').next().unwrap();
+        assert!(
+            remote.starts_with("@import") && remote.contains("https://fonts.example/x.css"),
+            "{out}"
+        );
+        assert!(remote.ends_with("print"), "{out}");
+    }
+
+    #[test]
+    fn remote_import_after_a_local_one_is_a_located_error() {
+        let tmp = TempDir::new().unwrap();
+        tmp.child("static/_vars.css")
+            .write_str(":root{--c:red}")
+            .unwrap();
+        let main = "@import \"_vars.css\";\n@import url(https://fonts.example/x.css);\nbody{}";
+        let err = run(&tmp, "main.css", main).unwrap_err();
+        assert!(err.path.ends_with("main.css"), "{err}");
+        let (message, location) = css_error(&err);
+        assert_eq!(
+            message,
+            "remote `@import` must come before local `@import`s"
+        );
+        assert_eq!(location.map(|l| l.0), Some(2));
+    }
+
+    #[test]
+    fn rendered_partials_replace_the_file_on_disk() {
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path().join("static");
+        tmp.child("static/_vars.css")
+            .write_str("---\n---\n:root{--w:{{ 1 + 1 }}px}")
+            .unwrap();
+        let rendered = HashMap::from([(
+            normalize(&dir.join("_vars.css")),
+            ":root{--w:2px}".to_string(),
+        )]);
+        let out = process_with(
+            &dir.join("main.css"),
+            "@import \"_vars.css\";\na{width:var(--w)}",
+            Some(&dir),
+            &CssConfig::default(),
+            &rendered,
+        )
+        .unwrap();
+        assert!(out.contains("--w:2px") && !out.contains("{{"), "{out}");
     }
 
     #[test]
@@ -382,6 +437,19 @@ mod tests {
             message.contains("a.css") && message.contains("b.css"),
             "{message}"
         );
+    }
+
+    #[test]
+    fn import_cycle_points_at_the_closing_import() {
+        let tmp = TempDir::new().unwrap();
+        let a = "@import \"b.css\";\na{color:red}";
+        tmp.child("static/a.css").write_str(a).unwrap();
+        tmp.child("static/b.css")
+            .write_str("/* b */\n  @import \"a.css\";\nb{color:red}")
+            .unwrap();
+        let err = run(&tmp, "a.css", a).unwrap_err();
+        assert!(err.path.ends_with("b.css"), "{err}");
+        assert_eq!(css_error(&err).1, Some((2, 3)), "{err}");
     }
 
     #[test]

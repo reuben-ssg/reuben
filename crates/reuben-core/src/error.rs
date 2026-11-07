@@ -64,9 +64,15 @@ impl Error {
         }
     }
 
-    /// Orders errors by path, then line and column, with position-less errors first within a path.
-    pub fn sort(errors: &mut [Error]) {
+    /// Orders errors by path, then line and column, with position-less errors first within a path, and drops repeats.
+    /// A problem in a file that several others import is found once per importer but is one problem.
+    pub fn sort(errors: &mut Vec<Error>) {
         errors.sort_by_cached_key(|e| (e.path.clone(), e.location().map(|s| (s.line, s.column))));
+        errors.dedup_by(|a, b| {
+            a.path == b.path
+                && a.location() == b.location()
+                && a.kind.to_string() == b.kind.to_string()
+        });
     }
 
     pub fn new(path: impl Into<PathBuf>, kind: impl Into<ErrorKind>) -> Self {

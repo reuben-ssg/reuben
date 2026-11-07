@@ -105,3 +105,60 @@ fn every_css_error_is_reported_and_nothing_is_written() {
     assert!(paths[2].ends_with("static/b.css"), "{paths:?}");
     assert!(!tmp.path().join("dist").exists());
 }
+
+#[test]
+fn templated_partial_is_imported_rendered_and_not_counted() {
+    let tmp = site_of(&[
+        INDEX,
+        ("static/_vars.css", "---\n---\n:root{--w:{{ 1 + 1 }}px}"),
+        (
+            "static/site.css",
+            "@import \"_vars.css\";\na{width:var(--w)}",
+        ),
+    ]);
+    let report = Site::load(tmp.path())
+        .unwrap()
+        .build(&BuildOptions {
+            drafts: false,
+            out: tmp.path().join("dist"),
+            jobs: None,
+        })
+        .unwrap();
+    let css = dist(&tmp, "site.css");
+    assert!(css.contains("--w:2px") && !css.contains("---"), "{css}");
+    assert_eq!(report.pages_written, 1);
+    assert!(!tmp.path().join("dist/_vars.css").exists());
+}
+
+#[test]
+fn error_in_template_output_quotes_the_rendered_line() {
+    let tmp = site_of(&[
+        INDEX,
+        (
+            "static/t.css",
+            "---\n---\n}}} b {{ \"{\" }} width: {{ 1 + 1 }}px }\n",
+        ),
+    ]);
+    let errs = build(&tmp).unwrap_err();
+    assert_eq!(errs.len(), 1, "{errs:?}");
+    assert!(errs[0].path.ends_with("static/t.css"));
+    assert_eq!(errs[0].location(), None);
+    assert!(
+        errs[0].to_string().contains("`}}} b { width: 2px }`"),
+        "{}",
+        errs[0]
+    );
+}
+
+#[test]
+fn error_in_a_shared_partial_is_reported_once() {
+    let tmp = site_of(&[
+        INDEX,
+        ("static/_bad.css", "a{color:red}\n}}} b {{\n"),
+        ("static/x.css", "@import \"_bad.css\";\n"),
+        ("static/y.css", "@import \"_bad.css\";\n"),
+    ]);
+    let errs = build(&tmp).unwrap_err();
+    assert_eq!(errs.len(), 1, "{errs:?}");
+    assert!(errs[0].path.ends_with("_bad.css"));
+}

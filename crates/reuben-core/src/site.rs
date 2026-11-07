@@ -290,12 +290,23 @@ impl Site {
         let rendered: Vec<Result<String, Vec<Error>>> =
             in_pool(pool.as_ref(), || pages.par_iter().map(render_one).collect());
         let mut css_jobs: Vec<CssJob> = Vec::new();
+        // Templated partials are imported as their rendered text. A partial that failed to render is imported as
+        // empty, since its own error is already reported and importers would only add noise.
+        let mut partials: HashMap<PathBuf, String> = HashMap::new();
+        let mut partial_pages = 0;
         // Merged in page order so neither output nor errors depend on which thread finished first.
         for (page, result) in pages.iter().zip(rendered) {
+            let is_partial = is_partial_css(&page.route.file);
+            partial_pages += usize::from(is_partial);
             match result {
-                Ok(_) if is_partial_css(&page.route.file) => {}
+                Ok(html) if is_partial => {
+                    partials.insert(crate::css::normalize(&page.source), html);
+                }
+                Err(mut e) if is_partial => {
+                    partials.insert(crate::css::normalize(&page.source), String::new());
+                    errors.append(&mut e);
+                }
                 Ok(html) if is_css(&page.route.file) => {
-                    // Line numbers in the rendered text don't match the template, so errors there carry none.
                     css_jobs.push(CssJob {
                         rel: page.route.file.clone(),
                         path: page.source.clone(),
@@ -340,7 +351,7 @@ impl Site {
         let processed = in_pool(pool.as_ref(), || {
             css_jobs
                 .par_iter()
-                .map(|job| job.run(&self.config.css))
+                .map(|job| job.run(&self.config.css, &partials))
                 .collect::<Vec<_>>()
         });
         for (job, result) in css_jobs.into_iter().zip(processed) {
@@ -389,7 +400,7 @@ impl Site {
             return Err(errors);
         }
         let report = BuildReport {
-            pages_written: pages.len(),
+            pages_written: pages.len() - partial_pages,
             static_copied,
             drafts_skipped: drafts.len(),
             warnings,
@@ -579,7 +590,11 @@ struct CssJob {
 }
 
 impl CssJob {
-    fn run(&self, cfg: &config::CssConfig) -> Result<String, Error> {
+    fn run(
+        &self,
+        cfg: &config::CssConfig,
+        partials: &HashMap<PathBuf, String>,
+    ) -> Result<String, Error> {
         let text;
         let (css, is_template) = match &self.input {
             CssInput::Text(t) => (t.as_str(), true),
@@ -590,15 +605,27 @@ impl CssJob {
                 (text.as_str(), false)
             }
         };
-        crate::css::process(&self.path, css, Some(&self.root), cfg).map_err(|mut e| {
-            if is_template
-                && e.path == self.path
-                && let ErrorKind::Css { location, .. } = &mut e.kind
-            {
-                *location = None;
-            }
-            e
-        })
+        crate::css::process_with(&self.path, css, Some(&self.root), cfg, partials).map_err(
+            |mut e| {
+                // A template's line numbers describe its rendered text, not the file on disk, so the error drops
+                // them and quotes the offending rendered line instead.
+                let rendered = if is_template && e.path == self.path {
+                    Some(css)
+                } else {
+                    partials
+                        .get(&crate::css::normalize(&e.path))
+                        .map(String::as_str)
+                };
+                if let (Some(rendered), ErrorKind::Css { message, location }) =
+                    (rendered, &mut e.kind)
+                    && let Some(at) = location.take()
+                    && let Some(line) = rendered.lines().nth(at.line.saturating_sub(1))
+                {
+                    message.push_str(&format!(" (in the rendered output: `{}`)", line.trim()));
+                }
+                e
+            },
+        )
     }
 }
 
