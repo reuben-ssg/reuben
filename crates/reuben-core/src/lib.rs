@@ -17,6 +17,7 @@ pub mod layout;
 pub mod markdown;
 pub mod math;
 pub mod merge;
+pub mod output;
 pub mod page;
 pub mod route;
 pub mod script;

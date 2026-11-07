@@ -15,6 +15,7 @@ use crate::data::{self, SiteData};
 use crate::dirs::{self, DirDefaults};
 use crate::error::{Error, ErrorKind};
 use crate::frontmatter::{self, FrontMatter};
+use crate::output::{Output, OutputFile, check_out_dir, write_atomic};
 use crate::route::{Route, route_for_page, route_for_template};
 use crate::script::helpers::url_for;
 use crate::script::{Html, ScriptEngine};
@@ -78,6 +79,12 @@ pub struct LoadOptions {
 pub struct BuildOptions {
     pub drafts: bool,
     pub out: PathBuf,
+}
+
+pub struct RenderOptions {
+    pub drafts: bool,
+    /// Worker threads for rendering; `None` lets the renderer choose.
+    pub jobs: Option<usize>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -225,51 +232,46 @@ impl Site {
         }
     }
 
-    pub fn build(&self, opts: &BuildOptions) -> Result<BuildReport, Vec<Error>> {
+    /// Renders the whole site into memory. Nothing touches the disk.
+    pub fn render(&self, opts: &RenderOptions) -> Result<(Output, BuildReport), Vec<Error>> {
         let (pages, drafts): (Vec<&Page>, Vec<&Page>) = self
             .pages
             .iter()
             .partition(|p| opts.drafts || !p.draft_excluded);
 
         self.check_collisions(&pages, opts.drafts)?;
-        // Anything that can fail before writing runs first, so a failed build leaves the previous output intact.
         let site_map = page::site_map(&self.config).map_err(|e| vec![e])?;
         let collections = collections::build(&pages, &self.config)?;
-        prepare_out_dir(&opts.out).map_err(|e| vec![e])?;
 
         let mut errors = Vec::new();
+        let mut output = Output::default();
         let scopes = page::SiteScopes {
             site: &site_map,
             data: &self.data.value,
             collections: &collections,
         };
         for page in &pages {
-            let output = match self.render_page(page, &scopes) {
-                Ok(output) => output,
+            let html = match self.render_page(page, &scopes) {
+                Ok(html) => html,
                 Err(mut e) => {
                     errors.append(&mut e);
                     continue;
                 }
             };
-            if let Err(e) = splice::ensure_no_placeholders(&page.source, &output) {
+            if let Err(e) = splice::ensure_no_placeholders(&page.source, &html) {
                 errors.push(e);
                 continue;
             }
-            let dest = opts.out.join(&page.route.file);
-            if let Err(e) = write(&dest, output.as_bytes()) {
-                errors.push(Error::new(&dest, e));
-            }
+            output.files.insert(
+                page.route.file.clone(),
+                OutputFile::Bytes(html.into_bytes()),
+            );
         }
         let statics = self.static_sources(opts.drafts);
         for (rel, src) in &statics {
-            let dest = opts.out.join(rel);
-            let copied = dest
-                .parent()
-                .map_or(Ok(()), fs::create_dir_all)
-                .and_then(|()| fs::copy(src, &dest));
-            if let Err(e) = copied {
-                errors.push(Error::new(&dest, e));
-            }
+            output
+                .files
+                .insert(rel.clone(), OutputFile::Copy(src.clone()));
         }
 
         let mut warnings = Vec::new();
@@ -291,10 +293,10 @@ impl Site {
                     .map(|p| url_for(&self.config.base_url, &p.route.url))
                     .collect();
                 urls.sort();
-                let dest = opts.out.join("sitemap.xml");
-                if let Err(e) = write(&dest, sitemap::render(&urls).as_bytes()) {
-                    errors.push(Error::new(&dest, e));
-                }
+                output.files.insert(
+                    PathBuf::from("sitemap.xml"),
+                    OutputFile::Bytes(sitemap::render(&urls).into_bytes()),
+                );
             } else {
                 warnings.push(
                     "sitemap.xml skipped: base_url must be absolute (http:// or https://)".into(),
@@ -305,12 +307,25 @@ impl Site {
         if !errors.is_empty() {
             return Err(errors);
         }
-        Ok(BuildReport {
+        let report = BuildReport {
             pages_written: pages.len(),
             static_copied: statics.len(),
             drafts_skipped: drafts.len(),
             warnings,
-        })
+        };
+        Ok((output, report))
+    }
+
+    /// Renders the site and swaps it into `opts.out`. A failed build leaves the previous output untouched.
+    pub fn build(&self, opts: &BuildOptions) -> Result<BuildReport, Vec<Error>> {
+        // Refuse a foreign directory before spending time rendering.
+        check_out_dir(&opts.out).map_err(|e| vec![e])?;
+        let (output, report) = self.render(&RenderOptions {
+            drafts: opts.drafts,
+            jobs: None,
+        })?;
+        write_atomic(&output, &opts.out).map_err(|e| vec![e])?;
+        Ok(report)
     }
 
     /// A page or copied file that already writes `sitemap.xml` (any case) takes the place of the generated one.
@@ -594,41 +609,6 @@ fn asset_drafted(rel: &Path, pages: &[Page], dirs: &DirDefaults) -> bool {
                     .parent()
                     .is_some_and(|d| !d.as_os_str().is_empty() && dir.ancestors().any(|a| a == d))
         })
-}
-
-/// Creates the output directory, or clears it only if a previous Reuben build created it.
-fn prepare_out_dir(out: &Path) -> Result<(), Error> {
-    let io = |e: std::io::Error| Error::new(out, e);
-    if out.exists() {
-        let entries: Vec<_> = fs::read_dir(out)
-            .map_err(io)?
-            .collect::<Result<_, _>>()
-            .map_err(io)?;
-        if !entries.is_empty() {
-            if !out.join(OUTPUT_MARKER).is_file() {
-                return Err(Error::new(out, ErrorKind::UnsafeOutputDir));
-            }
-            for entry in entries {
-                let path = entry.path();
-                let removed = if entry.file_type().map_err(io)?.is_dir() {
-                    fs::remove_dir_all(&path)
-                } else {
-                    fs::remove_file(&path)
-                };
-                removed.map_err(|e| Error::new(&path, e))?;
-            }
-        }
-    } else {
-        fs::create_dir_all(out).map_err(io)?;
-    }
-    fs::write(out.join(OUTPUT_MARKER), "").map_err(io)
-}
-
-fn write(dest: &Path, bytes: &[u8]) -> std::io::Result<()> {
-    if let Some(parent) = dest.parent() {
-        fs::create_dir_all(parent)?;
-    }
-    fs::write(dest, bytes)
 }
 
 #[cfg(test)]
