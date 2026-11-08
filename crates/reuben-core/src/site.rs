@@ -12,7 +12,7 @@ use std::sync::Arc;
 
 use crate::collections;
 use crate::config::{self, Config};
-use crate::css::{self, CssInput, CssJob, is_css, is_partial_css};
+use crate::css::{self, CssInput, CssJob, CssTemplates, is_css, is_partial_css};
 use crate::data::{self, SiteData};
 use crate::dirs::{self, DirDefaults};
 use crate::error::{Error, ErrorKind};
@@ -83,6 +83,8 @@ pub struct Site {
     /// An `includes/*.rhai` file failed, so nothing that runs Rhai is rendered: every call into the includes would
     /// fail and bury the real error.
     includes_broken: bool,
+    /// The `site` scope variable, built once from the config.
+    site_map: rhai::Map,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -223,8 +225,7 @@ impl Site {
         };
 
         pages.par_iter_mut().for_each(|page| {
-            page.pre_block_toc = page::compute_pre_block_toc(page.kind, &page.body, page.body_line);
-            page.summary = collections::compute_summary(
+            (page.pre_block_toc, page.summary) = page::precompute(
                 page.kind,
                 page.front_matter.description.as_deref(),
                 &page.body,
@@ -244,6 +245,7 @@ impl Site {
             load_errors: errors,
             broken_dirs: dirs.broken().clone(),
             includes_broken,
+            site_map: site_scope,
         })
     }
 
@@ -257,21 +259,12 @@ impl Site {
         // Everything below adds to one list, sorted once at the end, so no stage hides another's errors.
         let mut errors = self.load_errors.clone();
         errors.append(&mut self.check_collisions(&pages, opts.drafts));
-        let site_map = match page::site_map(&self.config) {
-            Ok(map) => map,
-            Err(e) => {
-                // Nothing can render without the `site` scope, so this is the last stage to contribute.
-                errors.push(e);
-                Error::sort(&mut errors);
-                return Err(errors);
-            }
-        };
         let (collections, mut collection_errors) = collections::build(&pages, &self.config);
         errors.append(&mut collection_errors);
 
         let mut output = Output::default();
         let scopes = page::SiteScopes {
-            site: &site_map,
+            site: &self.site_map,
             data: &self.data.value,
             collections: &collections,
         };
@@ -301,14 +294,21 @@ impl Site {
             in_pool(pool.as_ref(), || pages.par_iter().map(render_one).collect())
         };
         let mut css_jobs: Vec<CssJob> = Vec::new();
-        // Templated partials are imported as their rendered text. A partial that failed to render is imported as
+        // CSS templates are imported as their rendered text. One that failed to load or render is imported as
         // empty, since its own error is already reported and importers would only add noise.
-        let mut partials: HashMap<PathBuf, String> = self
-            .load_errors
-            .iter()
-            .filter(|e| is_partial_css(&e.path))
-            .map(|e| (css::normalize(&e.path), String::new()))
-            .collect();
+        let mut templates = CssTemplates {
+            rendered: self
+                .load_errors
+                .iter()
+                .filter(|e| is_css(&e.path))
+                .map(|e| (css::normalize(&e.path), String::new()))
+                .collect(),
+            unrendered: drafts
+                .iter()
+                .filter(|p| is_css(&p.route.file))
+                .map(|p| css::normalize(&p.source))
+                .collect(),
+        };
         let mut partial_pages = 0;
         // Merged in page order so neither output nor errors depend on which thread finished first.
         for (page, result) in pages.iter().zip(rendered) {
@@ -318,14 +318,16 @@ impl Site {
                 Err(_) if self.in_broken_dir(page) => Err(Vec::new()),
                 other => other,
             };
+            if is_css(&page.route.file) {
+                let text = result
+                    .as_ref()
+                    .map_or_else(|_| String::new(), String::clone);
+                templates
+                    .rendered
+                    .insert(css::normalize(&page.source), text);
+            }
             match result {
-                Ok(html) if is_partial => {
-                    partials.insert(css::normalize(&page.source), html);
-                }
-                Err(mut e) if is_partial => {
-                    partials.insert(css::normalize(&page.source), String::new());
-                    errors.append(&mut e);
-                }
+                Ok(_) if is_partial => {}
                 Ok(html) if is_css(&page.route.file) => {
                     css_jobs.push(self.css_job(
                         &page.route.file,
@@ -354,10 +356,10 @@ impl Site {
                 errors.push(Error::new(src, e));
                 continue;
             }
-            static_copied += 1;
             if is_css(rel) {
                 css_jobs.push(self.css_job(rel, src, false, CssInput::File));
             } else {
+                static_copied += 1;
                 output
                     .files
                     .insert(rel.clone(), OutputFile::Copy(src.clone()));
@@ -366,7 +368,7 @@ impl Site {
         let processed = in_pool(pool.as_ref(), || {
             css_jobs
                 .par_iter()
-                .map(|job| job.run(&self.config.css, &partials))
+                .map(|job| job.run(&self.config.css, &templates))
                 .collect::<Vec<_>>()
         });
         for (job, result) in css_jobs.into_iter().zip(processed) {
@@ -448,7 +450,7 @@ impl Site {
             && page
                 .rel
                 .parent()
-                .is_some_and(|dir| dir.ancestors().any(|d| self.broken_dirs.contains(d)))
+                .is_some_and(|dir| dirs::under_broken(&self.broken_dirs, dir))
     }
 
     /// A page or copied file that already writes `sitemap.xml` (any case) takes the place of the generated one.

@@ -54,6 +54,7 @@ pub fn generate(dir: &Path, pages: usize) -> io::Result<()> {
             "Inline math $x^{{{i}}} + y$ and a note.[^1]\n\n\
              {{{{ card(page.title, \"/{name}/p{i:05}/\") }}}}\n\n\
              {{{{ data.info.name }}}}\n\n\
+             Section: {{{{ page.params.section }}}}\n\n\
              ```rust\nfn main() {{\n    let n = {i};\n    println!(\"{{}}\", n);\n}}\n```\n\n\
              | Key | Value |\n| --- | --- |\n| id | {i} |\n| group | {name} |\n\n\
              [^1]: Footnote text for page {i}.\n"
@@ -94,10 +95,20 @@ mod tests {
             })
             .unwrap();
         assert_eq!(report.pages_written, 50);
+        for (i, name) in COLLECTIONS.iter().enumerate() {
+            let page = text(&output, &format!("{name}/p{i:05}/index.html"));
+            assert!(page.contains("<main>"), "layout missing: {page}");
+            assert!(
+                page.contains(&format!("Section: {name}")),
+                "_dir.toml params not rendered: {page}"
+            );
+            let h2 = page.matches("<h2").count();
+            assert!((3..=5).contains(&h2), "{h2} headings: {page}");
+        }
         let page = text(&output, "guides/p00000/index.html");
         assert!(page.contains("hl-"), "{page}");
         assert!(page.contains("<math"), "{page}");
-        assert!(page.contains("footnote"), "{page}");
+        assert!(page.contains("Footnote text for page 0."), "{page}");
         assert!(
             page.contains("<a class=\"card\" href=\"/guides/p00000/\">Page 0</a>"),
             "{page}"

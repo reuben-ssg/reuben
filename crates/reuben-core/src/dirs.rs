@@ -65,6 +65,11 @@ pub fn load(content: &Path) -> (DirDefaults, Vec<Error>) {
     (DirDefaults { folders, broken }, errors)
 }
 
+/// True when `rel_dir` or a folder above it is one of the `broken` folders (see [`DirDefaults::broken`]).
+pub(crate) fn under_broken(broken: &BTreeSet<PathBuf>, rel_dir: &Path) -> bool {
+    rel_dir.ancestors().any(|dir| broken.contains(dir))
+}
+
 fn read_folder_file(path: &Path) -> Result<FolderFile, Error> {
     let text = fs::read_to_string(path).map_err(|e| Error::new(path, e))?;
     let table: toml::Table =
@@ -103,14 +108,14 @@ impl DirDefaults {
         layered
     }
 
-    pub fn broken(&self) -> &BTreeSet<PathBuf> {
+    pub(crate) fn broken(&self) -> &BTreeSet<PathBuf> {
         &self.broken
     }
 
     /// True when `rel_dir` or a folder above it has a `_dir.toml` that failed to load.
     /// Pages there are reported through that file, not again for what its defaults would have supplied.
     pub fn folder_broken(&self, rel_dir: &Path) -> bool {
-        rel_dir.ancestors().any(|dir| self.broken.contains(dir))
+        under_broken(&self.broken, rel_dir)
     }
 
     /// True when `rel_dir` or any folder above it has a `_dir.toml` with `draft = true`.

@@ -199,3 +199,61 @@ fn theme_partial_is_used_when_the_site_has_none() {
     let css = dist(&tmp, "main.css");
     assert!(css.contains("--c:red"), "{css}");
 }
+
+#[test]
+fn a_non_partial_css_template_is_imported_rendered() {
+    let tmp = site_of(&[
+        INDEX,
+        ("static/t.css", "---\n---\n:root{--w:{{ 1 + 1 }}px}\n"),
+        ("static/m.css", "@import \"t.css\";\na{width:var(--w)}\n"),
+    ]);
+    build(&tmp).unwrap();
+    let css = dist(&tmp, "m.css");
+    assert!(css.contains("--w:2px") && !css.contains("---"), "{css}");
+}
+
+#[test]
+fn importing_a_drafted_css_template_is_a_located_error() {
+    let tmp = site_of(&[
+        INDEX,
+        ("static/_d.css", "---\ndraft: true\n---\n:root{--c:red}\n"),
+        (
+            "static/m.css",
+            "/* m */\n@import \"_d.css\";\na{color:var(--c)}\n",
+        ),
+    ]);
+    let errs = build(&tmp).unwrap_err();
+    assert_eq!(errs.len(), 1, "{errs:?}");
+    assert!(errs[0].path.ends_with("static/m.css"), "{errs:?}");
+    assert_eq!(errs[0].location().map(|l| l.line), Some(2), "{errs:?}");
+    assert!(
+        errs[0].to_string().contains("isn't rendered (draft)"),
+        "{}",
+        errs[0]
+    );
+    let with_drafts = Site::load(tmp.path()).unwrap().build(&BuildOptions {
+        drafts: true,
+        out: tmp.path().join("dist"),
+        jobs: None,
+    });
+    assert!(with_drafts.is_ok(), "{with_drafts:?}");
+    assert!(dist(&tmp, "m.css").contains("--c:red"));
+}
+
+#[test]
+fn processed_css_is_not_counted_as_copied() {
+    let tmp = site_of(&[
+        INDEX,
+        ("static/site.css", "a{color:red}"),
+        ("static/robots.txt", "x"),
+    ]);
+    let report = Site::load(tmp.path())
+        .unwrap()
+        .build(&BuildOptions {
+            drafts: false,
+            out: tmp.path().join("dist"),
+            jobs: None,
+        })
+        .unwrap();
+    assert_eq!(report.static_copied, 1);
+}

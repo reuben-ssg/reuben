@@ -76,21 +76,43 @@ pub(crate) fn page_map(page: &Page, config: &Config) -> Result<Map, Error> {
     Ok(map)
 }
 
-/// The table of contents before blocks run, so it's what page blocks and collection items see.
-/// A body whose blocks can't be extracted has none; the page's own render reports that error.
-pub(crate) fn compute_pre_block_toc(
+/// From one parse of the body: the table of contents before blocks run, and the summary (front matter
+/// `description`, else the plain text of the first paragraph with block placeholders removed). Both are what page
+/// blocks and collection items see. A body whose blocks can't be extracted has neither, beyond a `description`;
+/// the page's own render reports that error.
+pub(crate) fn precompute(
     kind: PageKind,
+    description: Option<&str>,
     body: &str,
     body_line: usize,
-) -> Vec<headings::TocEntry> {
+) -> (Vec<headings::TocEntry>, String) {
+    let described = || description.map_or_else(String::new, str::to_string);
     if kind != PageKind::Markdown {
-        return Vec::new();
+        return (Vec::new(), described());
     }
     let skip = markdown::code_ranges(body);
     let Ok(extracted) = blocks::extract(body, body_line, &skip) else {
-        return Vec::new();
+        return (Vec::new(), described());
     };
-    headings::assign_ids_before_blocks(&mut markdown::parse(&extracted.text, body_line))
+    let mut doc = markdown::parse(&extracted.text, body_line);
+    let toc = headings::assign_ids_before_blocks(&mut doc);
+    let summary = match description {
+        Some(d) => d.to_string(),
+        None => first_paragraph_text(&doc),
+    };
+    (toc, summary)
+}
+
+fn first_paragraph_text(doc: &Document) -> String {
+    let Some(paragraph) = doc
+        .children
+        .iter()
+        .find(|n| n.kind == crate::doc::NodeKind::Paragraph)
+    else {
+        return String::new();
+    };
+    let text = blocks::strip_placeholders(&crate::html::plain_text(paragraph));
+    text.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
 fn opt<T: Clone + Send + Sync + 'static>(v: Option<T>) -> Dynamic {

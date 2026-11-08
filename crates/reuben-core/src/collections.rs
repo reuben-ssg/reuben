@@ -5,11 +5,8 @@ use std::path::Path;
 
 use rhai::{Array, Dynamic, Map};
 
-use crate::blocks;
 use crate::config::Config;
 use crate::error::{Error, ErrorKind};
-use crate::html::plain_text;
-use crate::markdown;
 use crate::page::page_map;
 use crate::script::collection::{Collection, compare, sort_array};
 use crate::site::{Page, PageKind};
@@ -40,36 +37,6 @@ pub fn layout_of<'a>(rel: &Path, config: &'a Config) -> Option<&'a str> {
         .get(&collection_of(rel)?)?
         .layout
         .as_deref()
-}
-
-/// Front matter `description`, else the plain text of the first paragraph with block placeholders removed.
-/// A body whose blocks can't be extracted has no summary; the page's own render reports that error.
-pub(crate) fn compute_summary(
-    kind: PageKind,
-    description: Option<&str>,
-    body: &str,
-    body_line: usize,
-) -> String {
-    if let Some(d) = description {
-        return d.to_string();
-    }
-    if kind != PageKind::Markdown {
-        return String::new();
-    }
-    let skip = markdown::code_ranges(body);
-    let Ok(extracted) = blocks::extract(body, body_line, &skip) else {
-        return String::new();
-    };
-    let doc = markdown::parse(&extracted.text, body_line);
-    let Some(paragraph) = doc
-        .children
-        .iter()
-        .find(|n| n.kind == crate::doc::NodeKind::Paragraph)
-    else {
-        return String::new();
-    };
-    let text = blocks::strip_placeholders(&plain_text(paragraph));
-    text.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
 /// Markdown pages and `.html` templates under `content/` are collection members; other templates are not.
@@ -257,7 +224,7 @@ mod tests {
             front_matter_sources: Default::default(),
             draft_excluded: false,
             pre_block_toc: Vec::new(),
-            summary: compute_summary(PageKind::Markdown, description, body, 1),
+            summary: crate::page::precompute(PageKind::Markdown, description, body, 1).1,
         }
     }
 

@@ -28,21 +28,19 @@ pub(crate) fn targets(query: &str) -> Result<Targets, String> {
     resolved
 }
 
+/// The CSS templates of a build, keyed by [`normalize`]d source path, so an import gets a template's rendered
+/// output instead of its file.
+#[derive(Default)]
+pub(crate) struct CssTemplates {
+    pub(crate) rendered: HashMap<PathBuf, String>,
+    /// Templates this build leaves out (drafts). Importing one is an error, since its file isn't CSS.
+    pub(crate) unrendered: HashSet<PathBuf>,
+}
+
 /// Processes one stylesheet.
 ///
 /// With `bundle` on and an `imports_root`, local `@import`s are inlined, resolved against the importing file and
 /// never allowed to leave `imports_root`. Remote imports are left alone.
-pub fn process(
-    source_path: &Path,
-    css: &str,
-    imports_root: Option<&Path>,
-    cfg: &CssConfig,
-) -> Result<String, Error> {
-    process_with(source_path, css, imports_root, None, cfg, &HashMap::new())
-}
-
-/// Like [`process`], but an import of any path in `rendered` (keyed by [`normalize`]d path) gets that text instead of
-/// the file's bytes. That is how a templated partial is imported as its rendered output.
 ///
 /// A file in `overrides` replaces the one at the same relative path under `imports_root`, the way a site's static
 /// file replaces its theme's. Imports may reach either folder but nothing outside them.
@@ -52,7 +50,7 @@ pub(crate) fn process_with(
     imports_root: Option<&Path>,
     overrides: Option<&Path>,
     cfg: &CssConfig,
-    rendered: &HashMap<PathBuf, String>,
+    templates: &CssTemplates,
 ) -> Result<String, Error> {
     let fail = |message: String| {
         Error::new(
@@ -65,10 +63,22 @@ pub(crate) fn process_with(
     };
     let targets = targets(&cfg.targets).map_err(|m| fail(format!("css.targets: {m}")))?;
     let entry = normalize(source_path);
+    let bundle_root = imports_root.filter(|_| cfg.bundle);
+    let provider = Provider {
+        root: bundle_root.map(Base::new).unwrap_or_default(),
+        overrides: overrides.map(Base::new),
+        templates,
+        sources: FrozenMap::new(),
+        edges: Mutex::new(Vec::new()),
+        entry: entry.clone(),
+        entry_css: css,
+    };
     let locate = |kind: &dyn Display, loc: Option<&lightningcss::error::ErrorLocation>| {
         let (path, location) = match loc {
             Some(loc) if Path::new(&loc.filename) == entry => (source_path.to_path_buf(), loc),
-            Some(loc) if !loc.filename.is_empty() => (PathBuf::from(&loc.filename), loc),
+            Some(loc) if !loc.filename.is_empty() => {
+                (provider.spelled(Path::new(&loc.filename)), loc)
+            }
             Some(loc) => (source_path.to_path_buf(), loc),
             None => return fail(kind.to_string()),
         };
@@ -85,14 +95,6 @@ pub(crate) fn process_with(
         )
     };
 
-    let bundle_root = imports_root.filter(|_| cfg.bundle);
-    let provider = Provider::new(
-        normalize(bundle_root.unwrap_or(Path::new(""))),
-        overrides.map(normalize),
-        entry.clone(),
-        css,
-        rendered,
-    );
     let mut sheet = match bundle_root {
         Some(_) => {
             let options = ParserOptions {
@@ -112,7 +114,7 @@ pub(crate) fn process_with(
                 let path = if cycle.importer == entry {
                     source_path.to_path_buf()
                 } else {
-                    cycle.importer
+                    provider.spelled(&cycle.importer)
                 };
                 return Err(Error::new(
                     path,
@@ -173,54 +175,73 @@ struct Edge {
     specifier: String,
 }
 
-/// Serves the entry from memory and its imports from disk, refusing anything outside `root` and `overrides`.
-struct Provider {
-    root: PathBuf,
+/// A folder imports may come from, normalized for resolving and as the caller spelled it for error paths.
+#[derive(Default)]
+struct Base {
+    norm: PathBuf,
+    given: PathBuf,
+}
+
+impl Base {
+    fn new(given: &Path) -> Self {
+        Self {
+            norm: normalize(given),
+            given: given.to_path_buf(),
+        }
+    }
+}
+
+/// Serves the entry and rendered templates from memory and other imports from disk, refusing anything outside
+/// `root` and `overrides`.
+struct Provider<'a> {
+    root: Base,
     /// Files here take the place of the same relative path under `root`.
-    overrides: Option<PathBuf>,
+    overrides: Option<Base>,
+    templates: &'a CssTemplates,
+    /// Files read from disk.
     sources: FrozenMap<PathBuf, String>,
     /// Every resolved `@import`, for cycle detection. Collected in parallel, so sorted before use.
     edges: Mutex<Vec<Edge>>,
     entry: PathBuf,
+    entry_css: &'a str,
 }
 
-impl Provider {
-    fn new(
-        root: PathBuf,
-        overrides: Option<PathBuf>,
-        entry: PathBuf,
-        css: &str,
-        rendered: &HashMap<PathBuf, String>,
-    ) -> Self {
-        let sources = FrozenMap::new();
-        for (path, text) in rendered {
-            sources.insert(path.clone(), text.clone());
-        }
-        sources.insert(entry.clone(), css.to_string());
-        Self {
-            root,
-            overrides,
-            sources,
-            edges: Mutex::new(Vec::new()),
-            entry,
-        }
-    }
-
+impl Provider<'_> {
     /// The folders imports may come from, the deepest first so a nested one wins.
-    fn bases(&self) -> Vec<&Path> {
-        let mut bases: Vec<&Path> = self.overrides.iter().map(PathBuf::as_path).collect();
+    fn bases(&self) -> Vec<&Base> {
+        let mut bases: Vec<&Base> = self.overrides.iter().collect();
         bases.push(&self.root);
-        bases.sort_by_key(|b| std::cmp::Reverse(b.components().count()));
+        bases.sort_by_key(|b| std::cmp::Reverse(b.norm.components().count()));
         bases
     }
 
     fn display(&self, path: &Path) -> String {
         self.bases()
             .into_iter()
-            .find_map(|b| path.strip_prefix(b).ok())
+            .find_map(|b| path.strip_prefix(&b.norm).ok())
             .unwrap_or(path)
             .display()
             .to_string()
+    }
+
+    /// `path` (normalized) spelled the way the build walked it, so one file never shows up under two names.
+    fn spelled(&self, path: &Path) -> PathBuf {
+        self.bases()
+            .into_iter()
+            .find_map(|b| Some(b.given.join(path.strip_prefix(&b.norm).ok()?)))
+            .unwrap_or_else(|| path.to_path_buf())
+    }
+
+    /// The text of a file already in memory.
+    fn text(&self, file: &Path) -> Option<&str> {
+        if file == self.entry {
+            return Some(self.entry_css);
+        }
+        self.templates
+            .rendered
+            .get(file)
+            .map(String::as_str)
+            .or_else(|| self.sources.get(file))
     }
 
     fn find_cycle(&self) -> Option<Cycle> {
@@ -271,7 +292,7 @@ impl Provider {
 
     /// The first `@import` line of `file` that mentions `specifier`.
     fn import_location(&self, file: &Path, specifier: &str) -> Option<Span> {
-        let text = self.sources.get(file)?;
+        let text = self.text(file)?;
         text.lines().enumerate().find_map(|(i, line)| {
             let at = line.find("@import")?;
             line.contains(specifier).then_some(Span {
@@ -282,12 +303,18 @@ impl Provider {
     }
 }
 
-impl SourceProvider for Provider {
+impl SourceProvider for Provider<'_> {
     type Error = ProviderError;
 
-    fn read<'a>(&'a self, file: &Path) -> Result<&'a str, ProviderError> {
-        if let Some(text) = self.sources.get(file) {
+    fn read<'s>(&'s self, file: &Path) -> Result<&'s str, ProviderError> {
+        if let Some(text) = self.text(file) {
             return Ok(text);
+        }
+        if self.templates.unrendered.contains(file) {
+            return Err(ProviderError(format!(
+                "imports `{}`, a template that isn't rendered (draft)",
+                self.display(file)
+            )));
         }
         let text = std::fs::read_to_string(file)
             .map_err(|e| ProviderError(format!("can't read `{}`: {e}", self.display(file))))?;
@@ -311,11 +338,11 @@ impl SourceProvider for Provider {
         let rel = self
             .bases()
             .into_iter()
-            .find_map(|b| resolved.strip_prefix(b).ok())
+            .find_map(|b| resolved.strip_prefix(&b.norm).ok())
             .ok_or_else(outside)?;
         let (target, base) = match &self.overrides {
-            Some(over) if over.join(rel).is_file() => (over.join(rel), over),
-            _ => (self.root.join(rel), &self.root),
+            Some(over) if over.norm.join(rel).is_file() => (over.norm.join(rel), &over.norm),
+            _ => (self.root.norm.join(rel), &self.root.norm),
         };
         // A symlink inside a root must not lead out of it either.
         if let (Ok(real), Ok(base)) = (target.canonicalize(), base.canonicalize())
@@ -402,11 +429,7 @@ pub(crate) struct CssJob {
 }
 
 impl CssJob {
-    pub(crate) fn run(
-        &self,
-        cfg: &CssConfig,
-        partials: &HashMap<PathBuf, String>,
-    ) -> Result<String, Error> {
+    pub(crate) fn run(&self, cfg: &CssConfig, templates: &CssTemplates) -> Result<String, Error> {
         let text;
         let (css, is_template) = match &self.input {
             CssInput::Text(t) => (t.as_str(), true),
@@ -423,7 +446,7 @@ impl CssJob {
             Some(&self.root),
             self.overrides.as_deref(),
             cfg,
-            partials,
+            templates,
         )
         .map_err(|mut e| {
             // A template's line numbers describe its rendered text, not the file on disk, so the error drops
@@ -431,7 +454,10 @@ impl CssJob {
             let rendered = if is_template && e.path == self.path {
                 Some(css)
             } else {
-                partials.get(&normalize(&e.path)).map(String::as_str)
+                templates
+                    .rendered
+                    .get(&normalize(&e.path))
+                    .map(String::as_str)
             };
             if let (Some(rendered), ErrorKind::Css { message, location }) = (rendered, &mut e.kind)
                 && let Some(at) = location.take()
@@ -450,6 +476,22 @@ mod tests {
     use crate::error::ErrorKind;
     use assert_fs::TempDir;
     use assert_fs::prelude::*;
+
+    fn process(
+        source_path: &Path,
+        css: &str,
+        imports_root: Option<&Path>,
+        cfg: &CssConfig,
+    ) -> Result<String, Error> {
+        process_with(
+            source_path,
+            css,
+            imports_root,
+            None,
+            cfg,
+            &CssTemplates::default(),
+        )
+    }
 
     fn run(tmp: &TempDir, rel: &str, css: &str) -> Result<String, Error> {
         process(
@@ -529,17 +571,20 @@ mod tests {
         tmp.child("static/_vars.css")
             .write_str("---\n---\n:root{--w:{{ 1 + 1 }}px}")
             .unwrap();
-        let rendered = HashMap::from([(
-            normalize(&dir.join("_vars.css")),
-            ":root{--w:2px}".to_string(),
-        )]);
+        let templates = CssTemplates {
+            rendered: HashMap::from([(
+                normalize(&dir.join("_vars.css")),
+                ":root{--w:2px}".to_string(),
+            )]),
+            unrendered: HashSet::new(),
+        };
         let out = process_with(
             &dir.join("main.css"),
             "@import \"_vars.css\";\na{width:var(--w)}",
             Some(&dir),
             None,
             &CssConfig::default(),
-            &rendered,
+            &templates,
         )
         .unwrap();
         assert!(out.contains("--w:2px") && !out.contains("{{"), "{out}");
@@ -622,7 +667,7 @@ mod tests {
                 Some(&theme),
                 Some(&site),
                 &CssConfig::default(),
-                &HashMap::new(),
+                &CssTemplates::default(),
             )
         };
         let out = run("@import \"_v.css\";\n@import \"_w.css\";\n").unwrap();

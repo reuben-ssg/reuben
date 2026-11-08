@@ -146,3 +146,20 @@ fn summary_line_counts_errors_and_files() {
         .code(1)
         .stderr(predicates::str::ends_with("Found 1 error in 1 file\n"));
 }
+
+#[test]
+fn a_css_error_found_directly_and_through_an_import_is_one_error() {
+    let tmp = broken_site(&[
+        ("content/index.md", "---\ntitle: H\n---\nhi\n"),
+        ("static/a.css", "a {\n}}} x {{\n"),
+        ("static/b.css", "@import \"a.css\";\nb{color:red}\n"),
+    ]);
+    // The default root `.` is where a walked path and a resolved import could be spelled differently.
+    reuben()
+        .current_dir(tmp.path())
+        .arg("build")
+        .assert()
+        .code(1)
+        .stderr(predicates::str::contains("./static/a.css"))
+        .stderr(predicates::str::ends_with("Found 1 error in 1 file\n"));
+}

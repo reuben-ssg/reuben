@@ -42,7 +42,7 @@ fn is_env_config(name: &str) -> bool {
 
 /// The `include` globs of `reuben.toml` and the `env` overlay, read as plain TOML so they are found
 /// even when the full config does not load.
-pub fn include_patterns(root: &Path, env: Option<&str>) -> Vec<String> {
+fn include_patterns(root: &Path, env: Option<&str>) -> Vec<String> {
     let mut files = vec![root.join("reuben.toml")];
     files.extend(env.map(|e| root.join(format!("reuben.{e}.toml"))));
     let mut patterns = Vec::new();
