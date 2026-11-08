@@ -27,6 +27,8 @@ pub mod site;
 pub mod sitemap;
 pub mod splice;
 pub mod template;
+#[doc(hidden)]
+pub mod testsite;
 pub mod theme;
 
 pub use error::{Error, ErrorKind};

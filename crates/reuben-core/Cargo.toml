@@ -30,3 +30,8 @@ notify.workspace = true
 [dev-dependencies]
 insta.workspace = true
 assert_fs.workspace = true
+criterion.workspace = true
+
+[[bench]]
+name = "build"
+harness = false

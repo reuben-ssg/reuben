@@ -29,6 +29,7 @@ tiny_http = "0.12"
 notify = "8"
 jiff = "0.2"
 insta = "1.49"
+criterion = { version = "0.8", default-features = false }
 assert_cmd = "2.2"
 assert_fs = "1.1"
 predicates = "3.1"
