@@ -45,6 +45,8 @@ pub enum ErrorKind {
     NotUtf8,
     #[error("builds to {} too, which {} already builds to", file.display(), other.display())]
     OutputCollision { other: PathBuf, file: PathBuf },
+    #[error("builds to {}, but `__reuben/` is reserved for the dev server", .0.display())]
+    ReservedOutputPath(PathBuf),
     #[error(
         "output directory isn't empty and wasn't created by Reuben (no `{}` file), so it won't be cleared",
         crate::site::OUTPUT_MARKER
@@ -78,6 +80,7 @@ impl Clone for ErrorKind {
                 other: other.clone(),
                 file: file.clone(),
             },
+            Self::ReservedOutputPath(p) => Self::ReservedOutputPath(p.clone()),
             Self::UnsafeOutputDir => Self::UnsafeOutputDir,
         }
     }

@@ -45,9 +45,25 @@ pub fn route(path: &str, files: &BTreeMap<PathBuf, OutputFile>) -> Route {
         return found(index, files);
     }
     if files.contains_key(&index) {
-        return Route::Redirect(format!("{path}/"));
+        return Route::Redirect(directory_url(&key));
     }
     found(key, files)
+}
+
+/// `/seg/seg/`, built from the routed key so a request like `//docs` can't become the protocol-relative `//docs/`.
+fn directory_url(key: &Path) -> String {
+    let mut url = String::from("/");
+    for seg in key.components() {
+        for b in seg.as_os_str().to_string_lossy().bytes() {
+            if b.is_ascii_alphanumeric() || b"-._~".contains(&b) {
+                url.push(char::from(b));
+            } else {
+                url.push_str(&format!("%{b:02X}"));
+            }
+        }
+        url.push('/');
+    }
+    url
 }
 
 fn found(key: PathBuf, files: &BTreeMap<PathBuf, OutputFile>) -> Route {
@@ -136,6 +152,22 @@ mod tests {
     }
 
     #[test]
+    fn redirect_is_built_from_the_key() {
+        let f = files(&["a/index.html", "my dir/index.html"]);
+        assert_eq!(route("//a", &f), Route::Redirect("/a/".into()));
+        assert_eq!(route("/a//", &f), Route::File("a/index.html".into()));
+        assert_eq!(route("/./a", &f), Route::Redirect("/a/".into()));
+        assert_eq!(route("/my%20dir", &f), Route::Redirect("/my%20dir/".into()));
+    }
+
+    #[test]
+    fn double_encoded_traversal_just_misses() {
+        let f = files(&["index.html", "secret"]);
+        assert_eq!(route("/%252e%252e/secret", &f), Route::NotFound);
+        assert_eq!(route("/%252e%252e", &f), Route::NotFound);
+    }
+
+    #[test]
     fn route_rejects_traversal() {
         let f = files(&["index.html", "a/index.html"]);
         for p in [
@@ -144,6 +176,9 @@ mod tests {
             "/a/%2E%2E/b",
             "/a%00b",
             "/a%5Cb",
+            "/a%5cb",
+            "/%2e%2E/x",
+            "/a/%2e%2e",
             "/%zz",
             "/%ff",
         ] {

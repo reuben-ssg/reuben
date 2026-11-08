@@ -30,8 +30,11 @@ pub struct DevServer {
     shared: Arc<Shared>,
     server: Arc<Server>,
     addr: SocketAddr,
-    thread: Option<JoinHandle<()>>,
+    threads: Vec<JoinHandle<()>>,
 }
+
+/// Request handlers, so one slow client can't stall the rest.
+const WORKERS: usize = 4;
 
 impl DevServer {
     /// Binds `addr` (port `0` picks a free one) and serves `output` on background threads.
@@ -46,15 +49,17 @@ impl DevServer {
             clients: Mutex::new(Vec::new()),
             stopping: AtomicBool::new(false),
         });
-        let thread = {
-            let (server, shared) = (Arc::clone(&server), Arc::clone(&shared));
-            thread::spawn(move || accept_loop(&server, &shared))
-        };
+        let threads = (0..WORKERS)
+            .map(|_| {
+                let (server, shared) = (Arc::clone(&server), Arc::clone(&shared));
+                thread::spawn(move || accept_loop(&server, &shared))
+            })
+            .collect();
         Ok(DevServer {
             shared,
             server,
             addr,
-            thread: Some(thread),
+            threads,
         })
     }
 
@@ -85,15 +90,15 @@ impl Drop for DevServer {
     fn drop(&mut self) {
         self.shared.stopping.store(true, Ordering::SeqCst);
         self.server.unblock();
-        // Dropping the senders ends each stream's wait.
+        for t in self.threads.drain(..) {
+            let _ = t.join();
+        }
+        // Dropping the senders ends each stream. A stream that registers after this sees `stopping` itself.
         self.shared
             .clients
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .clear();
-        if let Some(t) = self.thread.take() {
-            let _ = t.join();
-        }
     }
 }
 
@@ -195,26 +200,41 @@ fn read(output: &Output, key: &std::path::Path) -> io::Result<Vec<u8>> {
 /// Holds one browser's event stream open until it disconnects or the server stops.
 fn stream_events(request: Request, shared: &Shared) {
     let (tx, rx) = mpsc::channel();
-    shared
-        .clients
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .push(tx);
+    {
+        let mut clients = shared.clients.lock().unwrap_or_else(|e| e.into_inner());
+        // Checked under the lock so `Drop` can't clear the list between this check and the push.
+        if shared.stopping.load(Ordering::SeqCst) {
+            return;
+        }
+        clients.push(tx);
+    }
     let mut w = request.into_writer();
-    let head = "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\nConnection: close\r\n\r\n: connected\n\n";
-    if w.write_all_flush(head.as_bytes()).is_err() {
+    // The socket outlives this writer (tiny_http keeps it for the next keep-alive request), so the stream is ended
+    // in-band with the chunked terminator rather than by closing.
+    let head = "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\nConnection: close\r\nTransfer-Encoding: chunked\r\n\r\n";
+    if w.write_all_flush(head.as_bytes()).is_err()
+        || send_chunk(&mut w, b": connected\n\n").is_err()
+    {
         return;
     }
     loop {
         let msg = match rx.recv_timeout(HEARTBEAT) {
             Ok(m) => m,
             Err(RecvTimeoutError::Timeout) => PING,
-            Err(RecvTimeoutError::Disconnected) => return,
+            Err(RecvTimeoutError::Disconnected) => break,
         };
-        if w.write_all_flush(msg).is_err() {
+        if send_chunk(&mut w, msg).is_err() {
             return;
         }
     }
+    let _ = w.write_all_flush(b"0\r\n\r\n");
+}
+
+fn send_chunk(w: &mut dyn io::Write, data: &[u8]) -> io::Result<()> {
+    let mut chunk = format!("{:x}\r\n", data.len()).into_bytes();
+    chunk.extend_from_slice(data);
+    chunk.extend_from_slice(b"\r\n");
+    w.write_all_flush(&chunk)
 }
 
 trait WriteFlush {

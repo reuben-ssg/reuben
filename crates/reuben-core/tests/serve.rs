@@ -4,8 +4,11 @@ use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpStream};
 use std::time::{Duration, Instant};
 
+use assert_fs::prelude::*;
+use reuben_core::ErrorKind;
 use reuben_core::output::{Output, OutputFile};
 use reuben_core::serve::DevServer;
+use reuben_core::site::{RenderOptions, Site};
 
 fn output(files: &[(&str, &str)]) -> Output {
     let mut out = Output::default();
@@ -63,6 +66,10 @@ fn serves_pages_assets_and_404() {
     let (status, head, _) = get(addr, "GET", "/a?x=1");
     assert_eq!(status, 301);
     assert!(head.contains("location: /a/?x=1"));
+
+    let (status, head, _) = get(addr, "GET", "//a");
+    assert_eq!(status, 301);
+    assert!(head.contains("location: /a/\r\n"), "{head}");
 
     let (status, _, body) = get(addr, "HEAD", "/");
     assert_eq!(status, 200);
@@ -150,14 +157,34 @@ fn drop_closes_streams_and_port() {
     let mut sse = TcpStream::connect(addr).unwrap();
     write!(sse, "GET /__reuben/live HTTP/1.1\r\nHost: x\r\n\r\n").unwrap();
     read_until(&mut sse, "\r\n\r\n", Duration::from_secs(2));
+    let started = Instant::now();
     drop(server);
-    let mut buf = [0u8; 256];
-    sse.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
-    loop {
-        match sse.read(&mut buf) {
-            Ok(0) | Err(_) => break,
-            Ok(_) => {}
-        }
-    }
+    // The client keeps its keep-alive connection open, so the only way to see the end is the chunked terminator.
+    let tail = read_until(&mut sse, "\r\n0\r\n\r\n", Duration::from_secs(2));
+    assert!(
+        tail.ends_with("\r\n0\r\n\r\n"),
+        "stream not terminated: {tail:?}"
+    );
+    assert!(started.elapsed() < Duration::from_secs(2));
     assert!(TcpStream::connect(addr).is_err());
+}
+
+#[test]
+fn reserved_prefix_is_a_render_error() {
+    let tmp = assert_fs::TempDir::new().unwrap();
+    tmp.child("content/index.md").write_str("hi\n").unwrap();
+    tmp.child("static/__reuben/x.txt").write_str("x").unwrap();
+    let site = Site::load(tmp.path()).unwrap();
+    let errs = site
+        .render(&RenderOptions {
+            drafts: false,
+            jobs: None,
+        })
+        .unwrap_err();
+    assert!(
+        errs.iter()
+            .any(|e| e.path.ends_with("static/__reuben/x.txt")
+                && matches!(e.kind, ErrorKind::ReservedOutputPath(_))),
+        "{errs:?}"
+    );
 }

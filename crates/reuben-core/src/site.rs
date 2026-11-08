@@ -555,6 +555,16 @@ impl Site {
         let mut seen: HashMap<String, PathBuf> = HashMap::new();
         let mut errors = Vec::new();
         for (file, source) in sources {
+            if file
+                .components()
+                .next()
+                .is_some_and(|c| c.as_os_str() == "__reuben")
+            {
+                errors.push(Error::new(
+                    &source,
+                    ErrorKind::ReservedOutputPath(file.clone()),
+                ));
+            }
             let key = file.to_string_lossy().to_lowercase();
             if let Some(other) = seen.get(&key) {
                 errors.push(Error::new(
