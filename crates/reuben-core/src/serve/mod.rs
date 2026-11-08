@@ -13,6 +13,7 @@ use tiny_http::{Header, Method, Request, Response, Server};
 use crate::output::{Output, OutputFile};
 
 mod http;
+pub mod watch;
 
 use http::{LIVE_EVENTS_PATH, LIVE_SCRIPT, LIVE_SCRIPT_PATH, Route};
 

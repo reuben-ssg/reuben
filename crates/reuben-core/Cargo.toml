@@ -25,6 +25,7 @@ jiff.workspace = true
 lightningcss.workspace = true
 elsa.workspace = true
 tiny_http.workspace = true
+notify.workspace = true
 
 [dev-dependencies]
 insta.workspace = true

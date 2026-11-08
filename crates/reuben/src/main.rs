@@ -5,12 +5,16 @@ mod diagnostic;
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use clap::{Parser, Subcommand};
 use reuben_core::Error;
+use reuben_core::config::Config;
 use reuben_core::highlight;
-use reuben_core::site::{BuildOptions, BuildReport, LoadOptions, Site};
+use reuben_core::output::Output;
+use reuben_core::serve::DevServer;
+use reuben_core::serve::watch::{Watcher, debounce};
+use reuben_core::site::{BuildOptions, BuildReport, LoadOptions, RenderOptions, Site};
 
 /// The tastiest SSG.
 #[derive(Parser)]
@@ -40,6 +44,21 @@ enum Command {
         #[arg(long, value_name = "N")]
         jobs: Option<usize>,
     },
+    /// Serve the site from memory, rebuild on change and reload the browser.
+    Serve {
+        /// Site root, containing `content/` and optionally `static/`.
+        #[arg(long, default_value = ".")]
+        root: PathBuf,
+        /// Port to listen on, on 127.0.0.1 only. `0` picks a free one.
+        #[arg(long, default_value_t = 1111)]
+        port: u16,
+        /// Include pages marked `draft: true`.
+        #[arg(long)]
+        drafts: bool,
+        /// Merge `reuben.<name>.toml` over `reuben.toml` if it exists.
+        #[arg(long)]
+        env: Option<String>,
+    },
     /// Print stylesheets that go with build output.
     #[command(subcommand)]
     Css(CssCommand),
@@ -64,6 +83,12 @@ fn main() -> ExitCode {
             env,
             jobs,
         } => build(root, out, drafts, env, jobs),
+        Command::Serve {
+            root,
+            port,
+            drafts,
+            env,
+        } => serve(&root, port, drafts, env),
         Command::Css(CssCommand::Highlight { theme }) => match highlight::theme_css(&theme) {
             Ok(css) => {
                 print!("{css}");
@@ -97,19 +122,101 @@ fn build(
                 summary(&report),
                 started.elapsed().as_millis()
             );
-            for w in &report.warnings {
-                eprintln!("warning: {w}");
-            }
+            print_warnings(&report);
             ExitCode::SUCCESS
         }
         Err(errors) => {
-            for e in &errors {
-                let source = std::fs::read_to_string(&e.path).ok();
-                eprint!("{}", diagnostic::render(e, source.as_deref()));
-            }
-            eprintln!("{}", error_summary(&errors));
+            print_errors(&errors);
             ExitCode::FAILURE
         }
+    }
+}
+
+fn print_errors(errors: &[Error]) {
+    for e in errors {
+        let source = std::fs::read_to_string(&e.path).ok();
+        eprint!("{}", diagnostic::render(e, source.as_deref()));
+    }
+    eprintln!("{}", error_summary(errors));
+}
+
+type Rendered = Result<(Output, BuildReport), Vec<Error>>;
+
+/// One full load and render. The config comes back even when the render fails, so the watches can follow it.
+fn rebuild(root: &Path, env: &Option<String>, drafts: bool) -> (Option<Config>, Rendered) {
+    match Site::load_with(root, &LoadOptions { env: env.clone() }) {
+        Ok(site) => {
+            let rendered = site.render(&RenderOptions { drafts, jobs: None });
+            (Some(site.config), rendered)
+        }
+        Err(errors) => (None, Err(errors)),
+    }
+}
+
+fn serve(root: &Path, port: u16, drafts: bool, env: Option<String>) -> ExitCode {
+    let (config, first) = rebuild(root, &env, drafts);
+    let output = match first {
+        Ok((output, report)) => {
+            print_warnings(&report);
+            output
+        }
+        Err(errors) => {
+            print_errors(&errors);
+            return ExitCode::FAILURE;
+        }
+    };
+    let server = match DevServer::start(&format!("127.0.0.1:{port}"), output) {
+        Ok(server) => server,
+        Err(e) => {
+            eprintln!("error: cannot listen on 127.0.0.1:{port}: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let canonical = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
+    let (mut watcher, events) = match Watcher::new(&canonical) {
+        Ok(pair) => pair,
+        Err(e) => {
+            eprintln!("error: cannot watch {}: {e}", root.display());
+            return ExitCode::FAILURE;
+        }
+    };
+    if let Some(config) = &config {
+        for problem in watcher.sync(config) {
+            eprintln!("warning: {problem}");
+        }
+    }
+    println!("Serving at http://{}", server.local_addr());
+
+    for () in debounce(events, Duration::from_millis(150)) {
+        let started = Instant::now();
+        let (config, result) = rebuild(root, &env, drafts);
+        match result {
+            Ok((output, report)) => {
+                server.replace(output);
+                print_warnings(&report);
+                println!(
+                    "Rebuilt {} in {} ms",
+                    plural(report.pages_written, "page", "pages"),
+                    started.elapsed().as_millis()
+                );
+            }
+            Err(errors) => {
+                print_errors(&errors);
+                server.notify_error();
+            }
+        }
+        if let Some(config) = &config {
+            for problem in watcher.sync(config) {
+                eprintln!("warning: {problem}");
+            }
+        }
+    }
+    ExitCode::SUCCESS
+}
+
+fn print_warnings(report: &BuildReport) {
+    for w in &report.warnings {
+        eprintln!("warning: {w}");
     }
 }
 
