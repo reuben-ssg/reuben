@@ -12,6 +12,7 @@ use std::sync::Arc;
 
 use crate::collections;
 use crate::config::{self, Config};
+use crate::css::{self, CssInput, CssJob, is_css, is_partial_css};
 use crate::data::{self, SiteData};
 use crate::dirs::{self, DirDefaults};
 use crate::error::{Error, ErrorKind};
@@ -292,7 +293,7 @@ impl Site {
             .load_errors
             .iter()
             .filter(|e| is_partial_css(&e.path))
-            .map(|e| (crate::css::normalize(&e.path), String::new()))
+            .map(|e| (css::normalize(&e.path), String::new()))
             .collect();
         let mut partial_pages = 0;
         // Merged in page order so neither output nor errors depend on which thread finished first.
@@ -305,10 +306,10 @@ impl Site {
             };
             match result {
                 Ok(html) if is_partial => {
-                    partials.insert(crate::css::normalize(&page.source), html);
+                    partials.insert(css::normalize(&page.source), html);
                 }
                 Err(mut e) if is_partial => {
-                    partials.insert(crate::css::normalize(&page.source), String::new());
+                    partials.insert(css::normalize(&page.source), String::new());
                     errors.append(&mut e);
                 }
                 Ok(html) if is_css(&page.route.file) => {
@@ -494,18 +495,13 @@ impl Site {
         }
     }
 
-    /// Where `@import`s in the CSS file `src` may reach: the folder it lives in the site, theme or content tree.
     fn css_root(&self, src: &Path, template_from_static: bool) -> PathBuf {
-        let site_static = self.root.join("static");
-        if template_from_static {
-            return site_static;
-        }
-        let theme_static = self.config.theme.as_ref().map(|t| t.join("static"));
-        match theme_static {
-            Some(dir) if src.starts_with(&dir) => dir,
-            _ if src.starts_with(&site_static) => site_static,
-            _ => self.root.join("content"),
-        }
+        css::css_root(
+            &self.root,
+            self.config.theme.as_deref(),
+            src,
+            template_from_static,
+        )
     }
 
     /// Every file to copy as (path relative to the output, source). Theme files come first and a site file at the
@@ -586,73 +582,6 @@ fn in_pool<R: Send>(pool: Option<&rayon::ThreadPool>, f: impl FnOnce() -> R + Se
     match pool {
         Some(pool) => pool.install(f),
         None => f(),
-    }
-}
-
-fn is_css(rel: &Path) -> bool {
-    rel.extension()
-        .is_some_and(|e| e.eq_ignore_ascii_case("css"))
-}
-
-/// `_name.css` files can be imported but are never written out.
-fn is_partial_css(rel: &Path) -> bool {
-    is_css(rel)
-        && rel
-            .file_name()
-            .is_some_and(|n| n.to_string_lossy().starts_with('_'))
-}
-
-enum CssInput {
-    /// Template output, already rendered.
-    Text(String),
-    /// Read from `CssJob::path`.
-    File,
-}
-
-struct CssJob {
-    rel: PathBuf,
-    path: PathBuf,
-    root: PathBuf,
-    input: CssInput,
-}
-
-impl CssJob {
-    fn run(
-        &self,
-        cfg: &config::CssConfig,
-        partials: &HashMap<PathBuf, String>,
-    ) -> Result<String, Error> {
-        let text;
-        let (css, is_template) = match &self.input {
-            CssInput::Text(t) => (t.as_str(), true),
-            CssInput::File => {
-                let bytes = fs::read(&self.path).map_err(|e| Error::new(&self.path, e))?;
-                text = String::from_utf8(bytes)
-                    .map_err(|_| Error::new(&self.path, ErrorKind::NotUtf8))?;
-                (text.as_str(), false)
-            }
-        };
-        crate::css::process_with(&self.path, css, Some(&self.root), cfg, partials).map_err(
-            |mut e| {
-                // A template's line numbers describe its rendered text, not the file on disk, so the error drops
-                // them and quotes the offending rendered line instead.
-                let rendered = if is_template && e.path == self.path {
-                    Some(css)
-                } else {
-                    partials
-                        .get(&crate::css::normalize(&e.path))
-                        .map(String::as_str)
-                };
-                if let (Some(rendered), ErrorKind::Css { message, location }) =
-                    (rendered, &mut e.kind)
-                    && let Some(at) = location.take()
-                    && let Some(line) = rendered.lines().nth(at.line.saturating_sub(1))
-                {
-                    message.push_str(&format!(" (in the rendered output: `{}`)", line.trim()));
-                }
-                e
-            },
-        )
     }
 }
 

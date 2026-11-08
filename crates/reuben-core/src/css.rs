@@ -322,6 +322,88 @@ pub(crate) fn normalize(path: &Path) -> PathBuf {
     out
 }
 
+pub(crate) fn is_css(rel: &Path) -> bool {
+    rel.extension()
+        .is_some_and(|e| e.eq_ignore_ascii_case("css"))
+}
+
+/// `_name.css` files can be imported but are never written out.
+pub(crate) fn is_partial_css(rel: &Path) -> bool {
+    is_css(rel)
+        && rel
+            .file_name()
+            .is_some_and(|n| n.to_string_lossy().starts_with('_'))
+}
+
+/// Where `@import`s in the CSS file `src` may reach: the folder it lives in the site, theme or content tree.
+pub(crate) fn css_root(
+    site_root: &Path,
+    theme: Option<&Path>,
+    src: &Path,
+    template_from_static: bool,
+) -> PathBuf {
+    let site_static = site_root.join("static");
+    if template_from_static {
+        return site_static;
+    }
+    let theme_static = theme.map(|t| t.join("static"));
+    match theme_static {
+        Some(dir) if src.starts_with(&dir) => dir,
+        _ if src.starts_with(&site_static) => site_static,
+        _ => site_root.join("content"),
+    }
+}
+
+pub(crate) enum CssInput {
+    /// Template output, already rendered.
+    Text(String),
+    /// Read from `CssJob::path`.
+    File,
+}
+
+/// One stylesheet to process during a build.
+pub(crate) struct CssJob {
+    pub(crate) rel: PathBuf,
+    pub(crate) path: PathBuf,
+    pub(crate) root: PathBuf,
+    pub(crate) input: CssInput,
+}
+
+impl CssJob {
+    pub(crate) fn run(
+        &self,
+        cfg: &CssConfig,
+        partials: &HashMap<PathBuf, String>,
+    ) -> Result<String, Error> {
+        let text;
+        let (css, is_template) = match &self.input {
+            CssInput::Text(t) => (t.as_str(), true),
+            CssInput::File => {
+                let bytes = std::fs::read(&self.path).map_err(|e| Error::new(&self.path, e))?;
+                text = String::from_utf8(bytes)
+                    .map_err(|_| Error::new(&self.path, ErrorKind::NotUtf8))?;
+                (text.as_str(), false)
+            }
+        };
+        process_with(&self.path, css, Some(&self.root), cfg, partials).map_err(|mut e| {
+            // A template's line numbers describe its rendered text, not the file on disk, so the error drops
+            // them and quotes the offending rendered line instead.
+            let rendered = if is_template && e.path == self.path {
+                Some(css)
+            } else {
+                partials.get(&normalize(&e.path)).map(String::as_str)
+            };
+            if let (Some(rendered), ErrorKind::Css { message, location }) = (rendered, &mut e.kind)
+                && let Some(at) = location.take()
+                && let Some(line) = rendered.lines().nth(at.line.saturating_sub(1))
+            {
+                message.push_str(&format!(" (in the rendered output: `{}`)", line.trim()));
+            }
+            e
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
