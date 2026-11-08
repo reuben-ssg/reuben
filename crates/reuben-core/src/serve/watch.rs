@@ -1,11 +1,13 @@
 //! File watching for `reuben serve`: which paths to watch, event filtering, and debouncing bursts of events.
 
 use std::collections::{BTreeSet, HashMap, HashSet};
+use std::mem;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use notify::event::ModifyKind;
 use notify::{Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher as _};
 
 use crate::config::Config;
@@ -38,6 +40,41 @@ fn is_env_config(name: &str) -> bool {
         .is_some_and(|rest| rest.len() > ".toml".len() && rest.ends_with(".toml"))
 }
 
+/// The `include` globs of `reuben.toml` and the `env` overlay, read as plain TOML so they are found
+/// even when the full config does not load.
+pub fn include_patterns(root: &Path, env: Option<&str>) -> Vec<String> {
+    let mut files = vec![root.join("reuben.toml")];
+    files.extend(env.map(|e| root.join(format!("reuben.{e}.toml"))));
+    let mut patterns = Vec::new();
+    for file in files {
+        let Ok(text) = std::fs::read_to_string(file) else {
+            continue;
+        };
+        let Ok(table) = toml::from_str::<toml::Table>(&text) else {
+            continue;
+        };
+        if let Some(toml::Value::Array(list)) = table.get("include") {
+            patterns.extend(list.iter().filter_map(|v| v.as_str().map(String::from)));
+        }
+    }
+    patterns
+}
+
+/// The folder an include glob lives in, relative to the root, and whether it reaches into subfolders.
+fn include_base(pattern: &str) -> (PathBuf, bool) {
+    let is_glob = |s: &str| s.contains(['*', '?', '[']);
+    let parts: Vec<&str> = pattern.split('/').filter(|p| !p.is_empty()).collect();
+    let literal = parts.iter().take_while(|p| !is_glob(p)).count();
+    // A pattern with no wildcard names a file, so its folder is the parent.
+    let keep = if literal == parts.len() {
+        literal.saturating_sub(1)
+    } else {
+        literal
+    };
+    let base = parts[..keep].iter().collect();
+    (base, pattern.contains("**"))
+}
+
 /// Collapses a burst of events into one signal once no event has arrived for `quiet`.
 /// Ends when the sender is gone and nothing is pending.
 pub fn debounce(rx: Receiver<notify::Result<Event>>, quiet: Duration) -> impl Iterator<Item = ()> {
@@ -54,23 +91,62 @@ pub fn debounce(rx: Receiver<notify::Result<Event>>, quiet: Duration) -> impl It
     })
 }
 
-/// What the event filter lets through from the site root, which is watched non-recursively.
+/// Editor droppings: hidden files, backups and swap files.
+fn is_noise(path: &Path) -> bool {
+    path.file_name().is_some_and(|n| {
+        let n = n.to_string_lossy();
+        n.starts_with('.') || n.ends_with('~') || n.ends_with(".swp") || n.ends_with(".swx")
+    })
+}
+
+/// What the event handler needs to know, shared with the watcher that updates it.
 #[derive(Default)]
-struct RootFilter {
+struct State {
     root: PathBuf,
     /// Direct children of the root that matter: site folders, the theme's top folder, config files.
     names: HashSet<PathBuf>,
+    /// Include globs, matched against root-level paths (the root is watched non-recursively).
+    globs: Vec<glob::Pattern>,
+    /// Files watched by name, which are never treated as editor noise.
+    files: HashSet<PathBuf>,
+    /// Mirror of the watcher's paths, so the handler can spot one being deleted or replaced.
+    watched: HashSet<PathBuf>,
+    /// Watched paths that were deleted or replaced; the OS may have dropped their watch.
+    dirty: HashSet<PathBuf>,
 }
 
-impl RootFilter {
+impl State {
     fn accepts(&self, path: &Path) -> bool {
+        if is_noise(path) && !self.files.contains(path) {
+            return false;
+        }
         if path.parent() != Some(self.root.as_path()) {
             return true;
         }
-        self.names.contains(path)
+        if self.names.contains(path)
             || path
                 .file_name()
                 .is_some_and(|n| is_env_config(&n.to_string_lossy()))
+        {
+            return true;
+        }
+        path.strip_prefix(&self.root)
+            .is_ok_and(|rel| self.globs.iter().any(|g| g.matches_path(rel)))
+    }
+
+    fn handle(&mut self, event: &Event) -> bool {
+        let replaced = matches!(
+            event.kind,
+            EventKind::Create(_) | EventKind::Remove(_) | EventKind::Modify(ModifyKind::Name(_))
+        );
+        if replaced {
+            for p in &event.paths {
+                if self.watched.contains(p) {
+                    self.dirty.insert(p.clone());
+                }
+            }
+        }
+        !matches!(event.kind, EventKind::Access(_)) && event.paths.iter().any(|p| self.accepts(p))
     }
 }
 
@@ -79,51 +155,74 @@ pub struct Watcher {
     inner: RecommendedWatcher,
     root: PathBuf,
     watched: HashMap<PathBuf, RecursiveMode>,
-    filter: Arc<Mutex<RootFilter>>,
+    /// `watch_paths` of the last config that loaded, kept while the config is broken.
+    config_paths: Vec<PathBuf>,
+    state: Arc<Mutex<State>>,
 }
 
 impl Watcher {
     /// `root` should be canonical so it matches the paths the OS reports.
     pub fn new(root: &Path) -> notify::Result<(Watcher, Receiver<notify::Result<Event>>)> {
         let (tx, rx) = mpsc::channel();
-        let filter = Arc::new(Mutex::new(RootFilter {
+        let state = Arc::new(Mutex::new(State {
             root: root.to_path_buf(),
-            names: HashSet::new(),
+            ..State::default()
         }));
-        let handler_filter = Arc::clone(&filter);
-        let inner = notify::recommended_watcher(move |event: notify::Result<Event>| {
-            let keep = match &event {
-                Ok(e) => {
-                    !matches!(e.kind, EventKind::Access(_)) && {
-                        let f = handler_filter.lock().unwrap_or_else(|e| e.into_inner());
-                        e.paths.iter().any(|p| f.accepts(p))
-                    }
+        let handler_state = Arc::clone(&state);
+        let inner = notify::recommended_watcher(move |event: notify::Result<Event>| match event {
+            Ok(e) => {
+                let keep = handler_state
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .handle(&e);
+                if keep {
+                    let _ = tx.send(Ok(e));
                 }
-                Err(_) => true,
-            };
-            if keep {
-                let _ = tx.send(event);
             }
+            Err(e) => eprintln!("warning: {e}"),
         })?;
         let watcher = Watcher {
             inner,
             root: root.to_path_buf(),
             watched: HashMap::new(),
-            filter,
+            config_paths: Vec::new(),
+            state,
         };
         Ok((watcher, rx))
     }
 
-    /// Brings the OS watches in line with `config`. Returns a message for each path that could not be watched.
-    pub fn sync(&mut self, config: &Config) -> Vec<String> {
+    /// Brings the OS watches in line with the site. `config` is `None` when the config failed to load, in
+    /// which case the previous set stays and only the `include` globs are re-read. Returns a message for each
+    /// path that could not be watched.
+    pub fn sync(&mut self, config: Option<&Config>, env: Option<&str>) -> Vec<String> {
+        if let Some(config) = config {
+            self.config_paths = watch_paths(&self.root, config);
+        }
+        let dirty = mem::take(&mut self.state.lock().unwrap_or_else(|e| e.into_inner()).dirty);
+        for path in dirty {
+            if self.watched.remove(&path).is_some() {
+                let _ = self.inner.unwatch(&path);
+            }
+        }
+
         let mut wanted: HashMap<PathBuf, RecursiveMode> = HashMap::new();
+        let mut add = |path: PathBuf, mode: RecursiveMode| {
+            let slot = wanted.entry(path).or_insert(mode);
+            if mode == RecursiveMode::Recursive {
+                *slot = mode;
+            }
+        };
         let mut names = HashSet::new();
+        let mut files = HashSet::new();
         // Folders that do not exist yet are noticed through the root, and picked up on the next sync.
-        wanted.insert(self.root.clone(), RecursiveMode::NonRecursive);
+        add(self.root.clone(), RecursiveMode::NonRecursive);
         for dir in WATCHED_DIRS {
             names.insert(self.root.join(dir));
         }
-        for path in watch_paths(&self.root, config) {
+        names.insert(self.root.join("reuben.toml"));
+        files.insert(self.root.join("reuben.toml"));
+
+        for path in &self.config_paths {
             let Ok(path) = path.canonicalize() else {
                 continue;
             };
@@ -133,15 +232,44 @@ impl Watcher {
                 names.insert(self.root.join(first));
             }
             if path.is_dir() {
-                wanted.insert(path, RecursiveMode::Recursive);
+                add(path, RecursiveMode::Recursive);
             } else if let Some(parent) = path.parent() {
                 // A file is watched through its folder, since an atomic save replaces the file itself.
-                wanted
-                    .entry(parent.to_path_buf())
-                    .or_insert(RecursiveMode::NonRecursive);
+                add(parent.to_path_buf(), RecursiveMode::NonRecursive);
+                files.insert(path);
             }
         }
-        self.filter.lock().unwrap_or_else(|e| e.into_inner()).names = names;
+
+        let mut globs = Vec::new();
+        for pattern in include_patterns(&self.root, env) {
+            if let Ok(glob) = glob::Pattern::new(&pattern) {
+                globs.push(glob);
+            }
+            let (base, deep) = include_base(&pattern);
+            if let Some(first) = base.components().next() {
+                names.insert(self.root.join(first));
+            }
+            // A folder that is not there yet is watched through its nearest existing ancestor.
+            let mut dir = self.root.join(&base);
+            let exists = dir.is_dir();
+            while !dir.is_dir() && dir != self.root && dir.pop() {}
+            let Ok(dir) = dir.canonicalize() else {
+                continue;
+            };
+            let mode = if exists && deep && dir != self.root {
+                RecursiveMode::Recursive
+            } else {
+                RecursiveMode::NonRecursive
+            };
+            add(dir, mode);
+        }
+
+        {
+            let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+            state.names = names;
+            state.globs = globs;
+            state.files = files;
+        }
 
         let mut problems = Vec::new();
         let stale: Vec<PathBuf> = self
@@ -165,6 +293,8 @@ impl Watcher {
                 Err(e) => problems.push(format!("cannot watch {}: {e}", path.display())),
             }
         }
+        self.state.lock().unwrap_or_else(|e| e.into_inner()).watched =
+            self.watched.keys().cloned().collect();
         problems
     }
 }
@@ -225,5 +355,42 @@ mod tests {
         }
         assert!(!paths.contains(&tmp.path().join("data")));
         assert!(!paths.contains(&tmp.path().join("static")));
+    }
+
+    #[test]
+    fn include_base_is_the_literal_folder() {
+        assert_eq!(include_base("conf/*.toml"), (PathBuf::from("conf"), false));
+        assert_eq!(include_base("*.toml"), (PathBuf::new(), false));
+        assert_eq!(include_base("a/b/**/x.toml"), (PathBuf::from("a/b"), true));
+        assert_eq!(include_base("a/b.toml"), (PathBuf::from("a"), false));
+    }
+
+    #[test]
+    fn include_patterns_survive_a_broken_config() {
+        let tmp = TempDir::new().unwrap();
+        tmp.child("reuben.toml")
+            .write_str("bogus_key = 1\ninclude = [\"a/*.toml\"]\n")
+            .unwrap();
+        tmp.child("reuben.prod.toml")
+            .write_str("include = [\"b/*.toml\"]\n")
+            .unwrap();
+        assert_eq!(
+            include_patterns(tmp.path(), Some("prod")),
+            ["a/*.toml", "b/*.toml"]
+        );
+        assert!(include_patterns(tmp.path(), None).len() == 1);
+    }
+
+    #[test]
+    fn state_ignores_editor_noise() {
+        let root = PathBuf::from("/site");
+        let state = State {
+            root: root.clone(),
+            ..State::default()
+        };
+        assert!(!state.accepts(&root.join("content/.index.md.swp")));
+        assert!(!state.accepts(&root.join("content/index.md~")));
+        assert!(!state.accepts(&root.join("content/.hidden")));
+        assert!(state.accepts(&root.join("content/index.md")));
     }
 }

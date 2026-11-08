@@ -151,28 +151,133 @@ fn serve_rebuilds_on_change() {
     );
 }
 
+fn serve_stderr(serve: &Serve) -> String {
+    serve.stderr.lock().unwrap().clone()
+}
+
+fn stderr_contains(serve: &Serve, needle: &str) -> bool {
+    serve.stderr.lock().unwrap().contains(needle)
+}
+
 #[test]
-fn serve_picks_up_a_new_data_dir_and_config_change() {
-    let tmp = site("Hello\n");
+fn serve_watches_a_new_data_dir() {
+    let tmp =
+        site("T={{ site.title }} D={{ if data.contains(\"x\") { data.x.v } else { \"none\" } }}");
+    let serve = start(tmp.path());
+    assert!(
+        body_contains(serve.port, "D=none"),
+        "{}",
+        serve_stderr(&serve)
+    );
+    // `data/` did not exist at startup. Nothing but the data file changes.
+    tmp.child("data/x.json")
+        .write_str("{\"v\": \"alpha\"}")
+        .unwrap();
+    assert!(
+        wait_until(Duration::from_secs(20), || body_contains(
+            serve.port, "D=alpha"
+        )),
+        "{}",
+        serve_stderr(&serve)
+    );
+    tmp.child("data/x.json")
+        .write_str("{\"v\": \"beta\"}")
+        .unwrap();
+    assert!(wait_until(Duration::from_secs(20), || body_contains(
+        serve.port, "D=beta"
+    )));
+}
+
+#[test]
+fn serve_watches_reuben_toml() {
+    let tmp = site("T={{ site.title }}");
     let serve = start(tmp.path());
     tmp.child("reuben.toml")
-        .write_str("title = \"T\"\n")
+        .write_str("title = \"Configured\"\n")
         .unwrap();
-    tmp.child("content/two.md")
-        .write_str(&page("Second"))
+    assert!(
+        wait_until(Duration::from_secs(20), || body_contains(
+            serve.port,
+            "T=Configured"
+        )),
+        "{}",
+        serve_stderr(&serve)
+    );
+}
+
+#[test]
+fn serve_recovers_from_a_broken_include() {
+    let tmp = site("T={{ site.title }}");
+    tmp.child("reuben.toml")
+        .write_str("include = [\"conf2/*.toml\"]\n")
         .unwrap();
-    assert!(wait_until(Duration::from_secs(20), || {
-        get(serve.port, "/two/").is_some_and(|(s, b)| s == 200 && b.contains("Second"))
-    }));
-    // `data/` did not exist at startup; creating it must start being watched.
-    tmp.child("data/x.json").write_str("{}").unwrap();
-    std::thread::sleep(Duration::from_millis(1500));
-    tmp.child("content/two.md")
-        .write_str(&page("Third"))
+    tmp.child("conf2").create_dir_all().unwrap();
+    let serve = start(tmp.path());
+    tmp.child("conf2/a.toml").write_str("title = \n").unwrap();
+    assert!(
+        wait_until(Duration::from_secs(20), || stderr_contains(
+            &serve, "error:"
+        )),
+        "broken include was not noticed"
+    );
+    tmp.child("conf2/a.toml")
+        .write_str("title = \"Included\"\n")
         .unwrap();
-    assert!(wait_until(Duration::from_secs(20), || {
-        get(serve.port, "/two/").is_some_and(|(_, b)| b.contains("Third"))
-    }));
+    assert!(
+        wait_until(Duration::from_secs(20), || body_contains(
+            serve.port,
+            "T=Included"
+        )),
+        "{}",
+        serve_stderr(&serve)
+    );
+}
+
+#[test]
+fn serve_notices_an_include_dir_created_later() {
+    let tmp = site("T={{ site.title }}");
+    tmp.child("reuben.toml")
+        .write_str("include = [\"conf3/*.toml\"]\n")
+        .unwrap();
+    let serve = start(tmp.path());
+    tmp.child("conf3/a.toml")
+        .write_str("title = \"Three\"\n")
+        .unwrap();
+    assert!(
+        wait_until(Duration::from_secs(20), || body_contains(
+            serve.port, "T=Three"
+        )),
+        "{}",
+        serve_stderr(&serve)
+    );
+    tmp.child("conf3/a.toml")
+        .write_str("title = \"Four\"\n")
+        .unwrap();
+    assert!(wait_until(Duration::from_secs(20), || body_contains(
+        serve.port, "T=Four"
+    )));
+}
+
+#[test]
+fn serve_ignores_editor_swap_files() {
+    let tmp = site("Hello");
+    let serve = start(tmp.path());
+    tmp.child("content/.index.md.swp")
+        .write_str("junk")
+        .unwrap();
+    tmp.child("content/index.md~").write_str("junk").unwrap();
+    thread::sleep(Duration::from_millis(1500));
+    assert!(
+        serve.stdout.try_recv().is_err(),
+        "swap files caused a rebuild"
+    );
+    // A real edit still goes through afterwards.
+    tmp.child("content/index.md")
+        .write_str(&page("Real"))
+        .unwrap();
+    assert!(wait_until(Duration::from_secs(20), || body_contains(
+        serve.port, "Real"
+    )));
 }
 
 #[test]
@@ -238,6 +343,18 @@ fn serve_writes_nothing_to_the_site() {
     let tmp = site("Hello\n");
     let serve = start(tmp.path());
     assert!(body_contains(serve.port, "Hello"));
+    tmp.child("content/index.md")
+        .write_str(&page("Again"))
+        .unwrap();
+    assert!(wait_until(Duration::from_secs(20), || body_contains(
+        serve.port, "Again"
+    )));
+    tmp.child("content/index.md")
+        .write_str(&page(BROKEN))
+        .unwrap();
+    assert!(wait_until(Duration::from_secs(20), || stderr_contains(
+        &serve, "error:"
+    )));
     assert!(!tmp.path().join("dist").exists());
     let names: Vec<_> = std::fs::read_dir(tmp.path())
         .unwrap()

@@ -3,6 +3,7 @@
 mod diagnostic;
 
 use std::collections::HashSet;
+use std::panic::AssertUnwindSafe;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::time::{Duration, Instant};
@@ -180,16 +181,25 @@ fn serve(root: &Path, port: u16, drafts: bool, env: Option<String>) -> ExitCode 
             return ExitCode::FAILURE;
         }
     };
-    if let Some(config) = &config {
-        for problem in watcher.sync(config) {
-            eprintln!("warning: {problem}");
-        }
+    for problem in watcher.sync(config.as_ref(), env.as_deref()) {
+        eprintln!("warning: {problem}");
     }
     println!("Serving at http://{}", server.local_addr());
 
     for () in debounce(events, Duration::from_millis(150)) {
         let started = Instant::now();
-        let (config, result) = rebuild(root, &env, drafts);
+        // A panic in a rebuild is a failed rebuild, not the end of the server.
+        let (config, result) =
+            std::panic::catch_unwind(AssertUnwindSafe(|| rebuild(root, &env, drafts)))
+                .unwrap_or_else(|panic| {
+                    let message = panic
+                        .downcast_ref::<&str>()
+                        .map(|s| s.to_string())
+                        .or_else(|| panic.downcast_ref::<String>().cloned())
+                        .unwrap_or_else(|| "unknown panic".into());
+                    eprintln!("error: rebuild panicked: {message}");
+                    (None, Err(Vec::new()))
+                });
         match result {
             Ok((output, report)) => {
                 server.replace(output);
@@ -201,14 +211,15 @@ fn serve(root: &Path, port: u16, drafts: bool, env: Option<String>) -> ExitCode 
                 );
             }
             Err(errors) => {
-                print_errors(&errors);
+                // Empty only after a panic, which has already been reported.
+                if !errors.is_empty() {
+                    print_errors(&errors);
+                }
                 server.notify_error();
             }
         }
-        if let Some(config) = &config {
-            for problem in watcher.sync(config) {
-                eprintln!("warning: {problem}");
-            }
+        for problem in watcher.sync(config.as_ref(), env.as_deref()) {
+            eprintln!("warning: {problem}");
         }
     }
     ExitCode::SUCCESS
