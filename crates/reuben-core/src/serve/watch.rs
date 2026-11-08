@@ -75,6 +75,16 @@ fn include_base(pattern: &str) -> (PathBuf, bool) {
     (base, pattern.contains("**"))
 }
 
+/// How to watch an include glob's base folder. The root and its ancestors are never watched recursively,
+/// since that would take in `dist/`, `.git/` and everything else beside the site.
+fn include_mode(root: &Path, dir: &Path, exists: bool, deep: bool) -> RecursiveMode {
+    if exists && deep && !root.starts_with(dir) {
+        RecursiveMode::Recursive
+    } else {
+        RecursiveMode::NonRecursive
+    }
+}
+
 /// Collapses a burst of events into one signal once no event has arrived for `quiet`.
 /// Ends when the sender is gone and nothing is pending.
 pub fn debounce(rx: Receiver<notify::Result<Event>>, quiet: Duration) -> impl Iterator<Item = ()> {
@@ -146,6 +156,10 @@ impl State {
                 }
             }
         }
+        // Dropped events arrive as a path-less notice, and may have hidden any change.
+        if event.need_rescan() || event.paths.is_empty() {
+            return true;
+        }
         !matches!(event.kind, EventKind::Access(_)) && event.paths.iter().any(|p| self.accepts(p))
     }
 }
@@ -179,7 +193,11 @@ impl Watcher {
                     let _ = tx.send(Ok(e));
                 }
             }
-            Err(e) => eprintln!("warning: {e}"),
+            // Something may have been missed, so the error also asks for a rebuild.
+            Err(e) => {
+                eprintln!("warning: {e}");
+                let _ = tx.send(Err(e));
+            }
         })?;
         let watcher = Watcher {
             inner,
@@ -256,12 +274,7 @@ impl Watcher {
             let Ok(dir) = dir.canonicalize() else {
                 continue;
             };
-            let mode = if exists && deep && dir != self.root {
-                RecursiveMode::Recursive
-            } else {
-                RecursiveMode::NonRecursive
-            };
-            add(dir, mode);
+            add(dir.clone(), include_mode(&self.root, &dir, exists, deep));
         }
 
         {
@@ -379,6 +392,35 @@ mod tests {
             ["a/*.toml", "b/*.toml"]
         );
         assert!(include_patterns(tmp.path(), None).len() == 1);
+    }
+
+    #[test]
+    fn rescan_and_pathless_events_rebuild() {
+        let mut state = State {
+            root: PathBuf::from("/site"),
+            ..State::default()
+        };
+        let rescan = Event::new(EventKind::Other).set_flag(notify::event::Flag::Rescan);
+        assert!(state.handle(&rescan));
+        assert!(state.handle(&Event::new(EventKind::Other)));
+        let access = Event::new(EventKind::Access(notify::event::AccessKind::Any))
+            .add_path(PathBuf::from("/site/content/a.md"));
+        assert!(!state.handle(&access));
+    }
+
+    #[test]
+    fn root_and_ancestors_are_never_watched_recursively() {
+        let root = Path::new("/a/b/site");
+        let deep = |dir: &str| include_mode(root, Path::new(dir), true, true);
+        assert_eq!(deep("/a/b/site"), RecursiveMode::NonRecursive);
+        assert_eq!(deep("/a/b"), RecursiveMode::NonRecursive);
+        assert_eq!(deep("/"), RecursiveMode::NonRecursive);
+        assert_eq!(deep("/a/b/site/conf"), RecursiveMode::Recursive);
+        assert_eq!(deep("/a/b/other"), RecursiveMode::Recursive);
+        assert_eq!(
+            include_mode(root, Path::new("/a/b/site/conf"), false, true),
+            RecursiveMode::NonRecursive
+        );
     }
 
     #[test]
