@@ -162,3 +162,40 @@ fn error_in_a_shared_partial_is_reported_once() {
     assert_eq!(errs.len(), 1, "{errs:?}");
     assert!(errs[0].path.ends_with("_bad.css"));
 }
+
+#[test]
+fn site_partial_overrides_the_one_a_theme_stylesheet_imports() {
+    let tmp = site_of(&[
+        ("reuben.toml", "theme = \"t\"\n"),
+        INDEX,
+        (
+            "t/static/main.css",
+            "@import \"_vars.css\";\na{color:var(--c)}\n",
+        ),
+        ("t/static/_vars.css", ":root{--c:red}\n"),
+        ("static/_vars.css", ":root{--c:blue}\n"),
+    ]);
+    build(&tmp).unwrap();
+    let css = dist(&tmp, "main.css");
+    assert!(
+        css.contains("--c:#00f") || css.contains("--c:blue"),
+        "{css}"
+    );
+    assert!(!css.contains("red"), "{css}");
+}
+
+#[test]
+fn theme_partial_is_used_when_the_site_has_none() {
+    let tmp = site_of(&[
+        ("reuben.toml", "theme = \"t\"\n"),
+        INDEX,
+        (
+            "t/static/main.css",
+            "@import \"sub/_vars.css\";\na{color:var(--c)}\n",
+        ),
+        ("t/static/sub/_vars.css", ":root{--c:red}\n"),
+    ]);
+    build(&tmp).unwrap();
+    let css = dist(&tmp, "main.css");
+    assert!(css.contains("--c:red"), "{css}");
+}

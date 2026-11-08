@@ -38,15 +38,19 @@ pub fn process(
     imports_root: Option<&Path>,
     cfg: &CssConfig,
 ) -> Result<String, Error> {
-    process_with(source_path, css, imports_root, cfg, &HashMap::new())
+    process_with(source_path, css, imports_root, None, cfg, &HashMap::new())
 }
 
 /// Like [`process`], but an import of any path in `rendered` (keyed by [`normalize`]d path) gets that text instead of
 /// the file's bytes. That is how a templated partial is imported as its rendered output.
+///
+/// A file in `overrides` replaces the one at the same relative path under `imports_root`, the way a site's static
+/// file replaces its theme's. Imports may reach either folder but nothing outside them.
 pub(crate) fn process_with(
     source_path: &Path,
     css: &str,
     imports_root: Option<&Path>,
+    overrides: Option<&Path>,
     cfg: &CssConfig,
     rendered: &HashMap<PathBuf, String>,
 ) -> Result<String, Error> {
@@ -84,6 +88,7 @@ pub(crate) fn process_with(
     let bundle_root = imports_root.filter(|_| cfg.bundle);
     let provider = Provider::new(
         normalize(bundle_root.unwrap_or(Path::new(""))),
+        overrides.map(normalize),
         entry.clone(),
         css,
         rendered,
@@ -168,9 +173,11 @@ struct Edge {
     specifier: String,
 }
 
-/// Serves the entry from memory and its imports from disk, refusing anything outside `root`.
+/// Serves the entry from memory and its imports from disk, refusing anything outside `root` and `overrides`.
 struct Provider {
     root: PathBuf,
+    /// Files here take the place of the same relative path under `root`.
+    overrides: Option<PathBuf>,
     sources: FrozenMap<PathBuf, String>,
     /// Every resolved `@import`, for cycle detection. Collected in parallel, so sorted before use.
     edges: Mutex<Vec<Edge>>,
@@ -178,7 +185,13 @@ struct Provider {
 }
 
 impl Provider {
-    fn new(root: PathBuf, entry: PathBuf, css: &str, rendered: &HashMap<PathBuf, String>) -> Self {
+    fn new(
+        root: PathBuf,
+        overrides: Option<PathBuf>,
+        entry: PathBuf,
+        css: &str,
+        rendered: &HashMap<PathBuf, String>,
+    ) -> Self {
         let sources = FrozenMap::new();
         for (path, text) in rendered {
             sources.insert(path.clone(), text.clone());
@@ -186,14 +199,25 @@ impl Provider {
         sources.insert(entry.clone(), css.to_string());
         Self {
             root,
+            overrides,
             sources,
             edges: Mutex::new(Vec::new()),
             entry,
         }
     }
 
+    /// The folders imports may come from, the deepest first so a nested one wins.
+    fn bases(&self) -> Vec<&Path> {
+        let mut bases: Vec<&Path> = self.overrides.iter().map(PathBuf::as_path).collect();
+        bases.push(&self.root);
+        bases.sort_by_key(|b| std::cmp::Reverse(b.components().count()));
+        bases
+    }
+
     fn display(&self, path: &Path) -> String {
-        path.strip_prefix(&self.root)
+        self.bases()
+            .into_iter()
+            .find_map(|b| path.strip_prefix(b).ok())
             .unwrap_or(path)
             .display()
             .to_string()
@@ -283,13 +307,19 @@ impl SourceProvider for Provider {
                 "import `{specifier}` is outside the stylesheet folder"
             ))
         };
-        let target = normalize(&originating.with_file_name(specifier));
-        if !target.starts_with(&self.root) {
-            return Err(outside());
-        }
-        // A symlink inside the root must not lead out of it either.
-        if let (Ok(real), Ok(root)) = (target.canonicalize(), self.root.canonicalize())
-            && !real.starts_with(root)
+        let resolved = normalize(&originating.with_file_name(specifier));
+        let rel = self
+            .bases()
+            .into_iter()
+            .find_map(|b| resolved.strip_prefix(b).ok())
+            .ok_or_else(outside)?;
+        let (target, base) = match &self.overrides {
+            Some(over) if over.join(rel).is_file() => (over.join(rel), over),
+            _ => (self.root.join(rel), &self.root),
+        };
+        // A symlink inside a root must not lead out of it either.
+        if let (Ok(real), Ok(base)) = (target.canonicalize(), base.canonicalize())
+            && !real.starts_with(base)
         {
             return Err(outside());
         }
@@ -336,21 +366,22 @@ pub(crate) fn is_partial_css(rel: &Path) -> bool {
 }
 
 /// Where `@import`s in the CSS file `src` may reach: the folder it lives in the site, theme or content tree.
+/// A theme stylesheet also gets the site's `static/` as overrides, since a site file replaces the theme's.
 pub(crate) fn css_root(
     site_root: &Path,
     theme: Option<&Path>,
     src: &Path,
     template_from_static: bool,
-) -> PathBuf {
+) -> (PathBuf, Option<PathBuf>) {
     let site_static = site_root.join("static");
     if template_from_static {
-        return site_static;
+        return (site_static, None);
     }
     let theme_static = theme.map(|t| t.join("static"));
     match theme_static {
-        Some(dir) if src.starts_with(&dir) => dir,
-        _ if src.starts_with(&site_static) => site_static,
-        _ => site_root.join("content"),
+        Some(dir) if src.starts_with(&dir) => (dir, Some(site_static)),
+        _ if src.starts_with(&site_static) => (site_static, None),
+        _ => (site_root.join("content"), None),
     }
 }
 
@@ -366,6 +397,7 @@ pub(crate) struct CssJob {
     pub(crate) rel: PathBuf,
     pub(crate) path: PathBuf,
     pub(crate) root: PathBuf,
+    pub(crate) overrides: Option<PathBuf>,
     pub(crate) input: CssInput,
 }
 
@@ -385,7 +417,15 @@ impl CssJob {
                 (text.as_str(), false)
             }
         };
-        process_with(&self.path, css, Some(&self.root), cfg, partials).map_err(|mut e| {
+        process_with(
+            &self.path,
+            css,
+            Some(&self.root),
+            self.overrides.as_deref(),
+            cfg,
+            partials,
+        )
+        .map_err(|mut e| {
             // A template's line numbers describe its rendered text, not the file on disk, so the error drops
             // them and quotes the offending rendered line instead.
             let rendered = if is_template && e.path == self.path {
@@ -497,6 +537,7 @@ mod tests {
             &dir.join("main.css"),
             "@import \"_vars.css\";\na{width:var(--w)}",
             Some(&dir),
+            None,
             &CssConfig::default(),
             &rendered,
         )
@@ -557,6 +598,40 @@ mod tests {
         let (message, location) = css_error(&err);
         assert!(message.contains("outside"), "{message}");
         assert_eq!(location.map(|l| l.0), Some(1));
+    }
+
+    #[test]
+    fn overrides_replace_imports_but_widen_nothing_else() {
+        let tmp = TempDir::new().unwrap();
+        tmp.child("t/static/_v.css")
+            .write_str("a{color:red}")
+            .unwrap();
+        tmp.child("t/static/_w.css")
+            .write_str("b{color:red}")
+            .unwrap();
+        tmp.child("s/static/_v.css")
+            .write_str("a{color:blue}")
+            .unwrap();
+        tmp.child("secret.css").write_str("s{color:red}").unwrap();
+        let theme = tmp.path().join("t/static");
+        let site = tmp.path().join("s/static");
+        let run = |css: &str| {
+            process_with(
+                &theme.join("main.css"),
+                css,
+                Some(&theme),
+                Some(&site),
+                &CssConfig::default(),
+                &HashMap::new(),
+            )
+        };
+        let out = run("@import \"_v.css\";\n@import \"_w.css\";\n").unwrap();
+        assert!(
+            out.contains("a{color:#00f}") && out.contains("b{color:red}"),
+            "{out}"
+        );
+        let err = run("@import \"../../secret.css\";\n").unwrap_err();
+        assert!(css_error(&err).0.contains("outside"), "{err}");
     }
 
     #[test]

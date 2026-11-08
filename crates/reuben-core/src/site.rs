@@ -327,12 +327,12 @@ impl Site {
                     errors.append(&mut e);
                 }
                 Ok(html) if is_css(&page.route.file) => {
-                    css_jobs.push(CssJob {
-                        rel: page.route.file.clone(),
-                        path: page.source.clone(),
-                        root: self.css_root(&page.source, page.from_static),
-                        input: CssInput::Text(html),
-                    });
+                    css_jobs.push(self.css_job(
+                        &page.route.file,
+                        &page.source,
+                        page.from_static,
+                        CssInput::Text(html),
+                    ));
                 }
                 Ok(html) => {
                     output.files.insert(
@@ -356,12 +356,7 @@ impl Site {
             }
             static_copied += 1;
             if is_css(rel) {
-                css_jobs.push(CssJob {
-                    rel: rel.clone(),
-                    path: src.clone(),
-                    root: self.css_root(src, false),
-                    input: CssInput::File,
-                });
+                css_jobs.push(self.css_job(rel, src, false, CssInput::File));
             } else {
                 output
                     .files
@@ -509,13 +504,26 @@ impl Site {
         }
     }
 
-    fn css_root(&self, src: &Path, template_from_static: bool) -> PathBuf {
-        css::css_root(
+    fn css_job(
+        &self,
+        rel: &Path,
+        src: &Path,
+        template_from_static: bool,
+        input: CssInput,
+    ) -> CssJob {
+        let (root, overrides) = css::css_root(
             &self.root,
             self.config.theme.as_deref(),
             src,
             template_from_static,
-        )
+        );
+        CssJob {
+            rel: rel.to_path_buf(),
+            path: src.to_path_buf(),
+            root,
+            overrides,
+            input,
+        }
     }
 
     /// Every file to copy as (path relative to the output, source). Theme files come first and a site file at the
