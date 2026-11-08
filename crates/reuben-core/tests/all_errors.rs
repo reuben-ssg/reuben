@@ -219,15 +219,57 @@ fn error_list_is_identical_whatever_the_thread_count() {
 }
 
 #[test]
-fn broken_include_still_stops_early() {
+fn broken_include_is_reported_with_every_other_error() {
     let tmp = site_of(&[
-        ("includes/bad.rhai", "fn (\n"),
+        ("includes/good.rhai", "fn helper() { \"h\" }\n"),
+        ("includes/h.rhai", "fn x( {\n"),
         ("content/a.md", "---\n---\nno title\n"),
+        ("content/b.md", "---\ntitle: B\n---\n{{ helper() }}\n"),
+        ("content/c.md", "---\ntitle: C\nlayout: l\n---\nc\n"),
+        ("layouts/l.html", "<main>{{ helper() }}</main>"),
+        ("data/bad.toml", "x = [\n"),
+        ("data/s.rhai", "helper()\n"),
+        ("static/bad.css", "a {\n}}} x {{\n"),
+        ("static/t.css", "---\n---\na{content:\"{{ helper() }}\"}\n"),
+        (
+            "static/main.css",
+            "@import \"_p.css\";\na{color:var(--c)}\n",
+        ),
+        ("static/_p.css", "---\n---\n:root{--c:{{ helper() }}}\n"),
+        ("content/d.md", "---\ntitle: D\n---\nd\n"),
+        ("content/d/index.md", "---\ntitle: D2\n---\nd\n"),
     ]);
-    let errors = Site::load(tmp.path()).unwrap_err();
-    assert!(!errors.is_empty());
+    let errors = build(&tmp).unwrap_err();
+    for file in [
+        "includes/h.rhai",
+        "content/a.md",
+        "data/bad.toml",
+        "static/bad.css",
+    ] {
+        assert!(
+            errors.iter().any(|e| e.path.ends_with(file)),
+            "no error for {file}: {errors:?}"
+        );
+    }
     assert!(
-        errors.iter().all(|e| e.path.ends_with("includes/bad.rhai")),
-        "{errors:?}"
+        errors
+            .iter()
+            .any(|e| e.path.ends_with("content/d.md") || e.path.ends_with("content/d/index.md")),
+        "no collision error: {errors:?}"
     );
+    for file in [
+        "content/b.md",
+        "content/c.md",
+        "layouts/l.html",
+        "data/s.rhai",
+        "static/t.css",
+        "static/main.css",
+        "static/_p.css",
+    ] {
+        assert!(
+            !errors.iter().any(|e| e.path.ends_with(file)),
+            "cascade error for {file}: {errors:?}"
+        );
+    }
+    assert!(!tmp.path().join("dist").exists());
 }

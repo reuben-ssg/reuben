@@ -80,6 +80,9 @@ pub struct Site {
     /// Folders (relative to `content/`) whose `_dir.toml` failed to load. Their pages stay in the site, but their
     /// render errors are dropped because the `_dir.toml` error already explains them.
     broken_dirs: BTreeSet<PathBuf>,
+    /// An `includes/*.rhai` file failed, so nothing that runs Rhai is rendered: every call into the includes would
+    /// fail and bury the real error.
+    includes_broken: bool,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -114,8 +117,8 @@ impl Site {
         Self::load_with(root, &LoadOptions::default())
     }
 
-    /// Reads every page and static file. Only a broken config (`reuben.toml`, includes) stops the load; a bad page,
-    /// data file or `_dir.toml` is kept in `load_errors` and the rest of the site still loads.
+    /// Reads every page and static file. Only a broken config (`reuben.toml` and its `include` files) stops the
+    /// load; a bad page, data file, `_dir.toml` or Rhai include is kept in `load_errors` and the rest still loads.
     pub fn load_with(root: &Path, opts: &LoadOptions) -> Result<Site, Vec<Error>> {
         let mut errors = Vec::new();
         let mut pages = Vec::new();
@@ -130,10 +133,16 @@ impl Site {
             .chain([root.join("includes")])
             .filter(|d| d.is_dir())
             .collect();
-        engine.load_includes(&include_dirs)?;
+        let include_errors = engine
+            .load_includes(&include_dirs)
+            .err()
+            .unwrap_or_default();
+        let includes_broken = !include_errors.is_empty();
+        errors.extend(include_errors);
         let site_scope = page::site_map(&config).map_err(|e| vec![e])?;
 
-        let (site_data, mut data_errors) = data::load(root, &engine, &site_scope);
+        let (site_data, mut data_errors) =
+            data::load(root, (!includes_broken).then_some(&engine), &site_scope);
         errors.append(&mut data_errors);
 
         let content = root.join("content");
@@ -234,6 +243,7 @@ impl Site {
             engine: Arc::new(engine),
             load_errors: errors,
             broken_dirs: dirs.broken().clone(),
+            includes_broken,
         })
     }
 
@@ -284,8 +294,12 @@ impl Site {
                     }
                 },
             );
-        let rendered: Vec<Result<String, Vec<Error>>> =
-            in_pool(pool.as_ref(), || pages.par_iter().map(render_one).collect());
+        // Skipped pages count as failed with nothing to add, so templated partials still import as empty.
+        let rendered: Vec<Result<String, Vec<Error>>> = if self.includes_broken {
+            pages.iter().map(|_| Err(Vec::new())).collect()
+        } else {
+            in_pool(pool.as_ref(), || pages.par_iter().map(render_one).collect())
+        };
         let mut css_jobs: Vec<CssJob> = Vec::new();
         // Templated partials are imported as their rendered text. A partial that failed to render is imported as
         // empty, since its own error is already reported and importers would only add noise.
