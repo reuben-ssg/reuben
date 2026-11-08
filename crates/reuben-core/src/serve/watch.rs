@@ -324,12 +324,13 @@ mod tests {
     fn debounce_collapses_bursts() {
         let (tx, rx) = mpsc::channel();
         let mut signals = debounce(rx, Duration::from_millis(150));
+        // Each burst is queued at once, so no scheduling delay can split it, and the gap between bursts is
+        // far longer than the quiet period, so none can merge them.
         let sender = thread::spawn(move || {
             for _ in 0..5 {
                 tx.send(Ok(Event::default())).unwrap();
-                thread::sleep(Duration::from_millis(10));
             }
-            thread::sleep(Duration::from_millis(300));
+            thread::sleep(Duration::from_millis(1200));
             tx.send(Ok(Event::default())).unwrap();
             // Dropping `tx` ends the iterator after the final burst.
         });

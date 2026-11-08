@@ -160,13 +160,22 @@ fn drop_closes_streams_and_port() {
     let started = Instant::now();
     drop(server);
     // The client keeps its keep-alive connection open, so the only way to see the end is the chunked terminator.
-    let tail = read_until(&mut sse, "\r\n0\r\n\r\n", Duration::from_secs(2));
+    // With no chunk sent yet, the terminator follows the header's blank line, which the first read consumed.
+    let tail = read_until(&mut sse, "0\r\n\r\n", Duration::from_secs(2));
     assert!(
-        tail.ends_with("\r\n0\r\n\r\n"),
+        tail == "0\r\n\r\n" || tail.ends_with("\r\n0\r\n\r\n"),
         "stream not terminated: {tail:?}"
     );
     assert!(started.elapsed() < Duration::from_secs(2));
-    assert!(TcpStream::connect(addr).is_err());
+    // The listener closes on the server's own thread, a moment after `drop` returns.
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while TcpStream::connect(addr).is_ok() && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert!(
+        TcpStream::connect(addr).is_err(),
+        "port still open after 2 s"
+    );
 }
 
 #[test]
