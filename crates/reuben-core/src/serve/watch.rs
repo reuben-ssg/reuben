@@ -5,7 +5,7 @@ use std::mem;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use notify::event::ModifyKind;
 use notify::{Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher as _};
@@ -85,13 +85,23 @@ fn include_mode(root: &Path, dir: &Path, exists: bool, deep: bool) -> RecursiveM
     }
 }
 
-/// Collapses a burst of events into one signal once no event has arrived for `quiet`.
+/// Collapses a burst of events into one signal once no event has arrived for `quiet`, or once `max_wait` has
+/// passed since the burst's first event, so a steady stream of changes still rebuilds.
 /// Ends when the sender is gone and nothing is pending.
-pub fn debounce(rx: Receiver<notify::Result<Event>>, quiet: Duration) -> impl Iterator<Item = ()> {
+pub fn debounce(
+    rx: Receiver<notify::Result<Event>>,
+    quiet: Duration,
+    max_wait: Duration,
+) -> impl Iterator<Item = ()> {
     std::iter::from_fn(move || {
         let _first = rx.recv().ok()?;
+        let deadline = Instant::now() + max_wait;
         loop {
-            match rx.recv_timeout(quiet) {
+            let left = deadline.saturating_duration_since(Instant::now());
+            if left.is_zero() {
+                return Some(());
+            }
+            match rx.recv_timeout(quiet.min(left)) {
                 Ok(_) => {}
                 Err(RecvTimeoutError::Timeout | RecvTimeoutError::Disconnected) => {
                     return Some(());
@@ -210,16 +220,17 @@ impl Watcher {
     }
 
     /// Brings the OS watches in line with the site. `config` is `None` when the config failed to load, in
-    /// which case the previous set stays and only the `include` globs are re-read. Returns a message for each
-    /// path that could not be watched.
-    pub fn sync(&mut self, config: Option<&Config>, env: Option<&str>) -> Vec<String> {
+    /// which case the previous set stays and only the `include` globs are re-read.
+    pub fn sync(&mut self, config: Option<&Config>, env: Option<&str>) -> Synced {
         if let Some(config) = config {
             self.config_paths = watch_paths(&self.root, config);
         }
+        let mut changed = false;
         let dirty = mem::take(&mut self.state.lock().unwrap_or_else(|e| e.into_inner()).dirty);
         for path in dirty {
             if self.watched.remove(&path).is_some() {
                 let _ = self.inner.unwatch(&path);
+                changed = true;
             }
         }
 
@@ -294,11 +305,13 @@ impl Watcher {
         for path in stale {
             let _ = self.inner.unwatch(&path);
             self.watched.remove(&path);
+            changed = true;
         }
         for (path, mode) in wanted {
             if self.watched.get(&path) == Some(&mode) {
                 continue;
             }
+            changed = true;
             match self.inner.watch(&path, mode) {
                 Ok(()) => {
                     self.watched.insert(path, mode);
@@ -308,8 +321,17 @@ impl Watcher {
         }
         self.state.lock().unwrap_or_else(|e| e.into_inner()).watched =
             self.watched.keys().cloned().collect();
-        problems
+        Synced { problems, changed }
     }
+}
+
+/// What [`Watcher::sync`] did.
+pub struct Synced {
+    /// A message for each path that could not be watched.
+    pub problems: Vec<String>,
+    /// A watch was added or removed. Adding one can briefly drop events on some platforms (macOS restarts its
+    /// event stream), so a change made meanwhile may have gone unseen.
+    pub changed: bool,
 }
 
 #[cfg(test)]
@@ -323,7 +345,7 @@ mod tests {
     #[test]
     fn debounce_collapses_bursts() {
         let (tx, rx) = mpsc::channel();
-        let mut signals = debounce(rx, Duration::from_millis(150));
+        let mut signals = debounce(rx, Duration::from_millis(150), Duration::from_secs(1));
         // Each burst is queued at once, so no scheduling delay can split it, and the gap between bursts is
         // far longer than the quiet period, so none can merge them.
         let sender = thread::spawn(move || {
@@ -338,6 +360,43 @@ mod tests {
         assert_eq!(signals.next(), Some(()), "second burst");
         assert_eq!(signals.next(), None, "channel closed");
         sender.join().unwrap();
+    }
+
+    #[test]
+    fn debounce_signals_during_a_steady_stream() {
+        let (tx, rx) = mpsc::channel();
+        let mut signals = debounce(rx, Duration::from_millis(150), Duration::from_millis(500));
+        let started = Instant::now();
+        let sender = thread::spawn(move || {
+            while started.elapsed() < Duration::from_secs(4)
+                && tx.send(Ok(Event::default())).is_ok()
+            {
+                thread::sleep(Duration::from_millis(20));
+            }
+        });
+        assert_eq!(signals.next(), Some(()));
+        assert!(
+            started.elapsed() < Duration::from_secs(3),
+            "no signal until the stream stopped: {:?}",
+            started.elapsed()
+        );
+        drop(signals);
+        sender.join().unwrap();
+    }
+
+    #[test]
+    fn sync_reports_whether_the_watches_changed() {
+        let tmp = TempDir::new().unwrap();
+        tmp.child("content").create_dir_all().unwrap();
+        let root = tmp.path().canonicalize().unwrap();
+        let cfg = config::load(&root, None).unwrap();
+        let (mut watcher, _events) = Watcher::new(&root).unwrap();
+        assert!(watcher.sync(Some(&cfg), None).changed, "first sync");
+        assert!(!watcher.sync(Some(&cfg), None).changed, "nothing new");
+        tmp.child("data").create_dir_all().unwrap();
+        let synced = watcher.sync(Some(&cfg), None);
+        assert!(synced.changed, "new data folder");
+        assert!(synced.problems.is_empty(), "{:?}", synced.problems);
     }
 
     #[test]

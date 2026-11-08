@@ -59,6 +59,9 @@ enum Command {
         /// Merge `reuben.<name>.toml` over `reuben.toml` if it exists.
         #[arg(long)]
         env: Option<String>,
+        /// Render with this many threads. Defaults to one per core.
+        #[arg(long, value_name = "N")]
+        jobs: Option<usize>,
     },
     /// Print stylesheets that go with build output.
     #[command(subcommand)]
@@ -89,7 +92,8 @@ fn main() -> ExitCode {
             port,
             drafts,
             env,
-        } => serve(&root, port, drafts, env),
+            jobs,
+        } => serve(&root, port, drafts, env, jobs),
         Command::Css(CssCommand::Highlight { theme }) => match highlight::theme_css(&theme) {
             Ok(css) => {
                 print!("{css}");
@@ -144,18 +148,29 @@ fn print_errors(errors: &[Error]) {
 type Rendered = Result<(Output, BuildReport), Vec<Error>>;
 
 /// One full load and render. The config comes back even when the render fails, so the watches can follow it.
-fn rebuild(root: &Path, env: &Option<String>, drafts: bool) -> (Option<Config>, Rendered) {
+fn rebuild(
+    root: &Path,
+    env: &Option<String>,
+    drafts: bool,
+    jobs: Option<usize>,
+) -> (Option<Config>, Rendered) {
     match Site::load_with(root, &LoadOptions { env: env.clone() }) {
         Ok(site) => {
-            let rendered = site.render(&RenderOptions { drafts, jobs: None });
+            let rendered = site.render(&RenderOptions { drafts, jobs });
             (Some(site.config), rendered)
         }
         Err(errors) => (None, Err(errors)),
     }
 }
 
-fn serve(root: &Path, port: u16, drafts: bool, env: Option<String>) -> ExitCode {
-    let (config, first) = rebuild(root, &env, drafts);
+fn serve(
+    root: &Path,
+    port: u16,
+    drafts: bool,
+    env: Option<String>,
+    jobs: Option<usize>,
+) -> ExitCode {
+    let (config, first) = rebuild(root, &env, drafts, jobs);
     let output = match first {
         Ok((output, report)) => {
             print_warnings(&report);
@@ -181,48 +196,73 @@ fn serve(root: &Path, port: u16, drafts: bool, env: Option<String>) -> ExitCode 
             return ExitCode::FAILURE;
         }
     };
-    for problem in watcher.sync(config.as_ref(), env.as_deref()) {
+    for problem in watcher.sync(config.as_ref(), env.as_deref()).problems {
         eprintln!("warning: {problem}");
     }
     println!("Serving at http://{}", server.local_addr());
 
-    for () in debounce(events, Duration::from_millis(150)) {
-        let started = Instant::now();
-        // A panic in a rebuild is a failed rebuild, not the end of the server.
-        let (config, result) =
-            std::panic::catch_unwind(AssertUnwindSafe(|| rebuild(root, &env, drafts)))
-                .unwrap_or_else(|panic| {
-                    let message = panic
-                        .downcast_ref::<&str>()
-                        .map(|s| s.to_string())
-                        .or_else(|| panic.downcast_ref::<String>().cloned())
-                        .unwrap_or_else(|| "unknown panic".into());
-                    eprintln!("error: rebuild panicked: {message}");
-                    (None, Err(Vec::new()))
-                });
-        match result {
-            Ok((output, report)) => {
-                server.replace(output);
-                print_warnings(&report);
-                println!(
-                    "Rebuilt {} in {} ms",
-                    plural(report.pages_written, "page", "pages"),
-                    started.elapsed().as_millis()
-                );
+    for () in debounce(events, Duration::from_millis(150), Duration::from_secs(1)) {
+        // Adding a watch can drop events for a moment (macOS restarts its event stream), so when the watches
+        // change, one more rebuild picks up anything saved meanwhile.
+        let mut again = true;
+        loop {
+            let watches_changed =
+                rebuild_and_serve(root, &env, drafts, jobs, &server, &mut watcher);
+            if !(watches_changed && again) {
+                break;
             }
-            Err(errors) => {
-                // Empty only after a panic, which has already been reported.
-                if !errors.is_empty() {
-                    print_errors(&errors);
-                }
-                server.notify_error();
-            }
-        }
-        for problem in watcher.sync(config.as_ref(), env.as_deref()) {
-            eprintln!("warning: {problem}");
+            again = false;
         }
     }
     ExitCode::SUCCESS
+}
+
+/// One rebuild in the serve loop: the watches follow the new config before its output goes live, so an edit
+/// made right after a page appears is never missed. Returns whether the watches changed.
+fn rebuild_and_serve(
+    root: &Path,
+    env: &Option<String>,
+    drafts: bool,
+    jobs: Option<usize>,
+    server: &DevServer,
+    watcher: &mut Watcher,
+) -> bool {
+    let started = Instant::now();
+    // A panic in a rebuild is a failed rebuild, not the end of the server.
+    let (config, result) =
+        std::panic::catch_unwind(AssertUnwindSafe(|| rebuild(root, env, drafts, jobs)))
+            .unwrap_or_else(|panic| {
+                let message = panic
+                    .downcast_ref::<&str>()
+                    .map(|s| s.to_string())
+                    .or_else(|| panic.downcast_ref::<String>().cloned())
+                    .unwrap_or_else(|| "unknown panic".into());
+                eprintln!("error: rebuild panicked: {message}");
+                (None, Err(Vec::new()))
+            });
+    let synced = watcher.sync(config.as_ref(), env.as_deref());
+    for problem in &synced.problems {
+        eprintln!("warning: {problem}");
+    }
+    match result {
+        Ok((output, report)) => {
+            server.replace(output);
+            print_warnings(&report);
+            println!(
+                "Rebuilt {} in {} ms",
+                plural(report.pages_written, "page", "pages"),
+                started.elapsed().as_millis()
+            );
+        }
+        Err(errors) => {
+            // Empty only after a panic, which has already been reported.
+            if !errors.is_empty() {
+                print_errors(&errors);
+            }
+            server.notify_error();
+        }
+    }
+    synced.changed
 }
 
 fn print_warnings(report: &BuildReport) {

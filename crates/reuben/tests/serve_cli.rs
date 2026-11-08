@@ -35,10 +35,11 @@ fn drain<R: Read + Send + 'static>(r: R, on_line: impl Fn(String) + Send + 'stat
     });
 }
 
-fn spawn(root: &Path) -> Child {
+fn spawn(root: &Path, extra: &[&str]) -> Child {
     Command::new(env!("CARGO_BIN_EXE_reuben"))
         .args(["serve", "--port", "0", "--root"])
         .arg(root)
+        .args(extra)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -47,7 +48,11 @@ fn spawn(root: &Path) -> Child {
 }
 
 fn start(root: &Path) -> Serve {
-    let mut child = spawn(root);
+    start_with(root, &[])
+}
+
+fn start_with(root: &Path, extra: &[&str]) -> Serve {
+    let mut child = spawn(root, extra);
     let stderr = Arc::new(Mutex::new(String::new()));
     let sink = Arc::clone(&stderr);
     drain(child.stderr.take().unwrap(), move |l| {
@@ -155,6 +160,26 @@ fn serve_stderr(serve: &Serve) -> String {
     serve.stderr.lock().unwrap().clone()
 }
 
+/// Waits for the next `Rebuilt` line, so the rebuild that saw the last write, and its watch update, are done.
+fn wait_rebuilt(serve: &Serve) {
+    let end = Instant::now() + Duration::from_secs(20);
+    while let Some(left) = end.checked_duration_since(Instant::now()) {
+        match serve.stdout.recv_timeout(left) {
+            Ok(line) if line.starts_with("Rebuilt ") => return,
+            Ok(_) => {}
+            Err(_) => break,
+        }
+    }
+    panic!("no rebuild line; stderr: {}", serve_stderr(serve));
+}
+
+#[test]
+fn serve_accepts_jobs() {
+    let tmp = site("Hello\n");
+    let serve = start_with(tmp.path(), &["--jobs", "2"]);
+    assert!(body_contains(serve.port, "Hello"));
+}
+
 fn stderr_contains(serve: &Serve, needle: &str) -> bool {
     serve.stderr.lock().unwrap().contains(needle)
 }
@@ -180,6 +205,7 @@ fn serve_watches_a_new_data_dir() {
         "{}",
         serve_stderr(&serve)
     );
+    wait_rebuilt(&serve);
     tmp.child("data/x.json")
         .write_str("{\"v\": \"beta\"}")
         .unwrap();
@@ -250,6 +276,7 @@ fn serve_notices_an_include_dir_created_later() {
         "{}",
         serve_stderr(&serve)
     );
+    wait_rebuilt(&serve);
     tmp.child("conf3/a.toml")
         .write_str("title = \"Four\"\n")
         .unwrap();
@@ -349,6 +376,7 @@ fn serve_writes_nothing_to_the_site() {
     assert!(wait_until(Duration::from_secs(20), || body_contains(
         serve.port, "Again"
     )));
+    wait_rebuilt(&serve);
     tmp.child("content/index.md")
         .write_str(&page(BROKEN))
         .unwrap();
