@@ -20,6 +20,7 @@ fn build(root: &Path) -> Result<(), Vec<Error>> {
     site.build(&BuildOptions {
         drafts: false,
         out: root.join("dist"),
+        jobs: None,
     })
     .map(|_| ())
 }

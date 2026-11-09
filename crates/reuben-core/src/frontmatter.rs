@@ -39,7 +39,7 @@ pub struct Parsed<'a> {
     pub body_line: usize,
 }
 
-#[derive(Debug, thiserror::Error)]
+#[derive(Debug, Clone, thiserror::Error)]
 pub enum FrontMatterError {
     #[error("file must start with front matter between `---` (YAML) or `+++` (TOML) lines")]
     Missing,

@@ -13,6 +13,10 @@ pub fn render(error: &Error, source: Option<&str>) -> String {
         },
         ErrorKind::Block(e) => (&e.message, e.span, &[]),
         ErrorKind::Math { message, location } => (message, *location, &[]),
+        ErrorKind::Css {
+            message,
+            location: Some(location),
+        } => (message, *location, &[]),
         _ => return plain(error),
     };
     let width = span.line.to_string().len();
@@ -79,6 +83,29 @@ mod tests {
             render(&err, Some("a\n$\\frac{1}{$\n")),
             "error: bad\n  --> content/m.md:2:1\n  |\n2 | $\\frac{1}{$\n  | ^\n"
         );
+    }
+
+    #[test]
+    fn renders_css_errors_with_snippet() {
+        let err = Error::new(
+            "static/a.css",
+            ErrorKind::Css {
+                message: "bad".into(),
+                location: Some(Span { line: 2, column: 3 }),
+            },
+        );
+        assert_eq!(
+            render(&err, Some("a {\n  color: ;\n")),
+            "error: bad\n  --> static/a.css:2:3\n  |\n2 |   color: ;\n  |   ^\n"
+        );
+        let unlocated = Error::new(
+            "static/a.css",
+            ErrorKind::Css {
+                message: "bad".into(),
+                location: None,
+            },
+        );
+        assert_eq!(render(&unlocated, None), "error: static/a.css: css: bad\n");
     }
 
     #[test]

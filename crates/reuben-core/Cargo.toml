@@ -19,9 +19,19 @@ pulldown-latex.workspace = true
 syntect.workspace = true
 rhai.workspace = true
 walkdir.workspace = true
+rayon.workspace = true
 glob.workspace = true
 jiff.workspace = true
+lightningcss.workspace = true
+elsa.workspace = true
+tiny_http.workspace = true
+notify.workspace = true
 
 [dev-dependencies]
 insta.workspace = true
 assert_fs.workspace = true
+criterion.workspace = true
+
+[[bench]]
+name = "build"
+harness = false

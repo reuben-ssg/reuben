@@ -19,6 +19,7 @@ fn build(root: &Path) -> Result<(), Vec<Error>> {
     site.build(&BuildOptions {
         drafts: false,
         out: root.join("dist"),
+        jobs: None,
     })
     .map(|_| ())
 }
@@ -60,7 +61,7 @@ fn site_static_overrides_theme_static() {
     build(&root).unwrap();
     assert_eq!(
         fs::read_to_string(root.join("dist/style.css")).unwrap(),
-        "/* site */"
+        "a{color:red}"
     );
 }
 
@@ -73,7 +74,7 @@ fn theme_static_is_copied_when_site_has_none() {
     build(&root).unwrap();
     assert_eq!(
         fs::read_to_string(root.join("dist/style.css")).unwrap(),
-        "/* theme */"
+        "a{color:#00f}"
     );
 }
 

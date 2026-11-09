@@ -5,11 +5,8 @@ use std::path::Path;
 
 use rhai::{Array, Dynamic, Map};
 
-use crate::blocks;
 use crate::config::Config;
 use crate::error::{Error, ErrorKind};
-use crate::html::plain_text;
-use crate::markdown;
 use crate::page::page_map;
 use crate::script::collection::{Collection, compare, sort_array};
 use crate::site::{Page, PageKind};
@@ -42,31 +39,6 @@ pub fn layout_of<'a>(rel: &Path, config: &'a Config) -> Option<&'a str> {
         .as_deref()
 }
 
-/// Front matter `description`, else the plain text of the first paragraph with block placeholders removed.
-/// A body whose blocks can't be extracted has no summary; the page's own render reports that error.
-pub fn summary(page: &Page) -> String {
-    if let Some(d) = &page.front_matter.description {
-        return d.clone();
-    }
-    if page.kind != PageKind::Markdown {
-        return String::new();
-    }
-    let skip = markdown::code_ranges(&page.body);
-    let Ok(extracted) = blocks::extract(&page.body, page.body_line, &skip) else {
-        return String::new();
-    };
-    let doc = markdown::parse(&extracted.text, page.body_line);
-    let Some(paragraph) = doc
-        .children
-        .iter()
-        .find(|n| n.kind == crate::doc::NodeKind::Paragraph)
-    else {
-        return String::new();
-    };
-    let text = blocks::strip_placeholders(&plain_text(paragraph));
-    text.split_whitespace().collect::<Vec<_>>().join(" ")
-}
-
 /// Markdown pages and `.html` templates under `content/` are collection members; other templates are not.
 fn joins_collection(page: &Page) -> bool {
     if page.from_static {
@@ -79,7 +51,8 @@ fn joins_collection(page: &Page) -> bool {
 }
 
 /// Builds every collection from the pages that are in the build. Callers exclude drafts first.
-pub fn build(pages: &[&Page], config: &Config) -> Result<Map, Vec<Error>> {
+/// A collection that can't be built is reported and left out; the others are still returned.
+pub fn build(pages: &[&Page], config: &Config) -> (Map, Vec<Error>) {
     let mut folders: BTreeMap<String, Vec<&Page>> = BTreeMap::new();
     for page in pages.iter().filter(|p| joins_collection(p)) {
         if let Some(folder) = collection_of(&page.rel) {
@@ -100,7 +73,7 @@ pub fn build(pages: &[&Page], config: &Config) -> Result<Map, Vec<Error>> {
         for page in group {
             match page_map(page, config) {
                 Ok(mut map) => {
-                    map.insert("summary".into(), summary(page).into());
+                    map.insert("summary".into(), page.summary.clone().into());
                     entries.push((page.rel.as_path(), map));
                 }
                 Err(e) => errors.push(e),
@@ -127,11 +100,7 @@ pub fn build(pages: &[&Page], config: &Config) -> Result<Map, Vec<Error>> {
             );
         }
     }
-    if errors.is_empty() {
-        Ok(out)
-    } else {
-        Err(errors)
-    }
+    (out, errors)
 }
 
 struct TreeNode {
@@ -254,6 +223,8 @@ mod tests {
             route: route_for_page(Path::new(rel)),
             front_matter_sources: Default::default(),
             draft_excluded: false,
+            pre_block_toc: Vec::new(),
+            summary: crate::page::precompute(PageKind::Markdown, description, body, 1).1,
         }
     }
 
@@ -273,6 +244,7 @@ mod tests {
             params: toml::Table::new(),
             collections,
             sitemap: false,
+            css: Default::default(),
             sources: Default::default(),
         }
     }
@@ -293,9 +265,9 @@ mod tests {
     #[test]
     fn summary_prefers_description_then_first_paragraph() {
         let p = page("guide/v.md", Some("Tone."), "Other.");
-        assert_eq!(summary(&p), "Tone.");
+        assert_eq!(p.summary, "Tone.");
         let p = page("guide/v.md", None, "Intro {{ x }} text.\n\nMore");
-        assert_eq!(summary(&p), "Intro text.");
+        assert_eq!(p.summary, "Intro text.");
     }
 
     #[test]

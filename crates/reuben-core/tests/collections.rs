@@ -13,6 +13,7 @@ fn build(drafts: bool) -> (TempDir, String) {
     site.build(&BuildOptions {
         drafts,
         out: tmp.path().join("dist"),
+        jobs: None,
     })
     .unwrap();
     let html = fs::read_to_string(tmp.path().join("dist/index.html")).unwrap();
@@ -59,6 +60,7 @@ fn build_with_page(body: &str) -> Vec<reuben_core::Error> {
     site.build(&BuildOptions {
         drafts: false,
         out: tmp.path().join("dist"),
+        jobs: None,
     })
     .unwrap_err()
 }
@@ -87,6 +89,7 @@ fn array_sort_by_helper_orders_filtered_collection() {
     site.build(&BuildOptions {
         drafts: false,
         out: tmp.path().join("dist"),
+        jobs: None,
     })
     .unwrap();
     let html = fs::read_to_string(tmp.path().join("dist/sorted/index.html")).unwrap();

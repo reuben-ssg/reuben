@@ -17,6 +17,7 @@ fn build(root: &Path, drafts: bool) -> Result<BuildReport, Vec<Error>> {
     Site::load(root)?.build(&BuildOptions {
         drafts,
         out: root.join("dist"),
+        jobs: None,
     })
 }
 
@@ -70,7 +71,7 @@ fn drafts_flag_includes_everything() {
 fn bad_dir_toml_names_its_file() {
     let tmp = cascade_site();
     fs::write(tmp.path().join("content/guide/_dir.toml"), "layout = [\n").unwrap();
-    let errors = Site::load(tmp.path()).unwrap_err();
+    let errors = Site::load(tmp.path()).unwrap().load_errors;
     assert!(
         errors.iter().any(|e| e.path.ends_with("guide/_dir.toml")),
         "{errors:?}"

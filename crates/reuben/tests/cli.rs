@@ -101,3 +101,65 @@ fn css_highlight_bad_theme_fails() {
         .code(1)
         .stderr(predicates::str::contains("nope"));
 }
+
+#[test]
+fn build_accepts_jobs_flag() {
+    let tmp = fixture("basic");
+    reuben()
+        .args(["build", "--jobs", "2", "--root"])
+        .arg(tmp.path())
+        .assert()
+        .success();
+    assert!(tmp.path().join("dist/about/index.html").is_file());
+}
+
+fn broken_site(files: &[(&str, &str)]) -> assert_fs::TempDir {
+    use assert_fs::prelude::*;
+    let tmp = assert_fs::TempDir::new().unwrap();
+    for (path, text) in files {
+        tmp.child(path).write_str(text).unwrap();
+    }
+    tmp
+}
+
+#[test]
+fn summary_line_counts_errors_and_files() {
+    let tmp = broken_site(&[
+        ("content/a.md", "---\n---\nx\n"),
+        (
+            "content/b.md",
+            "---\ntitle: B\n---\n{{ nope( }}\n\n{{ nope2( }}\n",
+        ),
+    ]);
+    reuben()
+        .args(["build", "--root"])
+        .arg(tmp.path())
+        .assert()
+        .code(1)
+        .stderr(predicates::str::ends_with("Found 3 errors in 2 files\n"));
+
+    let tmp = broken_site(&[("content/a.md", "---\n---\nx\n")]);
+    reuben()
+        .args(["build", "--root"])
+        .arg(tmp.path())
+        .assert()
+        .code(1)
+        .stderr(predicates::str::ends_with("Found 1 error in 1 file\n"));
+}
+
+#[test]
+fn a_css_error_found_directly_and_through_an_import_is_one_error() {
+    let tmp = broken_site(&[
+        ("content/index.md", "---\ntitle: H\n---\nhi\n"),
+        ("static/a.css", "a {\n}}} x {{\n"),
+        ("static/b.css", "@import \"a.css\";\nb{color:red}\n"),
+    ]);
+    // The default root `.` is where a walked path and a resolved import could be spelled differently.
+    reuben()
+        .current_dir(tmp.path())
+        .arg("build")
+        .assert()
+        .code(1)
+        .stderr(predicates::str::contains("./static/a.css"))
+        .stderr(predicates::str::ends_with("Found 1 error in 1 file\n"));
+}

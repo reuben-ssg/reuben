@@ -13,6 +13,7 @@ fn try_build(body: &str) -> (TempDir, Result<(), Vec<reuben_core::Error>>) {
         .build(&BuildOptions {
             drafts: false,
             out: tmp.path().join("dist"),
+            jobs: None,
         })
         .map(|_| ());
     (tmp, result)

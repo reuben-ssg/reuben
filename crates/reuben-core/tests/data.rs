@@ -20,6 +20,7 @@ fn data_files_nest_and_scripts_compute() {
     site.build(&BuildOptions {
         drafts: false,
         out: tmp.path().join("dist"),
+        jobs: None,
     })
     .unwrap();
     let html = fs::read_to_string(tmp.path().join("dist/index.html")).unwrap();
@@ -38,7 +39,7 @@ fn data_sources_are_recorded() {
 fn file_and_folder_collision_is_an_error() {
     let tmp = fixture();
     tmp.child("data/team.toml").write_str("x = 1\n").unwrap();
-    let errs = Site::load(tmp.path()).unwrap_err();
+    let errs = Site::load(tmp.path()).unwrap().load_errors;
     let text = errs.iter().map(ToString::to_string).collect::<String>();
     assert!(text.contains("team.toml"), "{text}");
     assert!(text.contains("data/team"), "{text}");
@@ -48,7 +49,7 @@ fn file_and_folder_collision_is_an_error() {
 fn script_colliding_with_plain_data_is_an_error() {
     let tmp = fixture();
     tmp.child("data/jobs.rhai").write_str("1").unwrap();
-    let errs = Site::load(tmp.path()).unwrap_err();
+    let errs = Site::load(tmp.path()).unwrap().load_errors;
     let text = errs.iter().map(ToString::to_string).collect::<String>();
     assert!(
         text.contains("jobs.rhai") && text.contains("jobs.yaml"),
@@ -60,7 +61,7 @@ fn script_colliding_with_plain_data_is_an_error() {
 fn data_script_cannot_see_collections() {
     let tmp = fixture();
     tmp.child("data/bad.rhai").write_str("collections").unwrap();
-    let errs = Site::load(tmp.path()).unwrap_err();
+    let errs = Site::load(tmp.path()).unwrap().load_errors;
     assert!(
         errs.iter().any(|e| e.path.ends_with("bad.rhai")),
         "{errs:?}"
@@ -71,7 +72,7 @@ fn data_script_cannot_see_collections() {
 fn data_script_error_has_location() {
     let tmp = fixture();
     tmp.child("data/err.rhai").write_str("\n  nope()").unwrap();
-    let errs = Site::load(tmp.path()).unwrap_err();
+    let errs = Site::load(tmp.path()).unwrap().load_errors;
     let e = errs.iter().find(|e| e.path.ends_with("err.rhai")).unwrap();
     let ErrorKind::Script(s) = &e.kind else {
         panic!("{e:?}")
@@ -96,6 +97,7 @@ fn hidden_and_junk_data_files_are_skipped() {
         .build(&BuildOptions {
             drafts: false,
             out: tmp.path().join("dist"),
+            jobs: None,
         })
         .unwrap();
     let html = fs::read_to_string(tmp.path().join("dist/index.html")).unwrap();
