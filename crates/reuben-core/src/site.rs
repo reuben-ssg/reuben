@@ -815,10 +815,12 @@ fn load_page_from(
 ) -> Result<Page, LoadFailure> {
     let src = String::from_utf8(bytes).map_err(|_| Error::new(path, ErrorKind::NotUtf8))?;
     let raw = frontmatter::parse_raw(&src).map_err(|e| Error::new(path, e))?;
-    let mut merged = dirs.map_or_else(Default::default, |d| {
-        d.defaults_for(rel.parent().unwrap_or(Path::new("")))
-    });
-    merged.merge(raw.value, path);
+    let rel_dir = rel.parent().unwrap_or(Path::new(""));
+    let mut merged = dirs.map_or_else(Default::default, |d| d.defaults_for(rel_dir));
+    let mut layers = dirs.map_or_else(Vec::new, |d| d.layers_for(rel_dir));
+    layers.push((&raw.value, path));
+    let rules = page_rules(rules, &layers);
+    merged.merge(raw.value.clone(), path);
     // Only Markdown pages need a title; any other template is named after its file.
     let untitled = match merged.value.get("title") {
         None | Some(serde_json::Value::Null) => true,
@@ -835,7 +837,7 @@ fn load_page_from(
         errors: vec![Error::new(path, e)],
         from_defaults: true,
     })?;
-    let rules = page_rules(rules, &front_matter, &merged.sources, path)?;
+    let rules = rules?;
     let sidecar = Some(path.with_extension("rhai")).filter(|p| p.is_file());
     let route = match kind {
         PageKind::Markdown => route_for_page(rel),
@@ -867,39 +869,43 @@ struct PageA11y {
     disable: Vec<String>,
 }
 
-/// The rules on for a page: `base` minus the page's merged `a11y.disable`. Problems are blamed on the file that set
-/// the value (the page, or a `_dir.toml` above it), and every unknown id is reported.
+/// The rules on for a page: `base` minus the `a11y.disable` of every layer, from the outermost `_dir.toml` down to
+/// the page's own front matter, so a layer adds to the ones above it. Each layer is a front matter map and the file
+/// it came from. Problems are blamed on the layer's own file, and every one is reported.
 fn page_rules(
     base: RuleSet,
-    front_matter: &FrontMatter,
-    sources: &BTreeMap<String, PathBuf>,
-    page: &Path,
+    layers: &[(&serde_json::Map<String, serde_json::Value>, &Path)],
 ) -> Result<RuleSet, LoadFailure> {
-    let Some(table) = front_matter.extra.get("a11y") else {
-        return Ok(base);
-    };
-    let blame = |key: &str| {
-        sources
-            .get(key)
-            .or_else(|| sources.get("a11y"))
-            .map_or_else(|| page.to_path_buf(), Clone::clone)
-    };
-    let parsed: PageA11y = serde_json::from_value(table.clone()).map_err(|e| Error {
-        path: blame("a11y.disable"),
-        kind: ErrorKind::Config(format!("`a11y` front matter: {e}")),
-    })?;
-    let (rules, unknown) = check::switch_off(base, &parsed.disable);
-    if unknown.is_empty() {
-        return Ok(rules);
+    let mut rules = base;
+    let mut errors = Vec::new();
+    for (layer, file) in layers {
+        let Some(table) = layer.get("a11y") else {
+            continue;
+        };
+        match serde_json::from_value::<PageA11y>(table.clone()) {
+            Ok(parsed) => {
+                let (next, unknown) = check::switch_off(rules, &parsed.disable);
+                rules = next;
+                errors.extend(
+                    unknown
+                        .into_iter()
+                        .map(|id| Error::new(*file, ErrorKind::UnknownRule(id))),
+                );
+            }
+            Err(e) => errors.push(Error::new(
+                *file,
+                ErrorKind::Config(format!("`a11y` front matter: {e}")),
+            )),
+        }
     }
-    let path = blame("a11y.disable");
-    Err(LoadFailure {
-        errors: unknown
-            .into_iter()
-            .map(|id| Error::new(&path, ErrorKind::UnknownRule(id)))
-            .collect(),
-        from_defaults: false,
-    })
+    if errors.is_empty() {
+        Ok(rules)
+    } else {
+        Err(LoadFailure {
+            errors,
+            from_defaults: false,
+        })
+    }
 }
 
 /// A page is excluded when it is a draft itself or sits under a folder drafted by `_dir.toml` or by its `index.md`.

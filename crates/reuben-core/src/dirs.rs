@@ -108,6 +108,17 @@ impl DirDefaults {
         layered
     }
 
+    /// The `_dir.toml` files that apply to pages directly in `rel_dir`, as (values, file), outermost first.
+    pub(crate) fn layers_for(&self, rel_dir: &Path) -> Vec<(&Map<String, Value>, &Path)> {
+        let mut chain: Vec<&Path> = rel_dir.ancestors().collect();
+        chain.reverse();
+        chain
+            .into_iter()
+            .filter_map(|dir| self.folders.get(dir))
+            .map(|file| (&file.value, file.source.as_path()))
+            .collect()
+    }
+
     pub(crate) fn broken(&self) -> &BTreeSet<PathBuf> {
         &self.broken
     }

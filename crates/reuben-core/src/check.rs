@@ -37,7 +37,8 @@ type SortKey = (
 );
 
 /// Orders findings by path, then line and column (a finding with no location counts as line 0 and is ordered by its
-/// built line), then rule and message, and drops repeats, so the result doesn't depend on render order.
+/// built line, which stands in for a location), then rule and message, and drops repeats, so the result doesn't
+/// depend on render order.
 pub fn sort(findings: &mut Vec<Finding>) {
     let key = |f: &Finding| -> SortKey {
         let (line, column) = f.location.map_or((0, 0), |s| (s.line, s.column));
@@ -382,7 +383,8 @@ fn generated_pieces(
 }
 
 /// Parses `pieces` as HTML and adds the items found. With `offset`, an item's line is the node's line plus its line
-/// within the HTML; otherwise every item is at the node's line.
+/// within the HTML; otherwise every item is at the node's line. An item from an include is always at the node's line
+/// (the include call), because lines in include output aren't lines of the page.
 fn fragment(
     pieces: &[(String, Option<usize>)],
     origins: &[Origin],
@@ -394,7 +396,7 @@ fn fragment(
     for item in fragment_items(&refs) {
         items.push(map_at(item, |(label, line)| At {
             span: Span {
-                line: if offset {
+                line: if offset && label.is_none() {
                     span.line + line - 1
                 } else {
                     span.line
@@ -508,6 +510,29 @@ mod tests {
             })
             .collect();
         assert_eq!(includes, [("/c/", Some(origin)), ("/d/", None)]);
+    }
+
+    #[test]
+    fn multi_line_include_output_is_located_at_the_call() {
+        let html = "<div>\n<p>text</p>\n<h2>Deep</h2></div>";
+        let origin = Origin {
+            file: "includes/card.rhai".into(),
+            line: 7,
+        };
+        let outputs = [Output::Html(Markup {
+            html: html.into(),
+            origins: vec![(0..html.len(), origin.clone())],
+        })];
+        let found = items(&format!("one\n\n{}\n", placeholder(0)), &outputs);
+        assert_eq!(
+            found,
+            [Item::Heading {
+                level: 2,
+                id: String::new(),
+                text: "Deep".into(),
+                at: at(3, Some(origin)),
+            }]
+        );
     }
 
     #[test]

@@ -79,39 +79,34 @@ fn every_rule_fires_once() {
     }
     assert_eq!(all.len(), Rule::ALL.len(), "{all:#?}");
 
-    let page_wide = [
-        Rule::HtmlLang,
-        Rule::PageTitle,
-        Rule::SingleH1,
-        Rule::MainLandmark,
-        Rule::IdUnique,
-        Rule::FormLabel,
-        Rule::LinkTarget,
+    // (rule, page, source line for a tree-pass finding or built line for an HTML-pass one)
+    let source = |rule, line| (rule, "tree.md", Some(line), None);
+    let built = |rule, page, file, line| (rule, page, None, Some((file, line)));
+    let expected = [
+        source(Rule::HeadingOrder, 6),
+        source(Rule::LinkText, 10),
+        source(Rule::ImgAlt, 12),
+        source(Rule::HeadingIdUnique, 8),
+        source(Rule::TableHeader, 16),
+        built(Rule::HtmlLang, "bare.md", "bare/index.html", 1),
+        built(Rule::PageTitle, "bare.md", "bare/index.html", 1),
+        built(Rule::SingleH1, "bare.md", "bare/index.html", 1),
+        built(Rule::MainLandmark, "bare.md", "bare/index.html", 1),
+        built(Rule::IdUnique, "bare.md", "bare/index.html", 2),
+        built(Rule::FormLabel, "bare.md", "bare/index.html", 2),
+        built(Rule::LinkTarget, "tree.md", "tree/index.html", 17),
     ];
-    for f in &all {
-        let expected = if page_wide.contains(&f.rule) {
-            "bare.md"
-        } else {
-            "tree.md"
-        };
-        if f.rule == Rule::LinkTarget {
-            assert_eq!(names(&f.path), "tree.md");
-        } else {
-            assert_eq!(names(&f.path), expected, "{f:?}");
-        }
-        if page_wide.contains(&f.rule) {
-            let (file, line) = f.built.as_ref().expect("HTML-pass finding has `built`");
-            assert!(file.ends_with("index.html"), "{f:?}");
-            assert!(*line >= 1);
-            assert_eq!(f.location, None);
-        } else {
-            assert_eq!(f.built, None);
-            assert!(f.location.unwrap().line >= 5, "{f:?}");
-        }
+    for (rule, page, line, built) in expected {
+        let f = with_rule(&all, rule)[0];
+        assert_eq!(names(&f.path), page, "{f:?}");
+        assert_eq!(f.location.map(|s| s.line), line, "{f:?}");
+        assert_eq!(
+            f.built.as_ref().map(|(p, l)| (p.to_str().unwrap(), *l)),
+            built,
+            "{f:?}"
+        );
+        assert_eq!(f.include, None);
     }
-    let order = with_rule(&all, Rule::HeadingOrder)[0];
-    assert_eq!(order.location.unwrap().line, 6);
-    assert_eq!(order.include, None);
 }
 
 #[test]
@@ -269,4 +264,61 @@ fn findings_are_identical_across_jobs() {
     let many = render_with(&tmp, false, None).unwrap().findings;
     assert!(one.len() >= 40, "{} findings", one.len());
     assert_eq!(one, many);
+}
+
+#[test]
+fn rule_switches_accumulate_per_layer() {
+    let page = "---\ntitle: T\na11y:\n  disable: [img-alt]\n---\n# T\n\n[click here](/quiet/a/) ![](a.png)\n";
+    let tmp = site(&[
+        (
+            "content/quiet/_dir.toml",
+            "[a11y]\ndisable = [\"link-text\"]\n",
+        ),
+        ("content/quiet/a.md", page),
+    ]);
+    assert_eq!(findings(&tmp), vec![]);
+}
+
+#[test]
+fn unknown_id_in_a_dir_toml_survives_a_page_override() {
+    let tmp = site(&[
+        ("content/docs/_dir.toml", "[a11y]\ndisable = [\"nope\"]\n"),
+        (
+            "content/docs/a.md",
+            "---\ntitle: A\na11y:\n  disable: [img-alt, also-nope]\n---\n# A\n",
+        ),
+    ]);
+    let failure = render_with(&tmp, false, None).unwrap_err();
+    let mut found: Vec<(String, String)> = failure
+        .iter()
+        .map(|e| {
+            (
+                names(&e.path),
+                e.to_string().split_once(": ").unwrap().1.to_string(),
+            )
+        })
+        .collect();
+    found.sort();
+    assert_eq!(
+        found,
+        [
+            (
+                "_dir.toml".to_string(),
+                "unknown accessibility rule `nope`".to_string()
+            ),
+            (
+                "a.md".to_string(),
+                "unknown accessibility rule `also-nope`".to_string()
+            ),
+        ]
+    );
+}
+
+#[test]
+fn every_unknown_config_id_is_reported() {
+    let tmp = site(&[("reuben.toml", "[a11y]\ndisable = [\"a\", \"b\"]\n")]);
+    let errors = Site::load(tmp.path()).unwrap_err();
+    let text = errors[0].to_string();
+    assert!(text.contains("unknown accessibility rule `a`"), "{text}");
+    assert!(text.contains("unknown accessibility rule `b`"), "{text}");
 }

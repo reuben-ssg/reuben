@@ -139,12 +139,14 @@ pub fn load(root: &Path, env: Option<&str>) -> Result<Config, Error> {
         ));
     }
     let (a11y, unknown) = crate::check::switch_off(RuleSet::all(), &raw.a11y.disable);
-    if let Some(id) = unknown.first() {
+    if !unknown.is_empty() {
         let blamed = layered.sources.get("a11y.disable").unwrap_or(&path);
-        return Err(Error::new(
-            blamed,
-            ErrorKind::Config(format!("unknown accessibility rule `{id}`")),
-        ));
+        let message = unknown
+            .iter()
+            .map(|id| format!("unknown accessibility rule `{id}`"))
+            .collect::<Vec<_>>()
+            .join("; ");
+        return Err(Error::new(blamed, ErrorKind::Config(message)));
     }
     Ok(Config {
         title: raw.title.unwrap_or_default(),
