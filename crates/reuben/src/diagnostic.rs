@@ -1,5 +1,8 @@
 //! Rust-style rendering of build errors with source snippets.
 
+use std::path::Path;
+
+use reuben_core::check::Finding;
 use reuben_core::doc::Span;
 use reuben_core::script::Frame;
 use reuben_core::{Error, ErrorKind};
@@ -19,19 +22,7 @@ pub fn render(error: &Error, source: Option<&str>) -> String {
         } => (message, *location, &[]),
         _ => return plain(error),
     };
-    let width = span.line.to_string().len();
-    let pad = " ".repeat(width + 1);
-    let mut out = format!(
-        "error: {message}\n{pad}--> {}:{}:{}\n",
-        error.path.display(),
-        span.line,
-        span.column
-    );
-    let text = source.and_then(|s| s.lines().nth(span.line.saturating_sub(1)));
-    if let Some(text) = text {
-        out += &format!("{pad}|\n{} | {text}\n", span.line);
-        out += &format!("{pad}| {}^\n", " ".repeat(span.column.saturating_sub(1)));
-    }
+    let (mut out, pad) = located("error", message, &error.path, span, source);
     for f in stack {
         out += &format!(
             "{pad}= in include `{}` ({}:{}:{})\n",
@@ -40,6 +31,56 @@ pub fn render(error: &Error, source: Option<&str>) -> String {
             f.line,
             f.column
         );
+    }
+    out
+}
+
+/// The heading, `-->` line and source snippet shared by errors and findings, plus the gutter padding for lines
+/// that follow.
+fn located(
+    kind: &str,
+    message: &str,
+    path: &Path,
+    span: Span,
+    source: Option<&str>,
+) -> (String, String) {
+    let width = span.line.to_string().len();
+    let pad = " ".repeat(width + 1);
+    let mut out = format!(
+        "{kind}: {message}\n{pad}--> {}:{}:{}\n",
+        path.display(),
+        span.line,
+        span.column
+    );
+    let text = source.and_then(|s| s.lines().nth(span.line.saturating_sub(1)));
+    if let Some(text) = text {
+        out += &format!("{pad}|\n{} | {text}\n", span.line);
+        out += &format!("{pad}| {}^\n", " ".repeat(span.column.saturating_sub(1)));
+    }
+    (out, pad)
+}
+
+/// Formats an accessibility finding as a warning; `source` is the text of `finding.path`, when it could be read.
+/// The include note names its file relative to the site `root`.
+pub fn render_finding(finding: &Finding, source: Option<&str>, root: &Path) -> String {
+    let kind = format!("warning[{}]", finding.rule.id());
+    let (mut out, pad) = match finding.location {
+        Some(span) => located(&kind, &finding.message, &finding.path, span, source),
+        None => {
+            let mut out = format!(
+                "{kind}: {}\n  --> {}",
+                finding.message,
+                finding.path.display()
+            );
+            if let Some((built, line)) = &finding.built {
+                out += &format!(" (built as {}, line {line})", built.display());
+            }
+            (out + "\n", "  ".to_string())
+        }
+    };
+    if let Some(origin) = &finding.include {
+        let file = origin.file.strip_prefix(root).unwrap_or(&origin.file);
+        out += &format!("{pad}= note: from {}:{}\n", file.display(), origin.line);
     }
     out
 }
@@ -125,6 +166,38 @@ mod tests {
         );
         assert!(
             render(&err, Some("x\n")).ends_with("  = in include `fail` (includes/fail.rhai:3:5)\n")
+        );
+    }
+
+    #[test]
+    fn renders_findings_with_snippet_note_and_built_location() {
+        use reuben_a11y::Rule;
+        use reuben_core::doc::Origin;
+
+        let tree = Finding {
+            path: "content/p.md".into(),
+            location: Some(Span { line: 2, column: 1 }),
+            rule: Rule::LinkText,
+            message: "bad link".into(),
+            include: Some(Origin {
+                file: "/site/includes/card.rhai".into(),
+                line: 2,
+            }),
+            built: None,
+        };
+        assert_eq!(
+            render_finding(&tree, Some("x\n{{ card() }}\n"), Path::new("/site")),
+            "warning[link-text]: bad link\n  --> content/p.md:2:1\n  |\n2 | {{ card() }}\n  | ^\n  = note: from includes/card.rhai:2\n"
+        );
+        let html = Finding {
+            location: None,
+            include: None,
+            built: Some(("a/index.html".into(), 14)),
+            ..tree
+        };
+        assert_eq!(
+            render_finding(&html, None, Path::new("/site")),
+            "warning[link-text]: bad link\n  --> content/p.md (built as a/index.html, line 14)\n"
         );
     }
 

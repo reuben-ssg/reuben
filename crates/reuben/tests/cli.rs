@@ -163,3 +163,45 @@ fn a_css_error_found_directly_and_through_an_import_is_one_error() {
         .stderr(predicates::str::contains("./static/a.css"))
         .stderr(predicates::str::ends_with("Found 1 error in 1 file\n"));
 }
+
+#[test]
+fn build_warns_but_succeeds() {
+    use assert_fs::prelude::*;
+    let tmp = assert_fs::TempDir::new().unwrap();
+    tmp.child("content/a.md")
+        .write_str("---\ntitle: A\n---\n# A\n\n[click here](/a/)\n")
+        .unwrap();
+    reuben()
+        .args(["build", "--root"])
+        .arg(tmp.path())
+        .assert()
+        .success()
+        .stderr(predicates::str::contains("warning[link-text]"))
+        .stderr(predicates::str::contains(
+            "1 accessibility warning in 1 file",
+        ));
+    assert!(tmp.path().join("dist/a/index.html").is_file());
+}
+
+#[test]
+fn failed_build_still_ends_with_error_summary() {
+    use assert_fs::prelude::*;
+    let tmp = assert_fs::TempDir::new().unwrap();
+    tmp.child("content/a.md")
+        .write_str("---\ntitle: A\n---\n# A\n\n[click here](/a/)\n")
+        .unwrap();
+    tmp.child("content/b.md")
+        .write_str("---\ntitle: B\n---\n{{ nope( }}\n")
+        .unwrap();
+    let out = reuben()
+        .args(["build", "--root"])
+        .arg(tmp.path())
+        .assert()
+        .code(1)
+        .get_output()
+        .clone();
+    let stderr = String::from_utf8_lossy(&out.stderr).to_string();
+    let lines: Vec<&str> = stderr.lines().collect();
+    assert_eq!(lines[lines.len() - 1], "Found 1 error in 1 file");
+    assert_eq!(lines[lines.len() - 2], "1 accessibility warning in 1 file");
+}

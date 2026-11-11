@@ -16,6 +16,7 @@ clap.workspace = true
 reuben-core.workspace = true
 
 [dev-dependencies]
+reuben-a11y.workspace = true
 assert_cmd.workspace = true
 predicates.workspace = true
 assert_fs.workspace = true
