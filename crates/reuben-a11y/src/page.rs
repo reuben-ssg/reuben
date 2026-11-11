@@ -43,6 +43,7 @@ pub fn check_page(html: &str, rules: &RuleSet, reported_ids: &HashSet<String>) -
     let mut title_seen = false;
     let mut title_text = String::new();
     let mut in_title = false;
+    let mut svg_depth = 0usize;
     let mut h1_lines: Vec<usize> = Vec::new();
     let mut main_seen = false;
     let mut seen_ids: HashSet<String> = HashSet::new();
@@ -58,7 +59,8 @@ pub fn check_page(html: &str, rules: &RuleSet, reported_ids: &HashSet<String>) -
                         html_tag_seen = true;
                         html_lang_ok |= non_blank(&tag, "lang");
                     }
-                    "title" => {
+                    "svg" => svg_depth += 1,
+                    "title" if svg_depth == 0 => {
                         title_seen = true;
                         in_title = true;
                     }
@@ -121,6 +123,7 @@ pub fn check_page(html: &str, rules: &RuleSet, reported_ids: &HashSet<String>) -
             }
             Event::End(name) => match name.as_str() {
                 "title" => in_title = false,
+                "svg" => svg_depth = svg_depth.saturating_sub(1),
                 "label" => label_depth = label_depth.saturating_sub(1),
                 _ => {}
             },
@@ -323,6 +326,61 @@ mod tests {
         rules.disable(Rule::LinkTarget);
         let html = GOOD.replace("<p id=\"a\">x</p>", "<a href=\"/a/\">a</a>");
         assert!(check_page(&html, &rules, &HashSet::new()).links.is_empty());
+    }
+
+    #[test]
+    fn an_svg_title_is_not_the_page_title() {
+        let html = "<html lang=en><body><main><h1>x</h1><svg><title>Menu</title></svg></main>";
+        assert_eq!(rules_of(&check(html)), [Rule::PageTitle]);
+        let empty = "<html lang=en><title> </title><body><main><h1>x</h1><svg><title>Menu</title></svg></main>";
+        assert_eq!(rules_of(&check(empty)), [Rule::PageTitle]);
+    }
+
+    #[test]
+    fn an_h1_inside_an_svg_title_does_not_count() {
+        let html = GOOD.replace(
+            "<p id=\"a\">x</p>",
+            "<svg><title><h1>icon</h1></title></svg>",
+        );
+        assert_eq!(check(&html).findings, []);
+    }
+
+    #[test]
+    fn comments_and_style_hide_markup() {
+        let report = with_body(
+            "<!-- <a href=\"/c/\">c</a><h1>c</h1> --><style>/* <a href=\"/s/\"> <h1> */</style><a href=\"/real/\">r</a>",
+        );
+        assert_eq!(report.findings, []);
+        assert_eq!(report.links.len(), 1);
+        assert_eq!(report.links[0].href, "/real/");
+    }
+
+    #[test]
+    fn uppercase_markup_is_treated_like_lowercase() {
+        let html = "<HTML LANG=en><TITLE>T</TITLE><MAIN><H1>T</H1><INPUT TYPE=HIDDEN></MAIN>";
+        assert_eq!(check(html).findings, []);
+        let bare = "<HTML LANG=en><TITLE>T</TITLE><MAIN><H1>T</H1><INPUT></MAIN>";
+        assert_eq!(rules_of(&check(bare)), [Rule::FormLabel]);
+    }
+
+    #[test]
+    fn unclosed_tags_and_unquoted_attributes_do_not_panic() {
+        let html = "<html lang=en><title>T<main><h1 class=a>T<p id=x><a href=/y/>y<input type=text";
+        let report = check(html);
+        assert!(report.findings.iter().all(|f| f.line >= 1));
+        let _ = check("<a href=\"/x/");
+        let _ = check("<");
+        let _ = check("");
+    }
+
+    #[test]
+    fn skip_links_and_decorated_links() {
+        let report = with_body(
+            "<a href=\"#main\">skip</a><a href=\"/a/?q=1\">a</a><a href=\"/b/#sec\">b</a>",
+        );
+        assert_eq!(report.findings, []);
+        let hrefs: Vec<&str> = report.links.iter().map(|l| l.href.as_str()).collect();
+        assert_eq!(hrefs, ["/a/?q=1", "/b/#sec"]);
     }
 
     #[test]
