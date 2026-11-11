@@ -2,8 +2,7 @@
 
 use assert_fs::TempDir;
 use assert_fs::prelude::*;
-use reuben_core::Error;
-use reuben_core::site::{BuildOptions, RenderOptions, Site};
+use reuben_core::site::{BuildOptions, Failure, RenderOptions, Site};
 
 fn site_of(files: &[(&str, &str)]) -> TempDir {
     let tmp = TempDir::new().unwrap();
@@ -13,7 +12,7 @@ fn site_of(files: &[(&str, &str)]) -> TempDir {
     tmp
 }
 
-fn build(tmp: &TempDir) -> Result<(), Vec<Error>> {
+fn build(tmp: &TempDir) -> Result<(), Failure> {
     Site::load(tmp.path())?
         .build(&BuildOptions {
             drafts: false,

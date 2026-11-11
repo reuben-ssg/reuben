@@ -35,6 +35,8 @@ pub enum ErrorKind {
     Config(String),
     #[error("data: {0}")]
     Data(String),
+    #[error("unknown accessibility rule `{0}`")]
+    UnknownRule(String),
     #[error("layout `{0}` not found in the site or its theme")]
     LayoutNotFound(String),
     #[error("invalid layout name `{0}`: a layout is a plain file name in `layouts/`")]
@@ -72,6 +74,7 @@ impl Clone for ErrorKind {
             },
             Self::Config(s) => Self::Config(s.clone()),
             Self::Data(s) => Self::Data(s.clone()),
+            Self::UnknownRule(s) => Self::UnknownRule(s.clone()),
             Self::LayoutNotFound(s) => Self::LayoutNotFound(s.clone()),
             Self::InvalidLayoutName(s) => Self::InvalidLayoutName(s.clone()),
             Self::UnsplicedPlaceholder => Self::UnsplicedPlaceholder,

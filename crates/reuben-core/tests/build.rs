@@ -3,7 +3,7 @@ use std::path::{Path, PathBuf};
 
 use assert_fs::TempDir;
 use assert_fs::prelude::*;
-use reuben_core::site::{BuildOptions, BuildReport, OUTPUT_MARKER, Site};
+use reuben_core::site::{BuildOptions, BuildReport, Failure, OUTPUT_MARKER, Site};
 use reuben_core::{Error, ErrorKind};
 
 const SITEMAP_WARNING: &str =
@@ -18,7 +18,7 @@ fn fixture(name: &str) -> TempDir {
     tmp
 }
 
-fn build(root: &Path, drafts: bool) -> Result<BuildReport, Vec<Error>> {
+fn build(root: &Path, drafts: bool) -> Result<BuildReport, Failure> {
     let site = Site::load(root)?;
     site.build(&BuildOptions {
         drafts,
@@ -46,7 +46,8 @@ fn builds_basic_site() {
             pages_written: 3,
             static_copied: 2,
             drafts_skipped: 1,
-            warnings: vec![SITEMAP_WARNING.into()]
+            warnings: vec![SITEMAP_WARNING.into()],
+            findings: vec![],
         }
     );
     let out = tmp.path().join("dist");

@@ -47,6 +47,18 @@ pub fn render_with(doc: &Document, highlighter: &dyn Highlighter) -> String {
     out
 }
 
+/// Renders one node on its own, for stages that need a part of the page as HTML.
+pub(crate) fn render_node(node: &Node) -> String {
+    let mut out = String::new();
+    block(
+        &mut out,
+        node,
+        false,
+        &RenderCtx::of(node, default_highlighter()),
+    );
+    out
+}
+
 pub fn escape_text(s: &str) -> Cow<'_, str> {
     escape(s)
 }

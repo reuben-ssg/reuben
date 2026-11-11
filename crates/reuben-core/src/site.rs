@@ -10,6 +10,9 @@ use walkdir::WalkDir;
 
 use std::sync::Arc;
 
+use reuben_a11y::{LocalLink, RuleSet};
+
+use crate::check::{self, Finding, TreeReport};
 use crate::collections;
 use crate::config::{self, Config};
 use crate::css::{self, CssInput, CssJob, CssTemplates, is_css, is_partial_css};
@@ -60,6 +63,8 @@ pub struct Page {
     pub pre_block_toc: Vec<TocEntry>,
     /// Front matter `description`, else the first paragraph's text, computed once at load.
     pub summary: String,
+    /// The accessibility rules checked on this page: the config's, minus the page's own `a11y.disable`.
+    pub rules: RuleSet,
 }
 
 #[derive(Debug)]
@@ -112,6 +117,51 @@ pub struct BuildReport {
     pub static_copied: usize,
     pub drafts_skipped: usize,
     pub warnings: Vec<String>,
+    /// Accessibility findings, sorted. They never fail a build.
+    pub findings: Vec<Finding>,
+}
+
+/// A failed render or build: every error found, plus the accessibility findings of the pages that did render.
+/// Derefs to the errors, since they are what made it fail.
+#[derive(Debug)]
+pub struct Failure {
+    pub errors: Vec<Error>,
+    pub findings: Vec<Finding>,
+}
+
+impl std::ops::Deref for Failure {
+    type Target = Vec<Error>;
+
+    fn deref(&self) -> &Vec<Error> {
+        &self.errors
+    }
+}
+
+impl From<Vec<Error>> for Failure {
+    fn from(errors: Vec<Error>) -> Self {
+        Self {
+            errors,
+            findings: Vec::new(),
+        }
+    }
+}
+
+/// A page's rendered text and what the checks found in it.
+struct Rendered {
+    html: String,
+    findings: Vec<Finding>,
+    /// Local links of the page, to be checked once every output file is known.
+    links: Vec<LocalLink>,
+}
+
+impl Rendered {
+    fn unchecked(html: String) -> Self {
+        Self {
+            html,
+            findings: Vec::new(),
+            links: Vec::new(),
+        }
+    }
 }
 
 impl Site {
@@ -171,9 +221,9 @@ impl Site {
                 continue;
             }
             let loaded = if is_markdown {
-                load_page(&path, &rel, Some(&dirs), PageKind::Markdown).map(Some)
+                load_page(&path, &rel, Some(&dirs), PageKind::Markdown, config.a11y).map(Some)
             } else {
-                load_template(&path, &rel, Some(&dirs))
+                load_template(&path, &rel, Some(&dirs), config.a11y)
             };
             match loaded {
                 Ok(Some(page)) => pages.push(page),
@@ -183,7 +233,7 @@ impl Site {
                 Err(f)
                     if f.from_defaults
                         && dirs.folder_broken(rel.parent().unwrap_or(Path::new(""))) => {}
-                Err(f) => errors.push(f.error),
+                Err(f) => errors.extend(f.errors),
             }
         }
         mark_draft_excluded(&mut pages, &dirs);
@@ -202,13 +252,13 @@ impl Site {
                 if is_junk(&rel) {
                     continue;
                 }
-                match load_template(&path, &rel, None) {
+                match load_template(&path, &rel, None, config.a11y) {
                     Ok(Some(mut page)) => {
                         page.draft_excluded = page.front_matter.draft;
                         pages.push(page);
                     }
                     Ok(None) => static_files.push(rel),
-                    Err(f) => errors.push(f.error),
+                    Err(f) => errors.extend(f.errors),
                 }
             }
         }
@@ -250,7 +300,7 @@ impl Site {
     }
 
     /// Renders the whole site into memory. Nothing touches the disk.
-    pub fn render(&self, opts: &RenderOptions) -> Result<(Output, BuildReport), Vec<Error>> {
+    pub fn render(&self, opts: &RenderOptions) -> Result<(Output, BuildReport), Failure> {
         let (pages, drafts): (Vec<&Page>, Vec<&Page>) = self
             .pages
             .iter()
@@ -268,10 +318,10 @@ impl Site {
             data: &self.data.value,
             collections: &collections,
         };
-        let render_one = |page: &&Page| -> Result<String, Vec<Error>> {
-            let html = self.render_page(page, &scopes)?;
+        let render_one = |page: &&Page| -> Result<Rendered, Vec<Error>> {
+            let (html, tree) = self.render_page(page, &scopes)?;
             splice::ensure_no_placeholders(&page.source, &html).map_err(|e| vec![e])?;
-            Ok(html)
+            Ok(check_html(page, html, tree))
         };
         // A pool that can't start is reported, and the build carries on with rayon's default pool.
         let pool =
@@ -288,7 +338,7 @@ impl Site {
                 },
             );
         // Skipped pages count as failed with nothing to add, so templated partials still import as empty.
-        let rendered: Vec<Result<String, Vec<Error>>> = if self.includes_broken {
+        let rendered: Vec<Result<Rendered, Vec<Error>>> = if self.includes_broken {
             pages.iter().map(|_| Err(Vec::new())).collect()
         } else {
             in_pool(pool.as_ref(), || pages.par_iter().map(render_one).collect())
@@ -310,7 +360,9 @@ impl Site {
                 .collect(),
         };
         let mut partial_pages = 0;
-        // Merged in page order so neither output nor errors depend on which thread finished first.
+        let mut findings: Vec<Finding> = Vec::new();
+        let mut page_links: Vec<(&Page, Vec<LocalLink>)> = Vec::new();
+        // Merged in page order so neither output, errors nor findings depend on which thread finished first.
         for (page, result) in pages.iter().zip(rendered) {
             let is_partial = is_partial_css(&page.route.file);
             partial_pages += usize::from(is_partial);
@@ -321,25 +373,27 @@ impl Site {
             if is_css(&page.route.file) {
                 let text = result
                     .as_ref()
-                    .map_or_else(|_| String::new(), String::clone);
+                    .map_or_else(|_| String::new(), |r| r.html.clone());
                 templates
                     .rendered
                     .insert(css::normalize(&page.source), text);
             }
             match result {
                 Ok(_) if is_partial => {}
-                Ok(html) if is_css(&page.route.file) => {
+                Ok(done) if is_css(&page.route.file) => {
                     css_jobs.push(self.css_job(
                         &page.route.file,
                         &page.source,
                         page.from_static,
-                        CssInput::Text(html),
+                        CssInput::Text(done.html),
                     ));
                 }
-                Ok(html) => {
+                Ok(done) => {
+                    findings.extend(done.findings);
+                    page_links.push((page, done.links));
                     output.files.insert(
                         page.route.file.clone(),
-                        OutputFile::Bytes(html.into_bytes()),
+                        OutputFile::Bytes(done.html.into_bytes()),
                     );
                 }
                 Err(mut e) => errors.append(&mut e),
@@ -412,21 +466,38 @@ impl Site {
             }
         }
 
+        // A failed build is missing pages, so a link to one would be reported as broken for no fault of the page.
+        if errors.is_empty() {
+            let base = check::base_path(&self.config.base_url);
+            for (page, links) in &page_links {
+                findings.extend(check::unbuilt_links(
+                    &page.source,
+                    &page.route.file,
+                    &page.route.url,
+                    &base,
+                    links,
+                    |key| output.files.contains_key(Path::new(key)),
+                ));
+            }
+        }
+        check::sort(&mut findings);
+
         if !errors.is_empty() {
             Error::sort(&mut errors);
-            return Err(errors);
+            return Err(Failure { errors, findings });
         }
         let report = BuildReport {
             pages_written: pages.len() - partial_pages,
             static_copied,
             drafts_skipped: drafts.len(),
             warnings,
+            findings,
         };
         Ok((output, report))
     }
 
     /// Renders the site and swaps it into `opts.out`. A failed build leaves the previous output untouched.
-    pub fn build(&self, opts: &BuildOptions) -> Result<BuildReport, Vec<Error>> {
+    pub fn build(&self, opts: &BuildOptions) -> Result<BuildReport, Failure> {
         let out_error = check_out_dir(&opts.out).err();
         let rendered = self.render(&RenderOptions {
             drafts: opts.drafts,
@@ -434,14 +505,22 @@ impl Site {
         });
         let (output, report) = match (rendered, out_error) {
             (Ok(done), None) => done,
-            (Ok(_), Some(e)) => return Err(vec![e]),
-            (Err(mut errors), out_error) => {
-                errors.extend(out_error);
-                Error::sort(&mut errors);
-                return Err(errors);
+            (Ok((_, report)), Some(e)) => {
+                return Err(Failure {
+                    errors: vec![e],
+                    findings: report.findings,
+                });
+            }
+            (Err(mut failure), out_error) => {
+                failure.errors.extend(out_error);
+                Error::sort(&mut failure.errors);
+                return Err(failure);
             }
         };
-        write_atomic(&output, &opts.out)?;
+        write_atomic(&output, &opts.out).map_err(|errors| Failure {
+            errors,
+            findings: report.findings.clone(),
+        })?;
         Ok(report)
     }
 
@@ -460,22 +539,27 @@ impl Site {
             || statics.iter().any(|(rel, _)| is_sitemap(rel))
     }
 
-    /// Renders one page or template to its final output text, layout included.
+    /// Renders one page or template to its final output text, layout included. A Markdown page also returns what the
+    /// tree pass found in its final body tree.
     fn render_page(
         &self,
         page: &Page,
         scopes: &page::SiteScopes<'_>,
-    ) -> Result<String, Vec<Error>> {
-        let (body, mut scope, layout_name) = match page.kind {
+    ) -> Result<(String, Option<TreeReport>), Vec<Error>> {
+        let (body, mut scope, layout_name, tree) = match page.kind {
             PageKind::Markdown => {
-                let page::RenderedBody { doc, scope, .. } =
-                    page::render_body(page, &self.engine, &self.config, scopes)?;
+                let page::RenderedBody {
+                    doc,
+                    scope,
+                    outputs,
+                } = page::render_body(page, &self.engine, &self.config, scopes)?;
                 let name = page
                     .front_matter
                     .layout
                     .as_deref()
                     .or_else(|| collections::layout_of(&page.rel, &self.config));
-                (html::render(&doc), scope, name)
+                let tree = check::tree_pass(&page.source, &page.rules, &doc, &outputs);
+                (html::render(&doc), scope, name, Some(tree))
             }
             PageKind::Template { escape } => {
                 let (text, scope) =
@@ -485,9 +569,9 @@ impl Site {
                 let own = page.front_matter_sources.get("layout") == Some(&page.source);
                 let name = page.front_matter.layout.as_deref().filter(|_| own);
                 if name.is_none() {
-                    return Ok(text);
+                    return Ok((text, None));
                 }
-                (text, scope, name)
+                (text, scope, name, None)
             }
         };
         let layout = layout::find_layout(layout_name, &self.root, self.config.theme.as_deref())
@@ -495,18 +579,20 @@ impl Site {
                 e.path.clone_from(&page.source);
                 vec![e]
             })?;
-        match (layout, page.kind) {
+        let html = match (layout, page.kind) {
             (Some(path), _) => {
-                layout::render_layout(&path, &self.engine, &mut scope, Html::new(body))
+                layout::render_layout(&path, &self.engine, &mut scope, Html::new(body))?
             }
-            (None, PageKind::Markdown) => Ok(builtin_page(&PageShell {
+            (None, PageKind::Markdown) => builtin_page(&PageShell {
                 title: &page.front_matter.title,
                 lang: "en",
                 description: page.front_matter.description.as_deref(),
                 body: &body,
-            })),
-            (None, PageKind::Template { .. }) => Ok(body),
-        }
+                body_has_h1: tree.as_ref().is_some_and(|t| t.has_h1),
+            }),
+            (None, PageKind::Template { .. }) => body,
+        };
+        Ok((html, tree))
     }
 
     fn css_job(
@@ -605,6 +691,33 @@ impl Site {
     }
 }
 
+/// Runs the HTML pass on a page's finished text, with the tree pass's findings. Only HTML pages are checked:
+/// Markdown pages and `.html` templates. Other templates are CSS, XML and the like.
+fn check_html(page: &Page, html: String, tree: Option<TreeReport>) -> Rendered {
+    let is_html = match page.kind {
+        PageKind::Markdown => true,
+        PageKind::Template { .. } => page.route.file.extension().is_some_and(|e| e == "html"),
+    };
+    if !is_html {
+        return Rendered::unchecked(html);
+    }
+    let (mut findings, reported_ids) =
+        tree.map_or_else(Default::default, |t| (t.findings, t.reported_ids));
+    let report = check::html_pass(
+        &page.source,
+        &page.route.file,
+        &html,
+        &page.rules,
+        &reported_ids,
+    );
+    findings.extend(report.findings);
+    Rendered {
+        html,
+        findings,
+        links: report.links,
+    }
+}
+
 fn in_pool<R: Send>(pool: Option<&rayon::ThreadPool>, f: impl FnOnce() -> R + Send) -> R {
     match pool {
         Some(pool) => pool.install(f),
@@ -638,14 +751,14 @@ fn walk(dir: &Path, errors: &mut Vec<Error>) -> Vec<(PathBuf, PathBuf)> {
 /// Why a page didn't load. `from_defaults` marks a failure in the merged front matter, which a broken `_dir.toml`
 /// can cause; reading and parsing the file itself never depends on folder defaults.
 struct LoadFailure {
-    error: Error,
+    errors: Vec<Error>,
     from_defaults: bool,
 }
 
 impl From<Error> for LoadFailure {
     fn from(error: Error) -> Self {
         Self {
-            error,
+            errors: vec![error],
             from_defaults: false,
         }
     }
@@ -657,6 +770,7 @@ fn load_template(
     path: &Path,
     rel: &Path,
     dirs: Option<&DirDefaults>,
+    rules: RuleSet,
 ) -> Result<Option<Page>, LoadFailure> {
     let io = |e: std::io::Error| Error::new(path, e);
     // Most static files are binary, so read just enough to rule them out before loading the rest.
@@ -676,7 +790,7 @@ fn load_template(
     let kind = PageKind::Template {
         escape: template::escape_for(rel),
     };
-    load_page_from(path, rel, bytes, dirs, kind).map(Some)
+    load_page_from(path, rel, bytes, dirs, kind, rules).map(Some)
 }
 
 fn load_page(
@@ -684,17 +798,20 @@ fn load_page(
     rel: &Path,
     dirs: Option<&DirDefaults>,
     kind: PageKind,
+    rules: RuleSet,
 ) -> Result<Page, LoadFailure> {
     let bytes = fs::read(path).map_err(|e| Error::new(path, e))?;
-    load_page_from(path, rel, bytes, dirs, kind)
+    load_page_from(path, rel, bytes, dirs, kind, rules)
 }
 
+/// `rules` are the accessibility rules the config leaves on; the page's merged `a11y.disable` switches more off.
 fn load_page_from(
     path: &Path,
     rel: &Path,
     bytes: Vec<u8>,
     dirs: Option<&DirDefaults>,
     kind: PageKind,
+    rules: RuleSet,
 ) -> Result<Page, LoadFailure> {
     let src = String::from_utf8(bytes).map_err(|_| Error::new(path, ErrorKind::NotUtf8))?;
     let raw = frontmatter::parse_raw(&src).map_err(|e| Error::new(path, e))?;
@@ -715,9 +832,10 @@ fn load_page_from(
         merged.value.insert("title".into(), name.into());
     }
     let front_matter = frontmatter::from_value(merged.value).map_err(|e| LoadFailure {
-        error: Error::new(path, e),
+        errors: vec![Error::new(path, e)],
         from_defaults: true,
     })?;
+    let rules = page_rules(rules, &front_matter, &merged.sources, path)?;
     let sidecar = Some(path.with_extension("rhai")).filter(|p| p.is_file());
     let route = match kind {
         PageKind::Markdown => route_for_page(rel),
@@ -737,6 +855,50 @@ fn load_page_from(
         draft_excluded: false,
         pre_block_toc: Vec::new(),
         summary: String::new(),
+        rules,
+    })
+}
+
+/// The merged front matter's `a11y` table, which may switch accessibility rules off for the page.
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PageA11y {
+    #[serde(default)]
+    disable: Vec<String>,
+}
+
+/// The rules on for a page: `base` minus the page's merged `a11y.disable`. Problems are blamed on the file that set
+/// the value (the page, or a `_dir.toml` above it), and every unknown id is reported.
+fn page_rules(
+    base: RuleSet,
+    front_matter: &FrontMatter,
+    sources: &BTreeMap<String, PathBuf>,
+    page: &Path,
+) -> Result<RuleSet, LoadFailure> {
+    let Some(table) = front_matter.extra.get("a11y") else {
+        return Ok(base);
+    };
+    let blame = |key: &str| {
+        sources
+            .get(key)
+            .or_else(|| sources.get("a11y"))
+            .map_or_else(|| page.to_path_buf(), Clone::clone)
+    };
+    let parsed: PageA11y = serde_json::from_value(table.clone()).map_err(|e| Error {
+        path: blame("a11y.disable"),
+        kind: ErrorKind::Config(format!("`a11y` front matter: {e}")),
+    })?;
+    let (rules, unknown) = check::switch_off(base, &parsed.disable);
+    if unknown.is_empty() {
+        return Ok(rules);
+    }
+    let path = blame("a11y.disable");
+    Err(LoadFailure {
+        errors: unknown
+            .into_iter()
+            .map(|id| Error::new(&path, ErrorKind::UnknownRule(id)))
+            .collect(),
+        from_defaults: false,
     })
 }
 
@@ -822,6 +984,7 @@ mod tests {
             draft_excluded: false,
             pre_block_toc: Vec::new(),
             summary: String::new(),
+            rules: RuleSet::all(),
         }
     }
 

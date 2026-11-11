@@ -15,7 +15,7 @@ use reuben_core::highlight;
 use reuben_core::output::Output;
 use reuben_core::serve::DevServer;
 use reuben_core::serve::watch::{Watcher, debounce};
-use reuben_core::site::{BuildOptions, BuildReport, LoadOptions, RenderOptions, Site};
+use reuben_core::site::{BuildOptions, BuildReport, Failure, LoadOptions, RenderOptions, Site};
 
 /// The tastiest SSG.
 #[derive(Parser)]
@@ -120,7 +120,8 @@ fn build(
         out: out.unwrap_or_else(|| root.join("dist")),
         jobs,
     };
-    match Site::load_with(&root, &LoadOptions { env }).and_then(|site| site.build(&opts)) {
+    let loaded = Site::load_with(&root, &LoadOptions { env }).map_err(Failure::from);
+    match loaded.and_then(|site| site.build(&opts)) {
         Ok(report) => {
             println!(
                 "{} in {}ms",
@@ -145,7 +146,7 @@ fn print_errors(errors: &[Error]) {
     eprintln!("{}", error_summary(errors));
 }
 
-type Rendered = Result<(Output, BuildReport), Vec<Error>>;
+type Rendered = Result<(Output, BuildReport), Failure>;
 
 /// One full load and render. The config comes back even when the render fails, so the watches can follow it.
 fn rebuild(
@@ -159,7 +160,7 @@ fn rebuild(
             let rendered = site.render(&RenderOptions { drafts, jobs });
             (Some(site.config), rendered)
         }
-        Err(errors) => (None, Err(errors)),
+        Err(errors) => (None, Err(errors.into())),
     }
 }
 
@@ -238,7 +239,7 @@ fn rebuild_and_serve(
                     .or_else(|| panic.downcast_ref::<String>().cloned())
                     .unwrap_or_else(|| "unknown panic".into());
                 eprintln!("error: rebuild panicked: {message}");
-                (None, Err(Vec::new()))
+                (None, Err(Vec::new().into()))
             });
     let synced = watcher.sync(config.as_ref(), env.as_deref());
     for problem in &synced.problems {

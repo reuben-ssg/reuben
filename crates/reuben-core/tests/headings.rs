@@ -2,7 +2,7 @@ use std::fs;
 
 use assert_fs::TempDir;
 use assert_fs::prelude::*;
-use reuben_core::site::{BuildOptions, Site};
+use reuben_core::site::{BuildOptions, Failure, Site};
 
 fn build(files: &[(&str, &str)], out: &str) -> String {
     let tmp = TempDir::new().unwrap();
@@ -120,7 +120,7 @@ fn smart_punctuation_slug() {
     assert!(html.contains("id=\"rye--its\""), "{html}");
 }
 
-fn try_build(files: &[(&str, &str)]) -> (TempDir, Result<(), Vec<reuben_core::Error>>) {
+fn try_build(files: &[(&str, &str)]) -> (TempDir, Result<(), Failure>) {
     let tmp = TempDir::new().unwrap();
     for (path, text) in files {
         tmp.child(path).write_str(text).unwrap();

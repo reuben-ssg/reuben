@@ -1939,6 +1939,7 @@ dependencies = [
  "notify",
  "pulldown-latex",
  "rayon",
+ "reuben-a11y",
  "rhai",
  "serde",
  "serde-saphyr",

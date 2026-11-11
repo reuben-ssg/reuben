@@ -3,8 +3,8 @@ use std::path::Path;
 
 use assert_fs::TempDir;
 use assert_fs::prelude::*;
-use reuben_core::site::{BuildOptions, Site};
-use reuben_core::{Error, ErrorKind};
+use reuben_core::ErrorKind;
+use reuben_core::site::{BuildOptions, Failure, Site};
 
 fn fixture(name: &str) -> TempDir {
     let tmp = TempDir::new().unwrap();
@@ -15,7 +15,7 @@ fn fixture(name: &str) -> TempDir {
     tmp
 }
 
-fn build(root: &Path) -> Result<(), Vec<Error>> {
+fn build(root: &Path) -> Result<(), Failure> {
     let site = Site::load(root)?;
     site.build(&BuildOptions {
         drafts: false,

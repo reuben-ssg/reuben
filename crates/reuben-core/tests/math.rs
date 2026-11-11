@@ -3,9 +3,9 @@ use std::fs;
 use assert_fs::TempDir;
 use assert_fs::prelude::*;
 use reuben_core::ErrorKind;
-use reuben_core::site::{BuildOptions, Site};
+use reuben_core::site::{BuildOptions, Failure, Site};
 
-fn try_build(body: &str) -> (TempDir, Result<(), Vec<reuben_core::Error>>) {
+fn try_build(body: &str) -> (TempDir, Result<(), Failure>) {
     let tmp = TempDir::new().unwrap();
     tmp.child("content/index.md").write_str(body).unwrap();
     let site = Site::load(tmp.path()).unwrap();

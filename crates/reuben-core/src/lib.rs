@@ -3,6 +3,7 @@
 #![forbid(unsafe_code)]
 
 pub mod blocks;
+pub mod check;
 pub mod collections;
 pub mod config;
 pub mod css;
