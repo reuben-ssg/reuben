@@ -2,7 +2,7 @@
 
 use std::path::Path;
 
-use crate::doc::{Document, Node, NodeKind};
+use crate::doc::{Document, Node, NodeKind, Origin};
 use crate::error::{Error, ErrorKind};
 
 /// What a block produced. `Text` is escaped text from strings and scalars, `Html` is raw markup from `Html` values,
@@ -10,14 +10,38 @@ use crate::error::{Error, ErrorKind};
 #[derive(Debug, Clone, PartialEq)]
 pub enum Output {
     Text(String),
-    Html(String),
+    Html(Markup),
     Nothing,
+}
+
+/// Raw markup plus the include lines that wrote parts of it. Each range is the byte range of `html` contributed by
+/// one `Html` value that came from an include.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct Markup {
+    pub html: String,
+    pub origins: Vec<(std::ops::Range<usize>, Origin)>,
+}
+
+impl From<&str> for Markup {
+    fn from(html: &str) -> Self {
+        html.to_string().into()
+    }
+}
+
+impl From<String> for Markup {
+    fn from(html: String) -> Self {
+        Self {
+            html,
+            origins: Vec::new(),
+        }
+    }
 }
 
 impl Output {
     fn markup(&self) -> Option<&str> {
         match self {
-            Output::Text(s) | Output::Html(s) => Some(s),
+            Output::Text(s) => Some(s),
+            Output::Html(m) => Some(&m.html),
             Output::Nothing => None,
         }
     }
@@ -165,8 +189,12 @@ fn splice_children(node: &mut Node, outputs: &[Output], in_image: bool) {
     for mut child in children {
         if let Some(n) = sole_placeholder(&child) {
             match output(outputs, n) {
-                Output::Html(h) => {
-                    child.kind = NodeKind::HtmlBlock(h.clone());
+                Output::Html(m) => {
+                    child.kind = NodeKind::Generated {
+                        html: m.html.clone(),
+                        block: n,
+                        inline: false,
+                    };
                     child.children.clear();
                     node.children.push(child);
                     continue;
@@ -180,10 +208,15 @@ fn splice_children(node: &mut Node, outputs: &[Output], in_image: bool) {
                 for piece in pieces(t) {
                     let kind = match piece {
                         Piece::Text(s) => NodeKind::Text(s.to_string()),
-                        Piece::Slot(n) => match output(outputs, n).markup() {
-                            Some(h) if in_image => NodeKind::Text(unescape(h)),
-                            Some(h) => NodeKind::HtmlInline(h.to_string()),
-                            None => continue,
+                        Piece::Slot(n) => match output(outputs, n) {
+                            Output::Nothing => continue,
+                            out if in_image => NodeKind::Text(unescape(out.markup().unwrap_or(""))),
+                            Output::Html(m) => NodeKind::Generated {
+                                html: m.html.clone(),
+                                block: n,
+                                inline: true,
+                            },
+                            Output::Text(s) => NodeKind::HtmlInline(s.clone()),
                         },
                     };
                     node.children.push(Node {
@@ -236,6 +269,39 @@ mod tests {
                 &[Output::Html("<div>x</div>".into())]
             ),
             "<div>x</div>"
+        );
+    }
+    #[test]
+    fn generated_nodes_carry_their_block() {
+        let mut d = doc(&format!("{}\n\nmid {} sentence\n", p(0), p(1)));
+        splice(
+            &mut d,
+            &[
+                Output::Html("<b>a</b>".into()),
+                Output::Html("<i>b</i>".into()),
+            ],
+        );
+        assert_eq!(
+            d.children[0].kind,
+            NodeKind::Generated {
+                html: "<b>a</b>".into(),
+                block: 0,
+                inline: false
+            }
+        );
+        let inline: Vec<_> = d.children[1]
+            .children
+            .iter()
+            .filter(|c| matches!(c.kind, NodeKind::Generated { .. }))
+            .map(|c| &c.kind)
+            .collect();
+        assert_eq!(
+            inline,
+            [&NodeKind::Generated {
+                html: "<i>b</i>".into(),
+                block: 1,
+                inline: true
+            }]
         );
     }
     #[test]

@@ -468,7 +468,8 @@ impl Site {
     ) -> Result<String, Vec<Error>> {
         let (body, mut scope, layout_name) = match page.kind {
             PageKind::Markdown => {
-                let (doc, scope) = page::render_body(page, &self.engine, &self.config, scopes)?;
+                let page::RenderedBody { doc, scope, .. } =
+                    page::render_body(page, &self.engine, &self.config, scopes)?;
                 let name = page
                     .front_matter
                     .layout
@@ -495,7 +496,9 @@ impl Site {
                 vec![e]
             })?;
         match (layout, page.kind) {
-            (Some(path), _) => layout::render_layout(&path, &self.engine, &mut scope, Html(body)),
+            (Some(path), _) => {
+                layout::render_layout(&path, &self.engine, &mut scope, Html::new(body))
+            }
             (None, PageKind::Markdown) => Ok(builtin_page(&PageShell {
                 title: &page.front_matter.title,
                 lang: "en",

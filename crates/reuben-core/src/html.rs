@@ -196,7 +196,13 @@ fn block(out: &mut String, node: &Node, tight: bool, ctx: &RenderCtx) {
             cr(out);
             out.push_str("<hr />\n");
         }
-        NodeKind::HtmlBlock(html) | NodeKind::Raw(html) => {
+        NodeKind::HtmlBlock(html)
+        | NodeKind::Generated {
+            html,
+            inline: false,
+            ..
+        }
+        | NodeKind::Raw(html) => {
             cr(out);
             out.push_str(html);
         }
@@ -374,7 +380,11 @@ fn inline(out: &mut String, node: &Node, ctx: &RenderCtx) {
             let d = if *display { "$$" } else { "$" };
             let _ = write!(out, "{d}{}{d}", escape_text(latex));
         }
-        NodeKind::HtmlInline(html) | NodeKind::Raw(html) => out.push_str(html),
+        NodeKind::HtmlInline(html)
+        | NodeKind::Generated {
+            html, inline: true, ..
+        }
+        | NodeKind::Raw(html) => out.push_str(html),
         _ => block(out, node, false, ctx),
     }
 }

@@ -147,14 +147,21 @@ pub fn build_scope(
     Ok(scope)
 }
 
-/// Returns the scope so the layout sees sidecar and setup variables.
+/// What `render_body` produces. `scope` is for the layout, which sees sidecar and setup variables. `outputs` are the
+/// blocks' outputs in block order, so a `Generated { block, .. }` node maps back to the `Markup` it came from.
+pub struct RenderedBody {
+    pub doc: Document,
+    pub scope: Scope<'static>,
+    pub outputs: Vec<Output>,
+}
+
 /// Every block's error is collected rather than stopping at the first.
 pub fn render_body(
     page: &Page,
     engine: &ScriptEngine,
     config: &Config,
     scopes: &SiteScopes<'_>,
-) -> Result<(Document, Scope<'static>), Vec<Error>> {
+) -> Result<RenderedBody, Vec<Error>> {
     let mut scope = build_scope(page, engine, config, scopes)?;
 
     let skip = markdown::code_ranges(&page.body);
@@ -194,5 +201,9 @@ pub fn render_body(
         let _ = scope.remove::<Map>("page");
         scope.push_constant("page", page_map);
     }
-    Ok((doc, scope))
+    Ok(RenderedBody {
+        doc,
+        scope,
+        outputs,
+    })
 }

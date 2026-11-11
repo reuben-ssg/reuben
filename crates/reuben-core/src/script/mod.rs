@@ -7,13 +7,30 @@ mod includes;
 use std::path::{Path, PathBuf};
 
 use crate::blocks::{Block, BlockKind};
-use crate::doc::Span;
+use crate::doc::{Origin, Span};
 use crate::html::escape_output;
-use crate::splice::Output;
+use crate::splice::{Markup, Output};
 use crate::template::Escape;
 
+/// Raw markup from `raw` or `markdown`. `origin` is the include line that made it, `None` when a page, layout or
+/// sidecar did.
 #[derive(Clone)]
-pub struct Html(pub String);
+pub struct Html {
+    pub markup: String,
+    pub origin: Option<Origin>,
+}
+
+impl Html {
+    pub fn new(markup: String) -> Self {
+        Self {
+            markup,
+            origin: None,
+        }
+    }
+}
+
+/// The paths of the include files loaded so far, as the strings Rhai holds as their sources.
+pub(crate) type IncludeFiles = std::sync::Arc<std::sync::RwLock<std::collections::HashSet<String>>>;
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct Frame {
@@ -38,6 +55,7 @@ impl std::fmt::Display for ScriptError {
 
 pub struct ScriptEngine {
     engine: rhai::Engine,
+    include_files: IncludeFiles,
 }
 
 impl std::fmt::Debug for ScriptEngine {
@@ -78,10 +96,14 @@ impl ScriptEngine {
         });
         engine
             .register_type_with_name::<Html>("Html")
-            .register_fn("to_string", |h: &mut Html| h.0.clone());
+            .register_fn("to_string", |h: &mut Html| h.markup.clone());
         collection::register(&mut engine);
-        helpers::register(&mut engine, site_root);
-        Self { engine }
+        let include_files = IncludeFiles::default();
+        helpers::register(&mut engine, site_root, &include_files);
+        Self {
+            engine,
+            include_files,
+        }
     }
 
     pub fn eval_block(
@@ -230,21 +252,22 @@ pub fn to_output(value: rhai::Dynamic, escape: Escape) -> Result<Output, String>
     if value.is_unit() {
         return Ok(Output::Nothing);
     }
-    let mut out = String::new();
+    let mut out = Markup::default();
     let mut html = false;
     write_value(value, escape, &mut out, &mut html)?;
     Ok(if html {
         Output::Html(out)
     } else {
-        Output::Text(out)
+        Output::Text(out.html)
     })
 }
 
 /// `html` is set when any `Html` value contributes, which makes the whole output markup.
+/// Each `Html` value that has an origin adds the range it occupies in `out.html`.
 fn write_value(
     value: rhai::Dynamic,
     escape: Escape,
-    out: &mut String,
+    out: &mut Markup,
     html: &mut bool,
 ) -> Result<(), String> {
     let text = |s: String| match escape {
@@ -254,11 +277,16 @@ fn write_value(
     if value.is_unit() {
         Ok(())
     } else if value.is_string() {
-        out.push_str(&text(value.into_string()?));
+        out.html.push_str(&text(value.into_string()?));
         Ok(())
     } else if value.is::<Html>() {
         *html = true;
-        out.push_str(&value.cast::<Html>().0);
+        let Html { markup, origin } = value.cast::<Html>();
+        let start = out.html.len();
+        out.html.push_str(&markup);
+        if let Some(origin) = origin {
+            out.origins.push((start..out.html.len(), origin));
+        }
         Ok(())
     } else if value.is_array() {
         let items = value.into_array().map_err(|t| t.to_string())?;
@@ -268,7 +296,7 @@ fn write_value(
     } else if value.is_map() {
         Err("can't output a map; output one of its fields".to_string())
     } else if value.is_int() || value.is_float() || value.is_bool() || value.is_char() {
-        out.push_str(&text(value.to_string()));
+        out.html.push_str(&text(value.to_string()));
         Ok(())
     } else {
         Err(format!(
@@ -295,6 +323,81 @@ mod tests {
         };
         engine.eval_block(&mut scope, &block, Path::new("page.md"), Escape::Html)
     }
+    /// An engine whose `includes/card.rhai` defines `card()` with its `raw` call on line 3.
+    fn card_engine() -> (assert_fs::TempDir, ScriptEngine, PathBuf) {
+        use assert_fs::prelude::*;
+        let dir = assert_fs::TempDir::new().unwrap();
+        dir.child("includes/card.rhai")
+            .write_str("// a card\nfn card() {\n    raw(\"<a href='/x/'>here</a>\")\n}\n")
+            .unwrap();
+        let mut engine = ScriptEngine::new(dir.path());
+        engine
+            .load_includes(&[dir.path().join("includes")])
+            .unwrap();
+        let card = dir.path().join("includes/card.rhai");
+        (dir, engine, card)
+    }
+
+    fn eval_in(engine: &ScriptEngine, src: &str) -> Output {
+        let block = Block {
+            kind: BlockKind::Output,
+            source: src.into(),
+            span: Span::default(),
+        };
+        let mut scope = rhai::Scope::new();
+        engine
+            .eval_block(&mut scope, &block, Path::new("page.md"), Escape::Html)
+            .unwrap()
+    }
+
+    #[test]
+    fn raw_in_an_include_records_its_line() {
+        let (_dir, engine, card) = card_engine();
+        let Output::Html(m) = eval_in(&engine, "card()") else {
+            panic!("not html")
+        };
+        assert_eq!(
+            m.origins,
+            [(
+                0..m.html.len(),
+                Origin {
+                    file: card,
+                    line: 3
+                }
+            )]
+        );
+    }
+
+    #[test]
+    fn raw_in_a_page_has_no_origin() {
+        let (_dir, engine, _) = card_engine();
+        let Output::Html(m) = eval_in(&engine, "raw(\"<b>x</b>\")") else {
+            panic!("not html")
+        };
+        assert!(m.origins.is_empty());
+    }
+
+    #[test]
+    fn array_output_keeps_each_range() {
+        let (_dir, engine, card) = card_engine();
+        let Output::Html(m) = eval_in(&engine, "[card(), \"<\", card()]") else {
+            panic!("not html")
+        };
+        let card_len = "<a href='/x/'>here</a>".len();
+        let origin = Origin {
+            file: card,
+            line: 3,
+        };
+        assert_eq!(m.html, "<a href='/x/'>here</a>&lt;<a href='/x/'>here</a>");
+        assert_eq!(
+            m.origins,
+            [
+                (0..card_len, origin.clone()),
+                (card_len + 4..2 * card_len + 4, origin)
+            ]
+        );
+    }
+
     #[test]
     fn no_escape_writes_strings_and_scalars_raw() {
         let engine = ScriptEngine::new(Path::new("."));

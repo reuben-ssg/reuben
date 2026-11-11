@@ -9,6 +9,13 @@ pub struct Span {
     pub column: usize,
 }
 
+/// A line in an `includes/*.rhai` file.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct Origin {
+    pub file: std::path::PathBuf,
+    pub line: usize,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct Node {
     pub kind: NodeKind,
@@ -56,6 +63,14 @@ pub enum NodeKind {
     LineBreak,
     HtmlBlock(String),
     HtmlInline(String),
+    /// The HTML that block number `block` (its index in the page's extracted blocks) produced, spliced at block
+    /// level or inline. It renders exactly like `HtmlBlock`/`HtmlInline`; the index lets later stages find the
+    /// block's `Markup` and so the include that wrote it.
+    Generated {
+        html: String,
+        block: usize,
+        inline: bool,
+    },
     Table {
         alignments: Vec<Alignment>,
     },

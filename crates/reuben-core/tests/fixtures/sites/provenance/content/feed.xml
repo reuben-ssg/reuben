@@ -1,0 +1,4 @@
+---
+title: Feed
+---
+<rss>{{ ["a", "b"].map(|p| "<item>" + p + "</item>") }}</rss>
