@@ -4,7 +4,8 @@ use crate::tree::Item;
 /// Collects headings, links, images and tables from HTML given as consecutive
 /// labelled pieces, in document order. The pieces are tokenized as one input.
 /// Each item is tagged with the label of the piece being fed when its start
-/// tag was emitted, and the 1-based line of that tag in the whole input.
+/// tag was emitted, and the 1-based line of that tag in the whole input. For a
+/// start tag that spans several lines, the line is where the tag ends.
 pub fn fragment_items<S: Copy>(pieces: &[(&str, S)]) -> Vec<Item<(S, usize)>> {
     let mut items: Vec<Item<(S, usize)>> = Vec::new();
     // Indexes into `items` of the elements still open, innermost last. Each
@@ -32,6 +33,9 @@ pub fn fragment_items<S: Copy>(pieces: &[(&str, S)]) -> Vec<Item<(S, usize)>> {
                             let label = tag
                                 .attr("aria-label")
                                 .filter(|l| !l.trim().is_empty())
+                                .or_else(|| {
+                                    tag.attr("aria-labelledby").filter(|l| !l.trim().is_empty())
+                                })
                                 .map(str::to_string);
                             open_links.push(OpenLink {
                                 index: items.len(),
@@ -103,7 +107,9 @@ fn alt_of<S>(tag: &StartTag<S>) -> Option<String> {
 struct OpenLink {
     index: usize,
     text: String,
-    /// A non-blank `aria-label`, which wins over the link's content.
+    /// A non-blank `aria-label`, or failing that the ids in `aria-labelledby`
+    /// (not resolved, so they only mark the link as named). It wins over the
+    /// link's content.
     label: Option<String>,
 }
 
@@ -137,6 +143,7 @@ fn collapse(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::{RuleSet, check_tree};
 
     fn one(html: &str) -> Vec<Item<((), usize)>> {
         fragment_items(&[(html, ())])
@@ -213,6 +220,30 @@ mod tests {
     fn aria_label_wins_over_link_content() {
         let items = one("<a href=\"/x/\" aria-label=\"Home\">here</a>");
         assert!(matches!(&items[0], Item::Link { name, .. } if name == "Home"));
+    }
+
+    #[test]
+    fn aria_labelledby_names_a_link() {
+        let items = one("<a href=\"/x\" aria-labelledby=\"t\"><svg></svg></a>");
+        let found = check_tree(&items, &RuleSet::all());
+        assert!(found.is_empty(), "{found:?}");
+    }
+
+    #[test]
+    fn image_with_empty_alt_leaves_a_link_unnamed() {
+        let items = one("<a href=\"/x/\"><img src=\"i.png\" alt=\"\"></a>");
+        let found = check_tree(&items, &RuleSet::all());
+        assert_eq!(found.len(), 1, "{found:?}");
+        assert_eq!(found[0].message, "link has no text");
+    }
+
+    #[test]
+    fn multiline_start_tag_reports_the_line_it_ends_on() {
+        let items = one("<a\n href=\"/x/\"\n>here</a>");
+        assert!(
+            matches!(&items[0], Item::Link { at: ((), 3), .. }),
+            "{items:?}"
+        );
     }
 
     #[test]
