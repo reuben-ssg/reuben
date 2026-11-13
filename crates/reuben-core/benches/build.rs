@@ -11,19 +11,23 @@ fn build(c: &mut Criterion) {
     for pages in [100usize, 1_000, 5_000] {
         let tmp = TempDir::new().unwrap();
         testsite::generate(tmp.path(), pages).unwrap();
+        let render = || {
+            let site = Site::load_with(tmp.path(), &Default::default()).unwrap();
+            let (_, report) = site
+                .render(&RenderOptions {
+                    drafts: false,
+                    jobs: None,
+                })
+                .unwrap();
+            assert_eq!(report.pages_written, pages);
+            report
+        };
+        eprintln!(
+            "{pages} pages: {} accessibility findings",
+            render().findings.len()
+        );
         group.throughput(Throughput::Elements(pages as u64));
-        group.bench_function(format!("{pages}_pages"), |b| {
-            b.iter(|| {
-                let site = Site::load_with(tmp.path(), &Default::default()).unwrap();
-                let (_, report) = site
-                    .render(&RenderOptions {
-                        drafts: false,
-                        jobs: None,
-                    })
-                    .unwrap();
-                assert_eq!(report.pages_written, pages);
-            });
-        });
+        group.bench_function(format!("{pages}_pages"), |b| b.iter(render));
     }
     group.finish();
 }
