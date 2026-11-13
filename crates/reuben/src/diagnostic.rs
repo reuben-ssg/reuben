@@ -8,12 +8,21 @@ use reuben_core::explain::{Entry, Explanation, Source};
 use reuben_core::script::Frame;
 use reuben_core::{Error, ErrorKind};
 
-/// Formats `error`; `source` is the text of `error.path`, when it could be read.
-pub fn render(error: &Error, source: Option<&str>) -> String {
+/// `path` as it is printed in a diagnostic: relative to the site `root`, or in full when it is outside it.
+fn shown(path: &Path, root: &Path) -> String {
+    path.strip_prefix(root)
+        .unwrap_or(path)
+        .display()
+        .to_string()
+}
+
+/// Formats `error`; `source` is the text of `error.path`, when it could be read. Files are named relative to the
+/// site `root`.
+pub fn render(error: &Error, source: Option<&str>, root: &Path) -> String {
     let (message, span, stack): (&str, Span, &[Frame]) = match &error.kind {
         ErrorKind::Script(e) => match e.location {
             Some(span) => (&e.message, span, &e.stack),
-            None => return plain(error),
+            None => return plain(error, root),
         },
         ErrorKind::Block(e) => (&e.message, e.span, &[]),
         ErrorKind::Math { message, location } => (message, *location, &[]),
@@ -21,14 +30,14 @@ pub fn render(error: &Error, source: Option<&str>) -> String {
             message,
             location: Some(location),
         } => (message, *location, &[]),
-        _ => return plain(error),
+        _ => return plain(error, root),
     };
-    let (mut out, pad) = located("error", message, &error.path, span, source);
+    let (mut out, pad) = located("error", message, &error.path, span, source, root);
     for f in stack {
         out += &format!(
             "{pad}= in include `{}` ({}:{}:{})\n",
             f.function,
-            f.file.display(),
+            shown(&f.file, root),
             f.line,
             f.column
         );
@@ -44,12 +53,13 @@ fn located(
     path: &Path,
     span: Span,
     source: Option<&str>,
+    root: &Path,
 ) -> (String, String) {
     let width = span.line.to_string().len();
     let pad = " ".repeat(width + 1);
     let mut out = format!(
         "{kind}: {message}\n{pad}--> {}:{}:{}\n",
-        path.display(),
+        shown(path, root),
         span.line,
         span.column
     );
@@ -62,26 +72,29 @@ fn located(
 }
 
 /// Formats an accessibility finding as a warning; `source` is the text of `finding.path`, when it could be read.
-/// The include note names its file relative to the site `root`.
+/// Files are named relative to the site `root`.
 pub fn render_finding(finding: &Finding, source: Option<&str>, root: &Path) -> String {
     let kind = format!("warning[{}]", finding.rule.id());
     let (mut out, pad) = match finding.location {
-        Some(span) => located(&kind, &finding.message, &finding.path, span, source),
+        Some(span) => located(&kind, &finding.message, &finding.path, span, source, root),
         None => {
             let mut out = format!(
                 "{kind}: {}\n  --> {}",
                 finding.message,
-                finding.path.display()
+                shown(&finding.path, root)
             );
             if let Some((built, line)) = &finding.built {
-                out += &format!(" (built as {}, line {line})", built.display());
+                out += &format!(" (built as {}, line {line})", shown(built, root));
             }
             (out + "\n", "  ".to_string())
         }
     };
     if let Some(origin) = &finding.include {
-        let file = origin.file.strip_prefix(root).unwrap_or(&origin.file);
-        out += &format!("{pad}= note: from {}:{}\n", file.display(), origin.line);
+        out += &format!(
+            "{pad}= note: from {}:{}\n",
+            shown(&origin.file, root),
+            origin.line
+        );
     }
     out
 }
@@ -89,12 +102,7 @@ pub fn render_finding(finding: &Finding, source: Option<&str>, root: &Path) -> S
 /// The page, a blank line, then one row per name: name, value and where it was set, in aligned columns.
 /// Files are named relative to the site `root`.
 pub fn render_explanation(explanation: &Explanation, root: &Path) -> String {
-    let relative = |file: &Path| {
-        file.strip_prefix(root)
-            .unwrap_or(file)
-            .display()
-            .to_string()
-    };
+    let relative = |file: &Path| shown(file, root);
     let origin = |source: &Source| match source {
         Source::FrontMatter { file, line }
         | Source::DirDefaults { file, line }
@@ -130,8 +138,8 @@ pub fn render_explanation(explanation: &Explanation, root: &Path) -> String {
     out
 }
 
-fn plain(error: &Error) -> String {
-    format!("error: {error}\n")
+fn plain(error: &Error, root: &Path) -> String {
+    format!("error: {}: {}\n", shown(&error.path, root), error.kind)
 }
 
 #[cfg(test)]
@@ -151,8 +159,8 @@ mod tests {
             }),
         );
         assert_eq!(
-            render(&err, Some("a\nb\n{{ nope( }}\n")),
-            "error: unexpected end of input\n  --> site/content/broken.md:3:4\n  |\n3 | {{ nope( }}\n  |    ^\n"
+            render(&err, Some("a\nb\n{{ nope( }}\n"), Path::new("site")),
+            "error: unexpected end of input\n  --> content/broken.md:3:4\n  |\n3 | {{ nope( }}\n  |    ^\n"
         );
     }
 
@@ -166,7 +174,7 @@ mod tests {
             },
         );
         assert_eq!(
-            render(&err, Some("a\n$\\frac{1}{$\n")),
+            render(&err, Some("a\n$\\frac{1}{$\n"), Path::new("")),
             "error: bad\n  --> content/m.md:2:1\n  |\n2 | $\\frac{1}{$\n  | ^\n"
         );
     }
@@ -181,7 +189,7 @@ mod tests {
             },
         );
         assert_eq!(
-            render(&err, Some("a {\n  color: ;\n")),
+            render(&err, Some("a {\n  color: ;\n"), Path::new("")),
             "error: bad\n  --> static/a.css:2:3\n  |\n2 |   color: ;\n  |   ^\n"
         );
         let unlocated = Error::new(
@@ -191,7 +199,10 @@ mod tests {
                 location: None,
             },
         );
-        assert_eq!(render(&unlocated, None), "error: static/a.css: css: bad\n");
+        assert_eq!(
+            render(&unlocated, None, Path::new("")),
+            "error: static/a.css: css: bad\n"
+        );
     }
 
     #[test]
@@ -203,14 +214,15 @@ mod tests {
                 location: Some(Span { line: 1, column: 1 }),
                 stack: vec![Frame {
                     function: "fail".into(),
-                    file: "includes/fail.rhai".into(),
+                    file: "/site/includes/fail.rhai".into(),
                     line: 3,
                     column: 5,
                 }],
             }),
         );
         assert!(
-            render(&err, Some("x\n")).ends_with("  = in include `fail` (includes/fail.rhai:3:5)\n")
+            render(&err, Some("x\n"), Path::new("/site"))
+                .ends_with("  = in include `fail` (includes/fail.rhai:3:5)\n")
         );
     }
 
@@ -303,7 +315,10 @@ mod tests {
             "content/x.md",
             ErrorKind::Io(std::io::Error::other("disk gone")),
         );
-        assert_eq!(render(&err, None), "error: content/x.md: disk gone\n");
+        assert_eq!(
+            render(&err, None, Path::new("")),
+            "error: content/x.md: disk gone\n"
+        );
     }
 
     #[test]
@@ -316,6 +331,6 @@ mod tests {
                 stack: vec![],
             }),
         );
-        assert!(render(&err, Some("éé{{\n")).contains("1 | éé{{\n  |   ^\n"));
+        assert!(render(&err, Some("éé{{\n"), Path::new("")).contains("1 | éé{{\n  |   ^\n"));
     }
 }

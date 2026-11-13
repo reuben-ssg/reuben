@@ -95,6 +95,42 @@ fn include_note_is_printed() {
 }
 
 #[test]
+fn diagnostics_name_files_relative_to_the_root() {
+    let tmp = site(&[
+        (
+            "includes/card.rhai",
+            "// a card\nfn card() { raw(\"<a href='/a/'>read more</a>\") }\n",
+        ),
+        (
+            "includes/fail.rhai",
+            "fn fail() {\n    throw \"boom\";\n}\n",
+        ),
+        ("content/a.md", "---\ntitle: A\n---\n# A\n\n{{ card() }}\n"),
+        (
+            "content/b.md",
+            "---\ntitle: B\n---\n# One\n\n<h1>Two</h1>\n",
+        ),
+        ("content/c.md", "---\ntitle: C\n---\n# C\n\n{{ fail() }}\n"),
+        ("content/d.md", "---\ndraft: false\n---\n# D\n"),
+    ]);
+    assert!(tmp.path().is_absolute());
+    let out = check(&tmp).code(1).get_output().clone();
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    for expected in [
+        "--> content/a.md:6:1",
+        "= note: from includes/card.rhai:2",
+        "--> content/b.md (built as b/index.html, line ",
+        "--> content/c.md:6:",
+        "= in include `fail` (includes/fail.rhai:2:",
+        "error: content/d.md: front matter: `title` is required",
+    ] {
+        assert!(stderr.contains(expected), "{expected:?} in:\n{stderr}");
+    }
+    let root = tmp.path().display().to_string();
+    assert!(!stderr.contains(&root), "{root} in:\n{stderr}");
+}
+
+#[test]
 fn built_location_for_html_findings() {
     let tmp = site(&[(
         "content/a.md",

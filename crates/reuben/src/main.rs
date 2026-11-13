@@ -192,7 +192,7 @@ fn check(root: &Path, drafts: bool, env: Option<String>, jobs: Option<usize>) ->
         }
         Err(failure) => {
             print_findings(&failure.findings, root);
-            print_errors(&failure.errors);
+            print_errors(&failure.errors, root);
             eprintln!("{}", check_summary(&failure.errors, &failure.findings));
         }
     }
@@ -205,7 +205,7 @@ fn explain(page: &str, root: &Path, env: Option<String>) -> ExitCode {
     match explained {
         Ok(explanation) => {
             print!("{}", diagnostic::render_explanation(&explanation, root));
-            print_errors(&explanation.errors);
+            print_errors(&explanation.errors, root);
             if explanation.errors.is_empty() {
                 ExitCode::SUCCESS
             } else {
@@ -214,7 +214,7 @@ fn explain(page: &str, root: &Path, env: Option<String>) -> ExitCode {
             }
         }
         Err(errors) => {
-            print_errors(&errors);
+            print_errors(&errors, root);
             ExitCode::FAILURE
         }
     }
@@ -227,17 +227,17 @@ fn print_findings(findings: &[Finding], root: &Path) {
     }
 }
 
-fn print_errors(errors: &[Error]) {
+fn print_errors(errors: &[Error], root: &Path) {
     for e in errors {
         let source = std::fs::read_to_string(&e.path).ok();
-        eprint!("{}", diagnostic::render(e, source.as_deref()));
+        eprint!("{}", diagnostic::render(e, source.as_deref(), root));
     }
 }
 
 /// A failed build: the findings, then the errors, then the warning line, and the error count last.
 fn print_failure(failure: &Failure, root: &Path) {
     print_findings(&failure.findings, root);
-    print_errors(&failure.errors);
+    print_errors(&failure.errors, root);
     if let Some(line) = warning_summary(&failure.findings) {
         eprintln!("{line}");
     }
