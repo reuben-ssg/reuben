@@ -50,8 +50,8 @@ pub struct Explanation {
 
 const VALUE_WIDTH: usize = 60;
 
-/// `page.*` names Reuben sets itself, after the front matter ones.
-const COMPUTED: [&str; 5] = ["url", "path", "slug", "toc", "summary"];
+/// `page.*` names Reuben always sets itself, over any front matter of the same name.
+const COMPUTED: [&str; 5] = ["url", "path", "slug", "collection", "toc"];
 
 impl Site {
     /// `page` is a source path (`content/blog/x.md`), a path under `content/` (`blog/x.md`) or a URL (`/blog/x/`).
@@ -170,11 +170,9 @@ impl Site {
             .collect()
     }
 
+    /// The front matter names, then the computed ones, as the page's own scope has them. Collections give each page
+    /// a `summary` too, but the page's scope only has one its front matter sets.
     fn page_entries(&self, page: &Page, map: &Map, texts: &mut Texts, out: &mut Vec<Entry>) {
-        // Collections add the summary to each page's map; the page's own scope doesn't carry it.
-        let mut map = map.clone();
-        map.insert("summary".into(), page.summary.clone().into());
-        let map = &map;
         for (key, file) in &page.front_matter_sources {
             let path: Vec<&str> = key.split('.').collect();
             if COMPUTED.contains(&key.as_str()) {
@@ -197,7 +195,9 @@ impl Site {
             };
             out.push(entry(format!("page.{key}"), &value, source));
         }
-        for key in COMPUTED {
+        // `draft` is computed only when no front matter sets it: a page can be drafted by its folder.
+        let draft = (!page.front_matter_sources.contains_key("draft")).then_some("draft");
+        for key in draft.into_iter().chain(COMPUTED) {
             if let Some(value) = lookup(map, &[key]) {
                 out.push(entry(format!("page.{key}"), &value, Source::Computed));
             }

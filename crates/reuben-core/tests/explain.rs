@@ -83,7 +83,7 @@ fn names_come_in_the_documented_order() {
     let names: Vec<&str> = ex.entries.iter().map(|e| e.name.as_str()).collect();
     let position = |n: &str| names.iter().position(|x| *x == n).unwrap();
     assert!(position("page.title") < position("page.url"));
-    assert!(position("page.summary") < position("site.title"));
+    assert!(position("page.toc") < position("site.title"));
     assert!(position("site.base_url") < position("data.info"));
     assert!(position("data.info") < position("collections.blog"));
     assert!(position("collections.blog") < position("card/1"));
@@ -104,6 +104,48 @@ fn names_come_in_the_documented_order() {
             line: None
         }
     );
+}
+
+#[test]
+fn only_names_in_the_page_scope_are_computed() {
+    let tmp = site(&[
+        ("content/blog/post.md", POST),
+        (
+            "content/blog/own.md",
+            "---\ntitle: Own\ndraft: true\nsummary: Mine\n---\nBody.\n",
+        ),
+    ]);
+    let ex = explain(&tmp, "blog/post.md");
+    let computed: Vec<(&str, &str)> = ex
+        .entries
+        .iter()
+        .filter(|e| e.source == Source::Computed && e.name.starts_with("page."))
+        .map(|e| (e.name.as_str(), e.value.as_str()))
+        .collect();
+    assert_eq!(
+        computed,
+        [
+            ("page.draft", "false"),
+            ("page.url", "\"/blog/post/\""),
+            ("page.path", "\"blog/post.md\""),
+            ("page.slug", "\"post\""),
+            ("page.collection", "\"blog\""),
+            ("page.toc", "[]"),
+        ]
+    );
+
+    let ex = explain(&tmp, "blog/own.md");
+    let own = |line| Source::FrontMatter {
+        file: tmp.path().join("content/blog/own.md"),
+        line: Some(line),
+    };
+    let summary = entry(&ex, "page.summary");
+    assert_eq!(
+        (summary.value.as_str(), &summary.source),
+        ("\"Mine\"", &own(4))
+    );
+    let draft = entry(&ex, "page.draft");
+    assert_eq!((draft.value.as_str(), &draft.source), ("true", &own(3)));
 }
 
 #[test]
