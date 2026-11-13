@@ -110,6 +110,25 @@ fn every_rule_fires_once() {
 }
 
 #[test]
+fn task_lists_need_no_labels() {
+    let tmp = site(&[(
+        "content/index.md",
+        "---\ntitle: Home\n---\n# Home\n\n- [ ] one\n- [x] two\n",
+    )]);
+    assert_eq!(findings(&tmp), vec![]);
+}
+
+#[test]
+fn markdown_links_named_by_title_or_image() {
+    let tmp = site(&[(
+        "content/index.md",
+        "---\ntitle: Home\n---\n# Home\n\n[](/ \"Home\") [![Logo](/logo.png)](/)\n",
+    )]);
+    let all = findings(&tmp);
+    assert_eq!(with_rule(&all, Rule::LinkText), Vec::<&Finding>::new());
+}
+
+#[test]
 fn include_finding_names_both() {
     let tmp = site(&[
         (

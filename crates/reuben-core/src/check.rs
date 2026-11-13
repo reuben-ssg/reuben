@@ -238,9 +238,15 @@ fn walk(node: &Node, outputs: &[Output], items: &mut Vec<Item<At>>) {
             });
             walk_children(node, outputs, items);
         }
-        NodeKind::Link { url, .. } => {
+        NodeKind::Link { url, title } => {
+            let text = html::plain_text(node);
             items.push(Item::Link {
-                name: html::plain_text(node),
+                // Like an HTML link's `title`, a Markdown title names the link only when nothing else does.
+                name: if text.trim().is_empty() {
+                    title.clone()
+                } else {
+                    text
+                },
                 href: url.clone(),
                 at,
             });

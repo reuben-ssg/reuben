@@ -67,7 +67,7 @@ impl Rule {
             Rule::MainLandmark => "The page has a main landmark.",
             Rule::IdUnique => "No two elements on a page share an id.",
             Rule::FormLabel => "Form controls have a label.",
-            Rule::LinkTarget => "Internal links point at a page or anchor that exists.",
+            Rule::LinkTarget => "Internal links point at a page or file that is built.",
         }
     }
 }

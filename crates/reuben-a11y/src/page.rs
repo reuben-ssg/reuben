@@ -73,7 +73,7 @@ pub fn check_page(html: &str, rules: &RuleSet, reported_ids: &HashSet<String>) -
                         }
                     }
                     "a" => {
-                        if let Some(href) = tag.attr("href")
+                        if let Some(href) = tag.attr("href").map(crate::links::trim_href)
                             && rules.is_on(Rule::LinkTarget)
                             && !is_external(href)
                         {
@@ -84,12 +84,14 @@ pub fn check_page(html: &str, rules: &RuleSet, reported_ids: &HashSet<String>) -
                         }
                     }
                     "input" | "select" | "textarea" => {
+                        // A disabled input can't be used, like the checkboxes of a Markdown task list.
                         let exempt = tag.name == "input"
-                            && tag.attr("type").is_some_and(|t| {
-                                ["hidden", "submit", "reset", "button", "image"]
-                                    .iter()
-                                    .any(|x| t.trim().eq_ignore_ascii_case(x))
-                            });
+                            && (tag.attr("disabled").is_some()
+                                || tag.attr("type").is_some_and(|t| {
+                                    ["hidden", "submit", "reset", "button", "image"]
+                                        .iter()
+                                        .any(|x| t.trim().eq_ignore_ascii_case(x))
+                                }));
                         let named = ["aria-label", "aria-labelledby", "title"]
                             .iter()
                             .any(|a| non_blank(&tag, a));
@@ -110,6 +112,7 @@ pub fn check_page(html: &str, rules: &RuleSet, reported_ids: &HashSet<String>) -
                     main_seen = true;
                 }
                 if let Some(id) = tag.attr("id")
+                    && !id.trim().is_empty()
                     && !seen_ids.insert(id.to_string())
                     && !reported_ids.contains(id)
                     && rules.is_on(Rule::IdUnique)
@@ -298,6 +301,33 @@ mod tests {
         );
         let report = with_body("<input><select></select><textarea></textarea>");
         assert_eq!(rules_of(&report), [Rule::FormLabel; 3]);
+    }
+
+    #[test]
+    fn task_list_checkboxes_need_no_label() {
+        let tasks = "<ul>\n<li><input type=\"checkbox\" disabled=\"\" /> one</li>\n<li><input type=\"checkbox\" disabled=\"\" checked=\"\" /> two</li>\n</ul>";
+        assert_eq!(with_body(tasks).findings, []);
+        let enabled = with_body("<input type=\"checkbox\">");
+        assert_eq!(rules_of(&enabled), [Rule::FormLabel]);
+    }
+
+    #[test]
+    fn blank_ids_are_not_duplicates() {
+        let report =
+            with_body("<p id=\"\"></p><p id=\"\"></p><p id=\"   \"></p><p id=\"   \"></p>");
+        assert_eq!(report.findings, []);
+    }
+
+    #[test]
+    fn hrefs_are_trimmed() {
+        let report = with_body("<a href=\" /a/ \">a</a><a href=\" https://x.y/\">x</a>");
+        assert_eq!(
+            report.links,
+            [LocalLink {
+                href: "/a/".into(),
+                line: 1
+            }]
+        );
     }
 
     #[test]

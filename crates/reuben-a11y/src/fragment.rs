@@ -30,9 +30,7 @@ pub fn fragment_items<S: Copy>(pieces: &[(&str, S)]) -> Vec<Item<(S, usize)>> {
                     }
                     "a" => {
                         if let Some(href) = tag.attr("href") {
-                            let label = tag
-                                .attr("aria-label")
-                                .filter(|l| !l.trim().is_empty())
+                            let label = aria_label(&tag)
                                 .or_else(|| {
                                     tag.attr("aria-labelledby").filter(|l| !l.trim().is_empty())
                                 })
@@ -41,6 +39,7 @@ pub fn fragment_items<S: Copy>(pieces: &[(&str, S)]) -> Vec<Item<(S, usize)>> {
                                 index: items.len(),
                                 text: String::new(),
                                 label,
+                                title: tag.attr("title").map(str::to_string),
                             });
                             items.push(Item::Link {
                                 name: String::new(),
@@ -51,9 +50,11 @@ pub fn fragment_items<S: Copy>(pieces: &[(&str, S)]) -> Vec<Item<(S, usize)>> {
                     }
                     "img" => {
                         let alt = alt_of(&tag);
-                        append_all(&mut open_headings, &mut open_links, alt.as_deref());
+                        let name = aria_label(&tag).or(alt.as_deref());
+                        append_all(&mut open_headings, &mut open_links, name);
                         items.push(Item::Image { alt, at });
                     }
+                    "svg" => append_all(&mut open_headings, &mut open_links, aria_label(&tag)),
                     "table" => {
                         open_tables.push(items.len());
                         items.push(Item::Table {
@@ -104,6 +105,10 @@ fn alt_of<S>(tag: &StartTag<S>) -> Option<String> {
     tag.attr("alt").map(str::to_string)
 }
 
+fn aria_label<S>(tag: &StartTag<S>) -> Option<&str> {
+    tag.attr("aria-label").filter(|l| !l.trim().is_empty())
+}
+
 struct OpenLink {
     index: usize,
     text: String,
@@ -111,6 +116,8 @@ struct OpenLink {
     /// (not resolved, so they only mark the link as named). It wins over the
     /// link's content.
     label: Option<String>,
+    /// The link's `title`, its name only when nothing else names it.
+    title: Option<String>,
 }
 
 /// Adds `text` to every open heading and link.
@@ -133,6 +140,9 @@ fn close_heading<S>(items: &mut [Item<S>], (index, buffer): (usize, String)) {
 fn close_link<S>(items: &mut [Item<S>], link: OpenLink) {
     if let Item::Link { name, .. } = &mut items[link.index] {
         *name = collapse(link.label.as_deref().unwrap_or(&link.text));
+        if name.is_empty() {
+            *name = collapse(link.title.as_deref().unwrap_or_default());
+        }
     }
 }
 
@@ -227,6 +237,23 @@ mod tests {
         let items = one("<a href=\"/x\" aria-labelledby=\"t\"><svg></svg></a>");
         let found = check_tree(&items, &RuleSet::all());
         assert!(found.is_empty(), "{found:?}");
+    }
+
+    #[test]
+    fn icon_links_are_named_by_their_icon_or_title() {
+        for html in [
+            "<a href=\"/x/\"><svg aria-label=\"Home\"><path d=\"M0\"/></svg></a>",
+            "<a href=\"/x/\"><img src=\"i.svg\" aria-label=\"Home\"></a>",
+            "<a href=\"/x/\" title=\"Home\"><svg></svg></a>",
+        ] {
+            let items = one(html);
+            assert!(
+                matches!(&items[0], Item::Link { name, .. } if name == "Home"),
+                "{html}: {items:?}"
+            );
+        }
+        let items = one("<a href=\"/x/\" title=\"Tip\">Home</a>");
+        assert!(matches!(&items[0], Item::Link { name, .. } if name == "Home"));
     }
 
     #[test]

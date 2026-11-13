@@ -84,8 +84,7 @@ pub fn check_tree<O: Clone>(items: &[Item<O>], rules: &RuleSet) -> Vec<Finding<O
                 let normalized = name
                     .trim()
                     .to_lowercase()
-                    .trim_end_matches(|c: char| c.is_ascii_punctuation())
-                    .trim_end()
+                    .trim_end_matches(|c: char| !c.is_alphanumeric())
                     .to_string();
                 if normalized.is_empty() {
                     add(Rule::LinkText, "link has no text".to_string(), at);
@@ -98,7 +97,7 @@ pub fn check_tree<O: Clone>(items: &[Item<O>], rules: &RuleSet) -> Vec<Finding<O
                 }
             }
             Item::Image { alt: None, at } => {
-                add(Rule::ImgAlt, "image has no alt attribute".to_string(), at);
+                add(Rule::ImgAlt, "image has no alt text".to_string(), at);
             }
             Item::Image { .. } => {}
             Item::Table {
@@ -182,6 +181,22 @@ mod tests {
     }
 
     #[test]
+    fn unicode_punctuation_is_trimmed_from_link_text() {
+        for (text, normalized) in [
+            ("Read more…", "read more"),
+            ("More →", "more"),
+            ("Read more »", "read more"),
+        ] {
+            let found = check_tree(&[link(text, 0)], &RuleSet::all());
+            assert_eq!(rules_of(&found), [Rule::LinkText], "{text}");
+            assert_eq!(
+                found[0].message,
+                format!("link text \"{normalized}\" doesn't say where the link goes")
+            );
+        }
+    }
+
+    #[test]
     fn missing_alt_but_not_empty_alt() {
         let all = RuleSet::all();
         let missing = Item::Image { alt: None, at: 0 };
@@ -192,6 +207,7 @@ mod tests {
         let found = check_tree(&[missing, decorative], &all);
         assert_eq!(rules_of(&found), [Rule::ImgAlt]);
         assert_eq!(found[0].at, 0);
+        assert_eq!(found[0].message, "image has no alt text");
     }
 
     #[test]

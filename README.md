@@ -28,7 +28,7 @@ Findings print as warnings with the file and line that caused them, and they nev
 | `main-landmark`     | The page has a main landmark.                                      |
 | `id-unique`         | No two elements on a page share an id.                             |
 | `form-label`        | Form controls have a label.                                        |
-| `link-target`       | Internal links point at a page or anchor that exists.              |
+| `link-target`       | Internal links point at a page or file that is built.              |
 
 A finding looks like this:
 
