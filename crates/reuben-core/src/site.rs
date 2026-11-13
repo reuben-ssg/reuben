@@ -221,12 +221,14 @@ impl Site {
             match loaded {
                 Ok(Some(page)) => pages.push(page),
                 Ok(None) => asset_rels.push(rel),
-                // The broken `_dir.toml` is already reported, and without its defaults a page would only add
-                // misleading errors (a missing title, say). Problems in the file itself are its own.
-                Err(f)
-                    if f.from_defaults
-                        && dirs.folder_broken(rel.parent().unwrap_or(Path::new(""))) => {}
-                Err(f) => errors.extend(f.errors),
+                Err(f) => {
+                    errors.extend(f.errors);
+                    // The broken `_dir.toml` is already reported, and without its defaults a page would only add
+                    // misleading errors (a missing title, say). Problems in the file itself are its own.
+                    if !dirs.folder_broken(rel.parent().unwrap_or(Path::new(""))) {
+                        errors.extend(f.from_defaults);
+                    }
+                }
             }
         }
         mark_draft_excluded(&mut pages, &dirs);
@@ -779,18 +781,18 @@ fn walk(dir: &Path, errors: &mut Vec<Error>) -> Vec<(PathBuf, PathBuf)> {
     files
 }
 
-/// Why a page didn't load. `from_defaults` marks a failure in the merged front matter, which a broken `_dir.toml`
-/// can cause; reading and parsing the file itself never depends on folder defaults.
+/// Why a page didn't load. `from_defaults` are failures in the merged front matter, which a broken `_dir.toml` can
+/// cause; reading and parsing the file itself never depends on folder defaults, so `errors` are always reported.
 struct LoadFailure {
     errors: Vec<Error>,
-    from_defaults: bool,
+    from_defaults: Vec<Error>,
 }
 
 impl From<Error> for LoadFailure {
     fn from(error: Error) -> Self {
         Self {
             errors: vec![error],
-            from_defaults: false,
+            from_defaults: Vec::new(),
         }
     }
 }
@@ -864,11 +866,19 @@ fn load_page_from(
             .map_or_else(String::new, |n| n.to_string_lossy().into_owned());
         merged.value.insert("title".into(), name.into());
     }
-    let front_matter = frontmatter::from_value(merged.value).map_err(|e| LoadFailure {
-        errors: vec![Error::new(path, e)],
-        from_defaults: true,
-    })?;
-    let rules = rules?;
+    let (front_matter, rules) = match (frontmatter::from_value(merged.value), rules) {
+        (Ok(front_matter), Ok(rules)) => (front_matter, rules),
+        (front_matter, rules) => {
+            return Err(LoadFailure {
+                errors: rules.err().unwrap_or_default(),
+                from_defaults: front_matter
+                    .err()
+                    .map(|e| Error::new(path, e))
+                    .into_iter()
+                    .collect(),
+            });
+        }
+    };
     let sidecar = Some(path.with_extension("rhai")).filter(|p| p.is_file());
     let route = match kind {
         PageKind::Markdown => route_for_page(rel),
@@ -906,7 +916,7 @@ struct PageA11y {
 fn page_rules(
     base: RuleSet,
     layers: &[(&serde_json::Map<String, serde_json::Value>, &Path)],
-) -> Result<RuleSet, LoadFailure> {
+) -> Result<RuleSet, Vec<Error>> {
     let mut rules = base;
     let mut errors = Vec::new();
     for (layer, file) in layers {
@@ -932,10 +942,7 @@ fn page_rules(
     if errors.is_empty() {
         Ok(rules)
     } else {
-        Err(LoadFailure {
-            errors,
-            from_defaults: false,
-        })
+        Err(errors)
     }
 }
 

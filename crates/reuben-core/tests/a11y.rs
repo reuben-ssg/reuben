@@ -406,6 +406,30 @@ fn unknown_id_in_a_dir_toml_survives_a_page_override() {
 }
 
 #[test]
+fn front_matter_and_rule_errors_are_both_reported() {
+    let tmp = site(&[(
+        "content/a.md",
+        "---\ntitle: A\nweight: heavy\na11y:\n  disable: [nope]\n---\n# A\n",
+    )]);
+    let failure = render_with(&tmp, false, None).unwrap_err();
+    assert_eq!(failure.len(), 2, "{:#?}", *failure);
+    assert!(
+        failure
+            .iter()
+            .any(|e| matches!(&e.kind, ErrorKind::UnknownRule(id) if id == "nope")),
+        "{:#?}",
+        *failure
+    );
+    assert!(
+        failure
+            .iter()
+            .any(|e| matches!(e.kind, ErrorKind::FrontMatter(_))),
+        "{:#?}",
+        *failure
+    );
+}
+
+#[test]
 fn every_unknown_config_id_is_reported() {
     let tmp = site(&[("reuben.toml", "[a11y]\ndisable = [\"a\", \"b\"]\n")]);
     let errors = Site::load(tmp.path()).unwrap_err();
