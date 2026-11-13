@@ -87,9 +87,9 @@ pub struct Site {
     broken_dirs: BTreeSet<PathBuf>,
     /// An `includes/*.rhai` file failed, so nothing that runs Rhai is rendered: every call into the includes would
     /// fail and bury the real error.
-    includes_broken: bool,
+    pub(crate) includes_broken: bool,
     /// The `site` scope variable, built once from the config.
-    site_map: rhai::Map,
+    pub(crate) site_map: rhai::Map,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -178,15 +178,8 @@ impl Site {
         let config = config::load(root, opts.env.as_deref()).map_err(|e| vec![e])?;
         let mut engine = ScriptEngine::new(root);
         engine.set_base_url(&config.base_url);
-        let include_dirs: Vec<PathBuf> = config
-            .theme
-            .iter()
-            .map(|t| t.join("includes"))
-            .chain([root.join("includes")])
-            .filter(|d| d.is_dir())
-            .collect();
         let include_errors = engine
-            .load_includes(&include_dirs)
+            .load_includes(&include_dirs(root, &config))
             .err()
             .unwrap_or_default();
         let includes_broken = !include_errors.is_empty();
@@ -524,7 +517,34 @@ impl Site {
         Ok(report)
     }
 
-    fn in_broken_dir(&self, page: &Page) -> bool {
+    /// The page a user means by a source path relative to the site root (`content/blog/x.md`), a path relative to
+    /// `content/` (`blog/x.md`) or a URL (`/blog/x/`). Drafts are found too.
+    pub fn find_page(&self, query: &str) -> Option<&Page> {
+        let query = query.trim();
+        let query = query.strip_prefix("./").unwrap_or(query);
+        if query.starts_with('/') {
+            let url = query.trim_end_matches('/');
+            return self
+                .pages
+                .iter()
+                .find(|p| p.route.url == query || p.route.url.trim_end_matches('/') == url);
+        }
+        let joined = |p: &Path| {
+            p.components()
+                .map(|c| c.as_os_str().to_string_lossy())
+                .collect::<Vec<_>>()
+                .join("/")
+        };
+        self.pages.iter().find(|p| {
+            p.source == Path::new(query)
+                || p.source
+                    .strip_prefix(&self.root)
+                    .is_ok_and(|rel| joined(rel) == query)
+                || (!p.from_static && joined(&p.rel) == query)
+        })
+    }
+
+    pub(crate) fn in_broken_dir(&self, page: &Page) -> bool {
         !page.from_static
             && page
                 .rel
@@ -541,7 +561,7 @@ impl Site {
 
     /// Renders one page or template to its final output text, layout included. A Markdown page also returns what the
     /// tree pass found in its final body tree.
-    fn render_page(
+    pub(crate) fn render_page(
         &self,
         page: &Page,
         scopes: &page::SiteScopes<'_>,
@@ -716,6 +736,17 @@ fn check_html(page: &Page, html: String, tree: Option<TreeReport>) -> Rendered {
         findings,
         links: report.links,
     }
+}
+
+/// The folders of `*.rhai` includes that exist, lowest precedence first: the theme's, then the site's.
+pub(crate) fn include_dirs(root: &Path, config: &Config) -> Vec<PathBuf> {
+    config
+        .theme
+        .iter()
+        .map(|t| t.join("includes"))
+        .chain([root.join("includes")])
+        .filter(|d| d.is_dir())
+        .collect()
 }
 
 fn in_pool<R: Send>(pool: Option<&rayon::ThreadPool>, f: impl FnOnce() -> R + Send) -> R {

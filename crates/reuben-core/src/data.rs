@@ -105,7 +105,7 @@ pub fn load(root: &Path, engine: Option<&ScriptEngine>, site: &Map) -> (SiteData
 }
 
 /// `data/team/members.toml` becomes `["team", "members"]`.
-fn key_for(dir: &Path, path: &Path) -> Vec<String> {
+pub(crate) fn key_for(dir: &Path, path: &Path) -> Vec<String> {
     let rel = path.strip_prefix(dir).unwrap_or(path);
     let mut keys: Vec<String> = rel
         .components()

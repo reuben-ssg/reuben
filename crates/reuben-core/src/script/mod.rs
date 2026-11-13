@@ -4,6 +4,8 @@ pub mod collection;
 pub(crate) mod helpers;
 mod includes;
 
+pub(crate) use includes::list_rhai;
+
 use std::path::{Path, PathBuf};
 
 use crate::blocks::{Block, BlockKind};

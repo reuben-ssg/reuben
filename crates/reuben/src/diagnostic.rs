@@ -4,6 +4,7 @@ use std::path::Path;
 
 use reuben_core::check::Finding;
 use reuben_core::doc::Span;
+use reuben_core::explain::{Entry, Explanation, Source};
 use reuben_core::script::Frame;
 use reuben_core::{Error, ErrorKind};
 
@@ -81,6 +82,50 @@ pub fn render_finding(finding: &Finding, source: Option<&str>, root: &Path) -> S
     if let Some(origin) = &finding.include {
         let file = origin.file.strip_prefix(root).unwrap_or(&origin.file);
         out += &format!("{pad}= note: from {}:{}\n", file.display(), origin.line);
+    }
+    out
+}
+
+/// The page, a blank line, then one row per name: name, value and where it was set, in aligned columns.
+/// Files are named relative to the site `root`.
+pub fn render_explanation(explanation: &Explanation, root: &Path) -> String {
+    let relative = |file: &Path| {
+        file.strip_prefix(root)
+            .unwrap_or(file)
+            .display()
+            .to_string()
+    };
+    let origin = |source: &Source| match source {
+        Source::FrontMatter { file, line }
+        | Source::DirDefaults { file, line }
+        | Source::Config { file, line }
+        | Source::Data { file, line }
+        | Source::Sidecar { file, line }
+        | Source::Include { file, line } => match line {
+            Some(line) => format!("{}:{line}", relative(file)),
+            None => relative(file),
+        },
+        Source::Computed => "computed".to_string(),
+        Source::Collection { name } => format!("collection {name}"),
+        Source::Helper => "built-in".to_string(),
+    };
+    let width = |column: fn(&Entry) -> &str| {
+        explanation
+            .entries
+            .iter()
+            .map(|e| column(e).chars().count())
+            .max()
+            .unwrap_or(0)
+    };
+    let (names, values) = (width(|e| &e.name), width(|e| &e.value));
+    let mut out = format!("{} ({})\n\n", relative(&explanation.page), explanation.url);
+    for e in &explanation.entries {
+        out += &format!(
+            "{:<names$}  {:<values$}  {}\n",
+            e.name,
+            e.value,
+            origin(&e.source)
+        );
     }
     out
 }
@@ -198,6 +243,57 @@ mod tests {
         assert_eq!(
             render_finding(&html, None, Path::new("/site")),
             "warning[link-text]: bad link\n  --> content/p.md (built as a/index.html, line 14)\n"
+        );
+    }
+
+    #[test]
+    fn renders_explanation_rows_with_root_relative_origins() {
+        let entry = |name: &str, value: &str, source| Entry {
+            name: name.into(),
+            value: value.into(),
+            source,
+        };
+        let explanation = Explanation {
+            page: "/site/content/a.md".into(),
+            url: "/a/".into(),
+            entries: vec![
+                entry(
+                    "page.x",
+                    "1",
+                    Source::DirDefaults {
+                        file: "/site/content/_dir.toml".into(),
+                        line: Some(3),
+                    },
+                ),
+                entry("page.url", "\"/a/\"", Source::Computed),
+                entry(
+                    "collections.blog",
+                    "2 pages",
+                    Source::Collection {
+                        name: "blog".into(),
+                    },
+                ),
+                entry("helpers", "raw", Source::Helper),
+                entry(
+                    "data.d",
+                    "#{}",
+                    Source::Data {
+                        file: "/elsewhere/d.json".into(),
+                        line: None,
+                    },
+                ),
+            ],
+            errors: Vec::new(),
+        };
+        assert_eq!(
+            render_explanation(&explanation, Path::new("/site")),
+            "content/a.md (/a/)\n\
+             \n\
+             page.x            1        content/_dir.toml:3\n\
+             page.url          \"/a/\"    computed\n\
+             collections.blog  2 pages  collection blog\n\
+             helpers           raw      built-in\n\
+             data.d            #{}      /elsewhere/d.json\n"
         );
     }
 

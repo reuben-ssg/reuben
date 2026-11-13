@@ -22,6 +22,17 @@ fn origin_of(ctx: &NativeCallContext, files: &IncludeFiles) -> Option<Origin> {
     })
 }
 
+/// The helper functions `register` and `register_url_for` add, for `reuben explain`.
+pub const NAMES: [&str; 7] = [
+    "raw",
+    "escape",
+    "markdown",
+    "sort_by",
+    "load_data",
+    "url_for",
+    "format_date",
+];
+
 pub fn register(engine: &mut Engine, site_root: &Path, include_files: &IncludeFiles) {
     let root: PathBuf = site_root.to_path_buf();
     let (raw_files, markdown_files) = (include_files.clone(), include_files.clone());

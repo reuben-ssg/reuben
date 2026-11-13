@@ -72,7 +72,7 @@ impl ScriptEngine {
     }
 }
 
-fn list_rhai(dir: &Path) -> std::io::Result<Vec<PathBuf>> {
+pub(crate) fn list_rhai(dir: &Path) -> std::io::Result<Vec<PathBuf>> {
     let mut files = Vec::new();
     for entry in std::fs::read_dir(dir)? {
         let path = entry?.path();

@@ -79,6 +79,17 @@ enum Command {
         #[arg(long, value_name = "N")]
         jobs: Option<usize>,
     },
+    /// List every name in scope for a page, with the file and line that set it.
+    Explain {
+        /// The page: a path like `content/blog/x.md` or `blog/x.md`, or a URL like `/blog/x/`.
+        page: String,
+        /// Site root, containing `content/` and optionally `static/`.
+        #[arg(long, default_value = ".")]
+        root: PathBuf,
+        /// Merge `reuben.<name>.toml` over `reuben.toml` if it exists.
+        #[arg(long)]
+        env: Option<String>,
+    },
     /// Print stylesheets that go with build output.
     #[command(subcommand)]
     Css(CssCommand),
@@ -116,6 +127,7 @@ fn main() -> ExitCode {
             env,
             jobs,
         } => check(&root, drafts, env, jobs),
+        Command::Explain { page, root, env } => explain(&page, &root, env),
         Command::Css(CssCommand::Highlight { theme }) => match highlight::theme_css(&theme) {
             Ok(css) => {
                 print!("{css}");
@@ -185,6 +197,27 @@ fn check(root: &Path, drafts: bool, env: Option<String>, jobs: Option<usize>) ->
         }
     }
     ExitCode::FAILURE
+}
+
+/// Prints the names in scope for one page, then any errors found along the way. Exits 1 if there were any.
+fn explain(page: &str, root: &Path, env: Option<String>) -> ExitCode {
+    let explained = Site::load_with(root, &LoadOptions { env }).and_then(|site| site.explain(page));
+    match explained {
+        Ok(explanation) => {
+            print!("{}", diagnostic::render_explanation(&explanation, root));
+            print_errors(&explanation.errors);
+            if explanation.errors.is_empty() {
+                ExitCode::SUCCESS
+            } else {
+                eprintln!("{}", error_summary(&explanation.errors));
+                ExitCode::FAILURE
+            }
+        }
+        Err(errors) => {
+            print_errors(&errors);
+            ExitCode::FAILURE
+        }
+    }
 }
 
 fn print_findings(findings: &[Finding], root: &Path) {

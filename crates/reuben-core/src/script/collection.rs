@@ -21,6 +21,10 @@ impl Collection {
             tree: Arc::new(tree),
         }
     }
+
+    pub fn page_count(&self) -> usize {
+        self.pages.len()
+    }
 }
 
 impl IntoIterator for Collection {
