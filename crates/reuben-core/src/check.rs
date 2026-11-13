@@ -8,7 +8,7 @@ use std::path::{Path, PathBuf};
 
 use reuben_a11y::{Item, LocalLink, Rule, RuleSet, check_page, check_tree, fragment_items};
 
-use crate::doc::{Document, Node, NodeKind, Origin, Span};
+use crate::doc::{Document, Fill, Node, NodeKind, Origin, Span};
 use crate::html;
 use crate::splice::{Markup, Output};
 
@@ -217,7 +217,17 @@ fn walk(node: &Node, outputs: &[Output], items: &mut Vec<Item<At>>) {
     };
     match &node.kind {
         NodeKind::HtmlBlock(text) | NodeKind::Raw(text) => {
-            fragment(&[(text.clone(), None)], &[], node.span, true, items);
+            fragment(
+                &[(text.clone(), Place::Written { shift: 0 })],
+                &[],
+                node.span,
+                items,
+            );
+        }
+        NodeKind::FilledHtmlBlock { html, fills } => {
+            let mut origins = Vec::new();
+            let pieces = filled_pieces(html, fills, outputs, &mut origins);
+            fragment(&pieces, &origins, node.span, items);
         }
         NodeKind::Generated {
             html,
@@ -225,8 +235,8 @@ fn walk(node: &Node, outputs: &[Output], items: &mut Vec<Item<At>>) {
             inline: false,
         } => {
             let mut origins = Vec::new();
-            let pieces = generated_pieces(html, outputs.get(*block), &mut origins);
-            fragment(&pieces, &origins, node.span, true, items);
+            let pieces = generated_pieces(html, outputs.get(*block), 1, &mut origins);
+            fragment(&pieces, &origins, node.span, items);
         }
         _ if has_inline_html(node) => mixed(node, outputs, items),
         NodeKind::Heading { level, id } => {
@@ -299,23 +309,27 @@ fn mixed(node: &Node, outputs: &[Output], items: &mut Vec<Item<At>>) {
     let marked = with_markers(node, &mut generated);
     let rendered = html::render_node(&marked);
 
+    let own = Place::Made {
+        line: 1,
+        origin: None,
+    };
     let mut origins = Vec::new();
-    let mut pieces: Vec<(String, Option<usize>)> = Vec::new();
+    let mut pieces: Vec<(String, Place)> = Vec::new();
     let mut rest = rendered.as_str();
     while let Some(start) = rest.find(MARK_OPEN) {
-        pieces.push((rest[..start].to_string(), None));
+        pieces.push((rest[..start].to_string(), own));
         let after = &rest[start + MARK_OPEN.len_utf8()..];
         let Some((number, tail)) = after.split_once(MARK_CLOSE) else {
             rest = after;
             continue;
         };
         if let Some((text, block)) = number.parse::<usize>().ok().and_then(|n| generated.get(n)) {
-            pieces.extend(generated_pieces(text, outputs.get(*block), &mut origins));
+            pieces.extend(generated_pieces(text, outputs.get(*block), 1, &mut origins));
         }
         rest = tail;
     }
-    pieces.push((rest.to_string(), None));
-    fragment(&pieces, &origins, node.span, false, items);
+    pieces.push((rest.to_string(), own));
+    fragment(&pieces, &origins, node.span, items);
 }
 
 const MARK_OPEN: char = '\u{E100}';
@@ -356,17 +370,30 @@ fn with_markers(node: &Node, generated: &mut Vec<(String, usize)>) -> Node {
     }
 }
 
-/// Cuts a block's `html` at the ranges its `Markup` says came from includes. A range's piece is labelled with an
-/// index into `origins`; gaps are labelled `None`. A `Markup` that doesn't match `html` contributes no origins.
+/// Where the items in a piece of HTML are located, relative to the node the HTML belongs to.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum Place {
+    /// HTML written in the page, so its lines are page lines: an item is at the node's line plus its line in the
+    /// whole input, less `shift`, the lines that generated HTML before it added.
+    Written { shift: usize },
+    /// HTML a block made, or a node rendered whole: every item is at the node's `line`-th line (1-based), and
+    /// `origin` indexes the include that wrote it. Lines within generated HTML aren't lines of the page.
+    Made { line: usize, origin: Option<usize> },
+}
+
+/// Cuts a block's `html` at the ranges its `Markup` says came from includes. Every piece is made at `line`; a range's
+/// piece names an index into `origins`. A `Markup` that doesn't match `html` contributes no origins.
 fn generated_pieces(
     text: &str,
     output: Option<&Output>,
+    line: usize,
     origins: &mut Vec<Origin>,
-) -> Vec<(String, Option<usize>)> {
+) -> Vec<(String, Place)> {
     let mut ranges: Vec<&(Range<usize>, Origin)> = match output {
         Some(Output::Html(Markup { html, origins })) if html == text => origins.iter().collect(),
         _ => Vec::new(),
     };
+    let made = |origin| Place::Made { line, origin };
     // Where ranges nest, the outer one is cut first and the inner is skipped.
     ranges.sort_by_key(|(range, _)| (range.start, Reverse(range.end)));
     let mut pieces = Vec::new();
@@ -376,40 +403,68 @@ fn generated_pieces(
             continue;
         };
         if !gap.is_empty() {
-            pieces.push((gap.to_string(), None));
+            pieces.push((gap.to_string(), made(None)));
         }
         origins.push(origin.clone());
-        pieces.push((piece.to_string(), Some(origins.len() - 1)));
+        pieces.push((piece.to_string(), made(Some(origins.len() - 1))));
         pos = range.end;
     }
     if let Some(tail) = text.get(pos..).filter(|tail| !tail.is_empty()) {
-        pieces.push((tail.to_string(), None));
+        pieces.push((tail.to_string(), made(None)));
     }
     pieces
 }
 
-/// Parses `pieces` as HTML and adds the items found. With `offset`, an item's line is the node's line plus its line
-/// within the HTML; otherwise every item is at the node's line. An item from an include is always at the node's line
-/// (the include call), because lines in include output aren't lines of the page.
-fn fragment(
-    pieces: &[(String, Option<usize>)],
-    origins: &[Origin],
-    span: Span,
-    offset: bool,
-    items: &mut Vec<Item<At>>,
-) {
-    let refs: Vec<(&str, Option<usize>)> = pieces.iter().map(|(t, l)| (t.as_str(), *l)).collect();
+/// Cuts a filled HTML block into the text written in the page and each block's output, which is made at the line of
+/// its placeholder.
+fn filled_pieces(
+    html: &str,
+    fills: &[Fill],
+    outputs: &[Output],
+    origins: &mut Vec<Origin>,
+) -> Vec<(String, Place)> {
+    let mut pieces = Vec::new();
+    let mut pos = 0;
+    let mut shift = 0;
+    for fill in fills {
+        let (Some(gap), Some(text)) = (
+            html.get(pos..fill.range.start),
+            html.get(fill.range.clone()),
+        ) else {
+            continue;
+        };
+        pieces.push((gap.to_string(), Place::Written { shift }));
+        pieces.extend(generated_pieces(
+            text,
+            outputs.get(fill.block),
+            fill.line,
+            origins,
+        ));
+        shift += text.matches('\n').count();
+        pos = fill.range.end;
+    }
+    if let Some(tail) = html.get(pos..) {
+        pieces.push((tail.to_string(), Place::Written { shift }));
+    }
+    pieces
+}
+
+/// Parses `pieces` as HTML and adds the items found, each located by its piece's `Place`.
+fn fragment(pieces: &[(String, Place)], origins: &[Origin], span: Span, items: &mut Vec<Item<At>>) {
+    let refs: Vec<(&str, Place)> = pieces.iter().map(|(t, p)| (t.as_str(), *p)).collect();
     for item in fragment_items(&refs) {
-        items.push(map_at(item, |(label, line)| At {
-            span: Span {
-                line: if offset && label.is_none() {
-                    span.line + line - 1
-                } else {
-                    span.line
+        items.push(map_at(item, |(place, line)| {
+            let (line, origin) = match place {
+                Place::Written { shift } => ((span.line + line - 1).saturating_sub(shift), None),
+                Place::Made { line, origin } => (span.line + line - 1, origin),
+            };
+            At {
+                span: Span {
+                    line,
+                    column: span.column,
                 },
-                column: span.column,
-            },
-            include: label.and_then(|i| origins.get(i).cloned()),
+                include: origin.and_then(|i| origins.get(i).cloned()),
+            }
         }));
     }
 }

@@ -62,6 +62,12 @@ pub enum NodeKind {
     SoftBreak,
     LineBreak,
     HtmlBlock(String),
+    /// An `HtmlBlock` after its placeholders were filled with block output. It renders exactly like `HtmlBlock`;
+    /// `fills` says which bytes of `html` each block wrote, so later stages can trace them.
+    FilledHtmlBlock {
+        html: String,
+        fills: Vec<Fill>,
+    },
     HtmlInline(String),
     /// The HTML that block number `block` (its index in the page's extracted blocks) produced, spliced at block
     /// level or inline. It renders exactly like `HtmlBlock`/`HtmlInline`; the index lets later stages find the
@@ -97,6 +103,15 @@ pub enum NodeKind {
     },
     /// Already-rendered HTML for a construct the tree doesn't model yet, so nothing is dropped.
     Raw(String),
+}
+
+/// The output of block number `block` in a `FilledHtmlBlock`: the byte range of the block's `html` it fills, and the
+/// 1-based line of the HTML block its placeholder was on.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Fill {
+    pub range: std::ops::Range<usize>,
+    pub block: usize,
+    pub line: usize,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]

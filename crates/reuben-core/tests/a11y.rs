@@ -150,6 +150,78 @@ fn include_finding_names_both() {
     }
 }
 
+/// Each `link-text` finding as (page line, include file name and line).
+fn link_text_lines(all: &[Finding]) -> Vec<(usize, Option<(String, usize)>)> {
+    with_rule(all, Rule::LinkText)
+        .iter()
+        .map(|f| {
+            (
+                f.location.unwrap().line,
+                f.include.as_ref().map(|o| (names(&o.file), o.line)),
+            )
+        })
+        .collect()
+}
+
+#[test]
+fn include_output_inside_an_html_block_is_located_at_its_call() {
+    let tmp = site(&[
+        (
+            "includes/card.rhai",
+            "// a card\nfn card(name) {\n    raw(\"<div>\\n<a href='/\" + name + \"/'>read more</a>\\n</div>\")\n}\n",
+        ),
+        (
+            "content/index.md",
+            "---\ntitle: Home\n---\n# Home\n\n\
+             <div class=\"grid\">\n\
+             {{ card(\"a\") }}\n\
+             {{ card(\"b\") }}\n\
+             <a href=\"/x/\">here</a>\n\
+             </div>\n",
+        ),
+    ]);
+    let card = Some(("card.rhai".to_string(), 3));
+    assert_eq!(
+        link_text_lines(&findings(&tmp)),
+        [(7, card.clone()), (8, card), (9, None)]
+    );
+}
+
+#[test]
+fn include_calling_include_names_the_inner_one() {
+    let tmp = site(&[
+        ("includes/outer.rhai", "fn outer() {\n    inner()\n}\n"),
+        (
+            "includes/inner.rhai",
+            "// inner\n\nfn inner() {\n    raw(\"<a href='/'>here</a>\")\n}\n",
+        ),
+        (
+            "includes/md.rhai",
+            "fn md() {\n    markdown(\"[more](/)\")\n}\n",
+        ),
+        (
+            "content/index.md",
+            "---\ntitle: Home\n---\n# Home\n\n{{ outer() }}\n\n<div>\n{{ md() }}\n</div>\n",
+        ),
+    ]);
+    assert_eq!(
+        link_text_lines(&findings(&tmp)),
+        [
+            (6, Some(("inner.rhai".to_string(), 4))),
+            (9, Some(("md.rhai".to_string(), 2)))
+        ]
+    );
+}
+
+#[test]
+fn page_made_generated_blocks_are_located_at_the_call() {
+    let tmp = site(&[(
+        "content/index.md",
+        "---\ntitle: Home\n---\n# Home\n{{ markdown(\"Intro\\n\\nMore:\\n\\n[here](/)\") }}\n\nEnd.\n",
+    )]);
+    assert_eq!(link_text_lines(&findings(&tmp)), [(5, None)]);
+}
+
 #[test]
 fn broken_link_and_draft_target() {
     let tmp = site(&[

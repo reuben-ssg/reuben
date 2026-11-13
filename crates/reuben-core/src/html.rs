@@ -209,6 +209,7 @@ fn block(out: &mut String, node: &Node, tight: bool, ctx: &RenderCtx) {
             out.push_str("<hr />\n");
         }
         NodeKind::HtmlBlock(html)
+        | NodeKind::FilledHtmlBlock { html, .. }
         | NodeKind::Generated {
             html,
             inline: false,
