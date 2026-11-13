@@ -8,12 +8,14 @@ use reuben_core::explain::{Entry, Explanation, Source};
 use reuben_core::script::Frame;
 use reuben_core::{Error, ErrorKind};
 
-/// `path` as it is printed in a diagnostic: relative to the site `root`, or in full when it is outside it.
+/// `path` as it is printed in a diagnostic: relative to the site `root`, or in full when it is outside it. The root
+/// itself is `.`.
 fn shown(path: &Path, root: &Path) -> String {
-    path.strip_prefix(root)
-        .unwrap_or(path)
-        .display()
-        .to_string()
+    match path.strip_prefix(root) {
+        Ok(rel) if rel.as_os_str().is_empty() => ".".to_string(),
+        Ok(rel) => rel.display().to_string(),
+        Err(_) => path.display().to_string(),
+    }
 }
 
 /// Formats `error`; `source` is the text of `error.path`, when it could be read. Files are named relative to the

@@ -90,3 +90,22 @@ fn explain_unknown_page_fails() {
         .code(1)
         .stderr(predicates::str::contains("/nope/"));
 }
+
+#[test]
+fn an_error_about_the_root_names_it_as_dot() {
+    let tmp = site(&[("content/a.md", "---\ntitle: A\n---\nA\n")]);
+    assert!(tmp.path().is_absolute());
+    let out = reuben()
+        .args(["explain", "nope", "--root"])
+        .arg(tmp.path())
+        .assert()
+        .code(1)
+        .get_output()
+        .clone();
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(!stderr.contains("error: :"), "{stderr}");
+    assert!(
+        stderr.starts_with("error: .: no page matches `nope`"),
+        "{stderr}"
+    );
+}
