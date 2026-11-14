@@ -3,7 +3,7 @@ use std::path::Path;
 
 use assert_fs::TempDir;
 use assert_fs::prelude::*;
-use reuben_core::site::{BuildOptions, Site};
+use reuben_core::site::{BuildOptions, Failure, Site};
 
 fn build(drafts: bool) -> (TempDir, String) {
     let tmp = TempDir::new().unwrap();
@@ -51,7 +51,7 @@ fn drafts_flag_adds_drafts_to_collections() {
     assert!(html.contains("DBAC|4|"), "{html}");
 }
 
-fn build_with_page(body: &str) -> Vec<reuben_core::Error> {
+fn build_with_page(body: &str) -> Failure {
     let tmp = TempDir::new().unwrap();
     let src = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/sites/collections");
     tmp.copy_from(src, &["**"]).unwrap();

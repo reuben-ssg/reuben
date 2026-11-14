@@ -106,7 +106,13 @@ fn collect(node: &Node, s: &mut String) {
         NodeKind::Text(t) | NodeKind::Code(t) => s.push_str(t),
         NodeKind::Math { latex, .. } => s.push_str(latex),
         NodeKind::SoftBreak | NodeKind::LineBreak => s.push(' '),
-        NodeKind::HtmlInline(h) | NodeKind::Raw(h) => s.push_str(&decode(&strip_tags(h))),
+        NodeKind::HtmlInline(h)
+        | NodeKind::Generated {
+            html: h,
+            inline: true,
+            ..
+        }
+        | NodeKind::Raw(h) => s.push_str(&decode(&strip_tags(h))),
         _ => node.children.iter().for_each(|c| collect(c, s)),
     }
 }

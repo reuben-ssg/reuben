@@ -3,8 +3,7 @@ use std::path::Path;
 
 use assert_fs::TempDir;
 use assert_fs::prelude::*;
-use reuben_core::Error;
-use reuben_core::site::{BuildOptions, BuildReport, Site};
+use reuben_core::site::{BuildOptions, BuildReport, Failure, Site};
 
 fn cascade_site() -> TempDir {
     let tmp = TempDir::new().unwrap();
@@ -13,7 +12,7 @@ fn cascade_site() -> TempDir {
     tmp
 }
 
-fn build(root: &Path, drafts: bool) -> Result<BuildReport, Vec<Error>> {
+fn build(root: &Path, drafts: bool) -> Result<BuildReport, Failure> {
     Site::load(root)?.build(&BuildOptions {
         drafts,
         out: root.join("dist"),

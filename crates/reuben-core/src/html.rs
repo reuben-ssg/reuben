@@ -47,6 +47,18 @@ pub fn render_with(doc: &Document, highlighter: &dyn Highlighter) -> String {
     out
 }
 
+/// Renders one node on its own, for stages that need a part of the page as HTML.
+pub(crate) fn render_node(node: &Node) -> String {
+    let mut out = String::new();
+    block(
+        &mut out,
+        node,
+        false,
+        &RenderCtx::of(node, default_highlighter()),
+    );
+    out
+}
+
 pub fn escape_text(s: &str) -> Cow<'_, str> {
     escape(s)
 }
@@ -196,7 +208,14 @@ fn block(out: &mut String, node: &Node, tight: bool, ctx: &RenderCtx) {
             cr(out);
             out.push_str("<hr />\n");
         }
-        NodeKind::HtmlBlock(html) | NodeKind::Raw(html) => {
+        NodeKind::HtmlBlock(html)
+        | NodeKind::FilledHtmlBlock { html, .. }
+        | NodeKind::Generated {
+            html,
+            inline: false,
+            ..
+        }
+        | NodeKind::Raw(html) => {
             cr(out);
             out.push_str(html);
         }
@@ -374,7 +393,11 @@ fn inline(out: &mut String, node: &Node, ctx: &RenderCtx) {
             let d = if *display { "$$" } else { "$" };
             let _ = write!(out, "{d}{}{d}", escape_text(latex));
         }
-        NodeKind::HtmlInline(html) | NodeKind::Raw(html) => out.push_str(html),
+        NodeKind::HtmlInline(html)
+        | NodeKind::Generated {
+            html, inline: true, ..
+        }
+        | NodeKind::Raw(html) => out.push_str(html),
         _ => block(out, node, false, ctx),
     }
 }

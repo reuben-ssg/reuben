@@ -390,3 +390,33 @@ fn serve_writes_nothing_to_the_site() {
         .collect();
     assert_eq!(names, ["content"]);
 }
+
+#[test]
+fn serve_rebuild_reports_findings() {
+    let tmp = site("# T\n\nHello\n");
+    let serve = start(tmp.path());
+    tmp.child("content/.index.md.tmp")
+        .write_str(&page("# T\n\n[click here](/) Goodbye"))
+        .unwrap();
+    std::fs::rename(
+        tmp.path().join("content/.index.md.tmp"),
+        tmp.path().join("content/index.md"),
+    )
+    .unwrap();
+    assert!(
+        wait_until(Duration::from_secs(20), || body_contains(
+            serve.port, "Goodbye"
+        )),
+        "stderr: {}",
+        serve_stderr(&serve)
+    );
+    wait_rebuilt(&serve);
+    assert!(
+        wait_until(Duration::from_secs(5), || stderr_contains(
+            &serve,
+            "warning[link-text]"
+        )),
+        "stderr: {}",
+        serve_stderr(&serve)
+    );
+}

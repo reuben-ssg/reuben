@@ -1,0 +1,5 @@
+---
+source: crates/reuben-core/tests/provenance.rs
+expression: html
+---
+<rss>&lt;item&gt;a&lt;/item&gt;&lt;item&gt;b&lt;/item&gt;</rss>

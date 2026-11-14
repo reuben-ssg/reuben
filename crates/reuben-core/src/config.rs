@@ -3,6 +3,7 @@
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
+use reuben_a11y::RuleSet;
 use serde_json::{Map, Value};
 
 use crate::error::{Error, ErrorKind};
@@ -17,7 +18,16 @@ pub struct Config {
     pub collections: BTreeMap<String, CollectionConfig>,
     pub sitemap: bool,
     pub css: CssConfig,
+    /// The accessibility rules that are on for every page, before a page's own switches.
+    pub a11y: RuleSet,
     pub sources: BTreeMap<String, PathBuf>,
+}
+
+/// The `[a11y]` table: rules switched off site-wide, by id.
+#[derive(Debug, Clone, PartialEq, Eq, Default, serde::Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct A11yConfig {
+    pub disable: Vec<String>,
 }
 
 /// The `[css]` table: how every CSS file in the output is processed.
@@ -62,6 +72,8 @@ struct Raw {
     sitemap: Option<bool>,
     #[serde(default)]
     css: CssConfig,
+    #[serde(default)]
+    a11y: A11yConfig,
 }
 
 fn read_layer(path: &Path) -> Result<Option<Map<String, Value>>, Error> {
@@ -126,6 +138,16 @@ pub fn load(root: &Path, env: Option<&str>) -> Result<Config, Error> {
             ErrorKind::Config(format!("css.targets: {message}")),
         ));
     }
+    let (a11y, unknown) = crate::check::switch_off(RuleSet::all(), &raw.a11y.disable);
+    if !unknown.is_empty() {
+        let blamed = layered.sources.get("a11y.disable").unwrap_or(&path);
+        let message = unknown
+            .iter()
+            .map(|id| format!("unknown accessibility rule `{id}`"))
+            .collect::<Vec<_>>()
+            .join("; ");
+        return Err(Error::new(blamed, ErrorKind::Config(message)));
+    }
     Ok(Config {
         title: raw.title.unwrap_or_default(),
         base_url: raw.base_url.unwrap_or_else(|| "/".into()),
@@ -134,6 +156,7 @@ pub fn load(root: &Path, env: Option<&str>) -> Result<Config, Error> {
         collections: raw.collections,
         sitemap: raw.sitemap.unwrap_or(true),
         css: raw.css,
+        a11y,
         sources: layered.sources,
     })
 }

@@ -1,0 +1,11 @@
+---
+source: crates/reuben-core/tests/provenance.rs
+expression: html
+---
+<!doctype html>
+<html lang="en"><head><title>Home</title></head><body><section class='card'><h2>layout</h2></section><main><section class='card'><h2>alone</h2></section>
+<p>Inline <section class='card'><h2>mid</h2></section> text and <b>page</b> and &lt;escaped&gt;.</p>
+<section class='card'><h2>one</h2></section>&lt;<p><em>two</em></p>
+<h1 id="heading-h">Heading <p><em>h</em></p>
+</h1>
+</main></body></html>

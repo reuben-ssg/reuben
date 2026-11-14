@@ -35,10 +35,16 @@ pub enum ErrorKind {
     Config(String),
     #[error("data: {0}")]
     Data(String),
+    #[error("unknown accessibility rule `{0}`")]
+    UnknownRule(String),
     #[error("layout `{0}` not found in the site or its theme")]
     LayoutNotFound(String),
     #[error("invalid layout name `{0}`: a layout is a plain file name in `layouts/`")]
     InvalidLayoutName(String),
+    #[error(
+        "no page matches `{0}`: give a path like content/blog/x.md, a path under content/ like blog/x.md, or a URL like /blog/x/"
+    )]
+    PageNotFound(String),
     #[error("internal error: a block placeholder was left in the rendered page")]
     UnsplicedPlaceholder,
     #[error("file is not valid UTF-8")]
@@ -72,8 +78,10 @@ impl Clone for ErrorKind {
             },
             Self::Config(s) => Self::Config(s.clone()),
             Self::Data(s) => Self::Data(s.clone()),
+            Self::UnknownRule(s) => Self::UnknownRule(s.clone()),
             Self::LayoutNotFound(s) => Self::LayoutNotFound(s.clone()),
             Self::InvalidLayoutName(s) => Self::InvalidLayoutName(s.clone()),
+            Self::PageNotFound(s) => Self::PageNotFound(s.clone()),
             Self::UnsplicedPlaceholder => Self::UnsplicedPlaceholder,
             Self::NotUtf8 => Self::NotUtf8,
             Self::OutputCollision { other, file } => Self::OutputCollision {

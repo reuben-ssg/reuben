@@ -1,0 +1,12 @@
+[package]
+name = "reuben-a11y"
+version = "0.0.0"
+description = "Accessibility rules for the Reuben static site generator."
+publish = false
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+html5ever.workspace = true

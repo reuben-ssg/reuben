@@ -3,7 +3,7 @@ use std::path::Path;
 
 use assert_fs::TempDir;
 use assert_fs::prelude::*;
-use reuben_core::site::{BuildOptions, Site};
+use reuben_core::site::{BuildOptions, Failure, Site};
 
 const FIXTURE: &str = "tests/fixtures/sites/templates";
 
@@ -103,7 +103,7 @@ fn fixture_copy() -> TempDir {
     tmp
 }
 
-fn build_in(tmp: &TempDir, drafts: bool) -> Result<(), Vec<reuben_core::Error>> {
+fn build_in(tmp: &TempDir, drafts: bool) -> Result<(), Failure> {
     Site::load(tmp.path())?
         .build(&BuildOptions {
             drafts,
@@ -276,7 +276,7 @@ fn site_of(files: &[(&str, &str)]) -> TempDir {
     tmp
 }
 
-fn run_build(tmp: &TempDir) -> Result<reuben_core::site::BuildReport, Vec<reuben_core::Error>> {
+fn run_build(tmp: &TempDir) -> Result<reuben_core::site::BuildReport, Failure> {
     Site::load(tmp.path())?.build(&BuildOptions {
         drafts: false,
         out: tmp.path().join("dist"),

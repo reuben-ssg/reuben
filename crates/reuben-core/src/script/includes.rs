@@ -55,6 +55,9 @@ impl ScriptEngine {
             )
         };
         let src = std::fs::read_to_string(path).map_err(|e| Error::new(path, e))?;
+        if let Ok(mut files) = self.include_files.write() {
+            files.insert(path.display().to_string());
+        }
         let mut ast = self
             .engine
             .compile(&src)
@@ -69,7 +72,7 @@ impl ScriptEngine {
     }
 }
 
-fn list_rhai(dir: &Path) -> std::io::Result<Vec<PathBuf>> {
+pub(crate) fn list_rhai(dir: &Path) -> std::io::Result<Vec<PathBuf>> {
     let mut files = Vec::new();
     for entry in std::fs::read_dir(dir)? {
         let path = entry?.path();
@@ -116,16 +119,16 @@ mod tests {
 
     #[test]
     fn includes_call_each_other_across_files() {
-        assert_eq!(
-            eval_with(&["theme"], "card(\"<x>\")").unwrap(),
-            Output::Html("<article><b>theme &lt;x&gt;</b></article>".into())
-        );
+        let Output::Html(m) = eval_with(&["theme"], "card(\"<x>\")").unwrap() else {
+            panic!("not html")
+        };
+        assert_eq!(m.html, "<article><b>theme &lt;x&gt;</b></article>");
     }
 
     #[test]
     fn site_include_overrides_theme() {
         match eval_with(&["theme", "site"], "card(\"y\")").unwrap() {
-            Output::Html(h) | Output::Text(h) => assert!(h.contains("<b>site y</b>"), "{h}"),
+            Output::Html(m) => assert!(m.html.contains("<b>site y</b>"), "{m:?}"),
             other => panic!("{other:?}"),
         }
     }

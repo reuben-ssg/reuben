@@ -2,7 +2,7 @@
 
 use std::path::Path;
 
-use crate::doc::{Document, Node, NodeKind};
+use crate::doc::{Document, Fill, Node, NodeKind, Origin};
 use crate::error::{Error, ErrorKind};
 
 /// What a block produced. `Text` is escaped text from strings and scalars, `Html` is raw markup from `Html` values,
@@ -10,14 +10,38 @@ use crate::error::{Error, ErrorKind};
 #[derive(Debug, Clone, PartialEq)]
 pub enum Output {
     Text(String),
-    Html(String),
+    Html(Markup),
     Nothing,
+}
+
+/// Raw markup plus the include lines that wrote parts of it. Each range is the byte range of `html` contributed by
+/// one `Html` value that came from an include.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct Markup {
+    pub html: String,
+    pub origins: Vec<(std::ops::Range<usize>, Origin)>,
+}
+
+impl From<&str> for Markup {
+    fn from(html: &str) -> Self {
+        html.to_string().into()
+    }
+}
+
+impl From<String> for Markup {
+    fn from(html: String) -> Self {
+        Self {
+            html,
+            origins: Vec::new(),
+        }
+    }
 }
 
 impl Output {
     fn markup(&self) -> Option<&str> {
         match self {
-            Output::Text(s) | Output::Html(s) => Some(s),
+            Output::Text(s) => Some(s),
+            Output::Html(m) => Some(&m.html),
             Output::Nothing => None,
         }
     }
@@ -104,6 +128,33 @@ fn replace_with(s: &str, outputs: &[Output], f: impl Fn(&str) -> String) -> Stri
     replace_pieces(pieces(s), outputs, f)
 }
 
+/// Fills an HTML block's placeholders with their output as is, recording where each output went.
+fn fill_html_block(s: &str, outputs: &[Output]) -> NodeKind {
+    let mut html = String::new();
+    let mut fills = Vec::new();
+    let mut line = 1;
+    for piece in pieces(s) {
+        match piece {
+            Piece::Text(t) => {
+                html.push_str(t);
+                line += t.matches('\n').count();
+            }
+            Piece::Slot(block) => {
+                if let Some(markup) = output(outputs, block).markup() {
+                    let start = html.len();
+                    html.push_str(markup);
+                    fills.push(Fill {
+                        range: start..html.len(),
+                        block,
+                        line,
+                    });
+                }
+            }
+        }
+    }
+    NodeKind::FilledHtmlBlock { html, fills }
+}
+
 /// Like `replace_with` for raw HTML, where a placeholder in a URL may be percent-encoded.
 fn replace_in_raw(s: &str, outputs: &[Output]) -> String {
     let decoded = replace_pieces(
@@ -165,8 +216,12 @@ fn splice_children(node: &mut Node, outputs: &[Output], in_image: bool) {
     for mut child in children {
         if let Some(n) = sole_placeholder(&child) {
             match output(outputs, n) {
-                Output::Html(h) => {
-                    child.kind = NodeKind::HtmlBlock(h.clone());
+                Output::Html(m) => {
+                    child.kind = NodeKind::Generated {
+                        html: m.html.clone(),
+                        block: n,
+                        inline: false,
+                    };
                     child.children.clear();
                     node.children.push(child);
                     continue;
@@ -180,10 +235,15 @@ fn splice_children(node: &mut Node, outputs: &[Output], in_image: bool) {
                 for piece in pieces(t) {
                     let kind = match piece {
                         Piece::Text(s) => NodeKind::Text(s.to_string()),
-                        Piece::Slot(n) => match output(outputs, n).markup() {
-                            Some(h) if in_image => NodeKind::Text(unescape(h)),
-                            Some(h) => NodeKind::HtmlInline(h.to_string()),
-                            None => continue,
+                        Piece::Slot(n) => match output(outputs, n) {
+                            Output::Nothing => continue,
+                            out if in_image => NodeKind::Text(unescape(out.markup().unwrap_or(""))),
+                            Output::Html(m) => NodeKind::Generated {
+                                html: m.html.clone(),
+                                block: n,
+                                inline: true,
+                            },
+                            Output::Text(s) => NodeKind::HtmlInline(s.clone()),
                         },
                     };
                     node.children.push(Node {
@@ -196,6 +256,9 @@ fn splice_children(node: &mut Node, outputs: &[Output], in_image: bool) {
             }
         }
         match &mut child.kind {
+            NodeKind::HtmlBlock(s) if has_placeholder(s) => {
+                child.kind = fill_html_block(s, outputs);
+            }
             NodeKind::HtmlBlock(s) | NodeKind::HtmlInline(s) => {
                 *s = replace_with(s, outputs, str::to_string);
             }
@@ -239,6 +302,39 @@ mod tests {
         );
     }
     #[test]
+    fn generated_nodes_carry_their_block() {
+        let mut d = doc(&format!("{}\n\nmid {} sentence\n", p(0), p(1)));
+        splice(
+            &mut d,
+            &[
+                Output::Html("<b>a</b>".into()),
+                Output::Html("<i>b</i>".into()),
+            ],
+        );
+        assert_eq!(
+            d.children[0].kind,
+            NodeKind::Generated {
+                html: "<b>a</b>".into(),
+                block: 0,
+                inline: false
+            }
+        );
+        let inline: Vec<_> = d.children[1]
+            .children
+            .iter()
+            .filter(|c| matches!(c.kind, NodeKind::Generated { .. }))
+            .map(|c| &c.kind)
+            .collect();
+        assert_eq!(
+            inline,
+            [&NodeKind::Generated {
+                html: "<i>b</i>".into(),
+                block: 1,
+                inline: true
+            }]
+        );
+    }
+    #[test]
     fn setup_block_paragraph_disappears() {
         assert_eq!(
             html(&format!("{}\n\nHi\n", p(0)), &[Output::Nothing]),
@@ -275,6 +371,34 @@ mod tests {
             "<div class=\"note\">\n</div>\n"
         );
     }
+    #[test]
+    fn filled_html_block_records_each_fill() {
+        let mut d = doc(&format!("<div>\n{}\n{}\n</div>\n", p(0), p(1)));
+        splice(
+            &mut d,
+            &[Output::Html("<b>\n</b>".into()), Output::Text("t".into())],
+        );
+        let NodeKind::FilledHtmlBlock { html, fills } = &d.children[0].kind else {
+            panic!("{:?}", d.children[0].kind);
+        };
+        assert_eq!(html, "<div>\n<b>\n</b>\nt\n</div>\n");
+        assert_eq!(
+            fills,
+            &[
+                Fill {
+                    range: 6..14,
+                    block: 0,
+                    line: 2
+                },
+                Fill {
+                    range: 15..16,
+                    block: 1,
+                    line: 3
+                }
+            ]
+        );
+    }
+
     #[test]
     fn output_in_table_cell() {
         assert!(

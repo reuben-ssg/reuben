@@ -3,7 +3,7 @@ use std::path::PathBuf;
 
 use assert_fs::TempDir;
 use assert_fs::prelude::*;
-use reuben_core::site::{RenderOptions, Site};
+use reuben_core::site::{Failure, RenderOptions, Site};
 use reuben_core::{Error, ErrorKind};
 
 const COLLECTIONS: [&str; 4] = ["alpha", "beta", "gamma", "delta"];
@@ -42,7 +42,7 @@ fn big_site() -> TempDir {
     tmp
 }
 
-fn render(site: &Site, jobs: usize) -> Result<reuben_core::output::Output, Vec<Error>> {
+fn render(site: &Site, jobs: usize) -> Result<reuben_core::output::Output, Failure> {
     site.render(&RenderOptions {
         drafts: false,
         jobs: Some(jobs),

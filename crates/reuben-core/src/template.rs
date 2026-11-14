@@ -57,8 +57,10 @@ pub fn substitute(text: &str, outputs: &[Output]) -> String {
         });
         match replacement {
             Some((out, consumed)) => {
-                if let Output::Text(s) | Output::Html(s) = out {
-                    result.push_str(s);
+                match out {
+                    Output::Text(s) => result.push_str(s),
+                    Output::Html(m) => result.push_str(&m.html),
+                    Output::Nothing => {}
                 }
                 rest = &after[consumed..];
             }

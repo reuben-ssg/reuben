@@ -3,6 +3,7 @@
 #![forbid(unsafe_code)]
 
 pub mod blocks;
+pub mod check;
 pub mod collections;
 pub mod config;
 pub mod css;
@@ -10,11 +11,13 @@ pub mod data;
 pub mod dirs;
 pub mod doc;
 pub mod error;
+pub mod explain;
 pub mod frontmatter;
 pub mod headings;
 pub mod highlight;
 pub mod html;
 pub mod layout;
+pub mod locate;
 pub mod markdown;
 pub mod math;
 pub mod merge;

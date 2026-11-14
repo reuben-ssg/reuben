@@ -2,29 +2,61 @@
 
 use std::path::{Path, PathBuf};
 
-use rhai::{Array, Dynamic, Engine, EvalAltResult};
+use rhai::{Array, Dynamic, Engine, EvalAltResult, NativeCallContext};
 
-use super::{Html, collection};
+use super::{Html, IncludeFiles, collection};
+use crate::doc::Origin;
 use crate::html::{escape_text, render};
 use crate::markdown::parse;
 use crate::math::render_math;
 
 type RhaiResult<T> = Result<T, Box<EvalAltResult>>;
 
-pub fn register(engine: &mut Engine, site_root: &Path) {
+/// The include file and line a native function was called from, or `None` when the caller isn't an include.
+fn origin_of(ctx: &NativeCallContext, files: &IncludeFiles) -> Option<Origin> {
+    let source = ctx.call_source()?;
+    let known = files.read().is_ok_and(|f| f.contains(source));
+    known.then(|| Origin {
+        file: PathBuf::from(source),
+        line: ctx.call_position().line().unwrap_or(0),
+    })
+}
+
+/// The helper functions `register` and `register_url_for` add, for `reuben explain`.
+pub const NAMES: [&str; 7] = [
+    "raw",
+    "escape",
+    "markdown",
+    "sort_by",
+    "load_data",
+    "url_for",
+    "format_date",
+];
+
+pub fn register(engine: &mut Engine, site_root: &Path, include_files: &IncludeFiles) {
     let root: PathBuf = site_root.to_path_buf();
+    let (raw_files, markdown_files) = (include_files.clone(), include_files.clone());
     engine
-        .register_fn("raw", |s: &str| Html(s.to_string()))
+        .register_fn("raw", move |ctx: NativeCallContext, s: &str| Html {
+            markup: s.to_string(),
+            origin: origin_of(&ctx, &raw_files),
+        })
         .register_fn("escape", |s: &str| escape_text(s).into_owned())
         // Never runs `{{ }}` blocks: it only parses and renders Markdown.
-        .register_fn("markdown", |s: &str| -> RhaiResult<Html> {
-            let mut doc = parse(s, 1);
-            render_math(&mut doc).map_err(|errors| {
-                let (span, message) = &errors[0];
-                format!("math at {}:{}: {message}", span.line, span.column)
-            })?;
-            Ok(Html(render(&doc)))
-        })
+        .register_fn(
+            "markdown",
+            move |ctx: NativeCallContext, s: &str| -> RhaiResult<Html> {
+                let mut doc = parse(s, 1);
+                render_math(&mut doc).map_err(|errors| {
+                    let (span, message) = &errors[0];
+                    format!("math at {}:{}: {message}", span.line, span.column)
+                })?;
+                Ok(Html {
+                    markup: render(&doc),
+                    origin: origin_of(&ctx, &markdown_files),
+                })
+            },
+        )
         .register_fn("sort_by", |items: &mut Array, key: &str| {
             collection::sorted(items, key)
         })
