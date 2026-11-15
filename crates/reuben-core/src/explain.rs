@@ -103,7 +103,7 @@ impl Site {
                     if let Err(e) = self.render_page(found, &scopes)
                         && !self.in_broken_dir(found)
                     {
-                        errors.extend(e);
+                        errors.extend(e.errors);
                     }
                 }
                 Err(e) => errors.extend(e),

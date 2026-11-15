@@ -23,6 +23,7 @@ use crate::frontmatter::{self, FrontMatter};
 use crate::headings::TocEntry;
 use crate::links::{AnchorRequest, LinkProblem, PageIndex, Target};
 use crate::output::{Output, OutputFile, check_out_dir, write_atomic};
+use crate::page::Failed;
 use crate::route::{Route, route_for_page, route_for_template};
 use crate::script::helpers::url_for;
 use crate::script::{Html, ScriptEngine};
@@ -163,13 +164,13 @@ struct Rendered {
 }
 
 impl Rendered {
-    fn unchecked(html: String, anchors: Vec<AnchorRequest>) -> Self {
+    fn unchecked(html: String) -> Self {
         Self {
             html,
             findings: Vec::new(),
             links: Vec::new(),
             ids: HashSet::new(),
-            anchors,
+            anchors: Vec::new(),
         }
     }
 }
@@ -357,9 +358,10 @@ impl Site {
             collections: &collections,
             pages: &index,
         };
-        let render_one = |page: &&Page| -> Result<Rendered, Vec<Error>> {
+        let render_one = |page: &&Page| -> Result<Rendered, Failed> {
             let (html, tree, anchors) = self.render_page(page, &scopes)?;
-            splice::ensure_no_placeholders(&page.source, &html).map_err(|e| vec![e])?;
+            splice::ensure_no_placeholders(&page.source, &html)
+                .map_err(|e| Failed::from(vec![e]))?;
             Ok(check_html(page, html, tree, anchors))
         };
         // A pool that can't start is reported, and the build carries on with rayon's default pool.
@@ -377,8 +379,8 @@ impl Site {
                 },
             );
         // Skipped pages count as failed with nothing to add, so templated partials still import as empty.
-        let rendered: Vec<Result<Rendered, Vec<Error>>> = if self.includes_broken {
-            pages.iter().map(|_| Err(Vec::new())).collect()
+        let rendered: Vec<Result<Rendered, Failed>> = if self.includes_broken {
+            pages.iter().map(|_| Err(Failed::default())).collect()
         } else {
             in_pool(pool.as_ref(), || pages.par_iter().map(render_one).collect())
         };
@@ -409,7 +411,7 @@ impl Site {
             let is_partial = is_partial_css(&page.route.file);
             partial_pages += usize::from(is_partial);
             let result = match result {
-                Err(_) if self.in_broken_dir(page) => Err(Vec::new()),
+                Err(_) if self.in_broken_dir(page) => Err(Failed::default()),
                 other => other,
             };
             if is_css(&page.route.file) {
@@ -442,7 +444,10 @@ impl Site {
                         OutputFile::Bytes(done.html.into_bytes()),
                     );
                 }
-                Err(mut e) => errors.append(&mut e),
+                Err(mut failed) => {
+                    errors.append(&mut failed.errors);
+                    page_anchors.push((page, failed.anchors));
+                }
             }
         }
         let statics = self.static_sources(opts.drafts);
@@ -639,7 +644,7 @@ impl Site {
         &self,
         page: &Page,
         scopes: &page::SiteScopes<'_>,
-    ) -> Result<(String, Option<TreeReport>, Vec<AnchorRequest>), Vec<Error>> {
+    ) -> Result<(String, Option<TreeReport>, Vec<AnchorRequest>), Failed> {
         let (body, mut scope, layout_name, tree, anchors) = match page.kind {
             PageKind::Markdown => {
                 let page::RenderedBody {
@@ -669,14 +674,19 @@ impl Site {
                 (text, scope, name, None, Vec::new())
             }
         };
+        let failed = |errors| Failed {
+            errors,
+            anchors: anchors.clone(),
+        };
         let layout = layout::find_layout(layout_name, &self.root, self.config.theme.as_deref())
             .map_err(|mut e| {
                 e.path.clone_from(&page.source);
-                vec![e]
+                failed(vec![e])
             })?;
         let html = match (layout, page.kind) {
             (Some(path), _) => {
-                layout::render_layout(&path, &self.engine, &mut scope, Html::new(body))?
+                layout::render_layout(&path, &self.engine, &mut scope, Html::new(body))
+                    .map_err(failed)?
             }
             (None, PageKind::Markdown) => builtin_page(&PageShell {
                 title: &page.front_matter.title,
@@ -799,7 +809,7 @@ fn check_html(
         PageKind::Template { .. } => page.route.file.extension().is_some_and(|e| e == "html"),
     };
     if !is_html {
-        return Rendered::unchecked(html, anchors);
+        return Rendered::unchecked(html);
     }
     let (mut findings, reported_ids) =
         tree.map_or_else(Default::default, |t| (t.findings, t.reported_ids));

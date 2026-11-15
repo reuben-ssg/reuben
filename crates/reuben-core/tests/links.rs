@@ -205,3 +205,84 @@ fn link_errors_are_identical_across_jobs() {
     assert!(one.len() >= 41, "{one:?}");
     assert_eq!(one, run(None));
 }
+
+fn messages(errors: &[reuben_core::Error]) -> Vec<String> {
+    errors
+        .iter()
+        .map(|e| {
+            format!(
+                "{}: {}",
+                e.path.file_name().unwrap().to_string_lossy(),
+                e.kind
+            )
+        })
+        .collect()
+}
+
+#[test]
+fn anchor_errors_survive_a_bad_link() {
+    let tmp = site_of(&[
+        (
+            "content/b.md",
+            &page("[a](@/missing.md)\n\n[b](@/c.md#nope)"),
+        ),
+        ("content/c.md", &page("# Top")),
+    ]);
+    let errors = build(&tmp).unwrap_err();
+    assert_eq!(
+        messages(&errors),
+        [
+            "b.md: no page `missing.md`",
+            "b.md: links to `#nope` on `c.md`, which has no such id"
+        ]
+    );
+}
+
+#[test]
+fn anchor_errors_survive_a_layout_error() {
+    let tmp = site_of(&[
+        (
+            "content/b.md",
+            "---\ntitle: B\nlayout: nolayout\n---\n[b](@/c.md#nope)\n",
+        ),
+        ("content/c.md", &page("# Top")),
+    ]);
+    let errors = build(&tmp).unwrap_err();
+    assert_eq!(
+        messages(&errors),
+        [
+            "b.md: layout `nolayout` not found in the site or its theme",
+            "b.md: links to `#nope` on `c.md`, which has no such id"
+        ]
+    );
+}
+
+#[test]
+fn failed_target_anchor_is_skipped() {
+    let tmp = site_of(&[
+        ("content/b.md", &page("[x](@/c.md#x)")),
+        ("content/c.md", &page("{{ nope( }}")),
+    ]);
+    let errors = build(&tmp).unwrap_err();
+    assert!(
+        errors.iter().all(|e| e.path.ends_with("c.md")),
+        "{errors:?}"
+    );
+    assert!(!errors.is_empty());
+}
+
+#[test]
+fn template_pages_are_not_targets() {
+    let tmp = site_of(&[
+        ("content/b.md", &page("[t](@/t.md#x) [c](@/c.md#top)")),
+        ("content/c.md", &page("# Top")),
+        ("content/t.html", "<div id=\"x\">x</div>"),
+    ]);
+    let errors = build(&tmp).unwrap_err();
+    let messages = messages(&errors);
+    assert_eq!(messages.len(), 1, "{messages:?}");
+    assert!(
+        messages[0].starts_with("b.md: no page `t.md`"),
+        "{messages:?}"
+    );
+}

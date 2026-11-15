@@ -162,13 +162,30 @@ pub struct RenderedBody {
     pub anchors: Vec<AnchorRequest>,
 }
 
+/// Why a page didn't render. A page that failed after its links were resolved still hands over its anchor requests,
+/// so the pages it links to are checked in the same run.
+#[derive(Debug, Default)]
+pub struct Failed {
+    pub errors: Vec<Error>,
+    pub anchors: Vec<AnchorRequest>,
+}
+
+impl From<Vec<Error>> for Failed {
+    fn from(errors: Vec<Error>) -> Self {
+        Self {
+            errors,
+            anchors: Vec::new(),
+        }
+    }
+}
+
 /// Every block's error is collected rather than stopping at the first.
 pub fn render_body(
     page: &Page,
     engine: &ScriptEngine,
     config: &Config,
     scopes: &SiteScopes<'_>,
-) -> Result<RenderedBody, Vec<Error>> {
+) -> Result<RenderedBody, Failed> {
     let mut scope = build_scope(page, engine, config, scopes)?;
 
     let skip = markdown::code_ranges(&page.body);
@@ -188,7 +205,7 @@ pub fn render_body(
         }
     }
     if !errors.is_empty() {
-        return Err(errors);
+        return Err(errors.into());
     }
     splice::splice(&mut doc, &outputs);
     // Ids are assigned first so a heading's slug reads its LaTeX, not the MathML's annotation.
@@ -208,7 +225,7 @@ pub fn render_body(
         }));
     }
     if !errors.is_empty() {
-        return Err(errors);
+        return Err(Failed { errors, anchors });
     }
 
     // Constants can't be reassigned, so the layout's `page` is swapped for a copy carrying the final toc.
