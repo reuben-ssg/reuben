@@ -26,6 +26,8 @@ pub struct PageReport {
     /// Every `<a href>` that isn't plainly external, collected only when
     /// `link-target` is on.
     pub links: Vec<LocalLink>,
+    /// Every non-blank `id` in the page, collected whatever rules are on, for checking links to `#anchors`.
+    pub ids: HashSet<String>,
 }
 
 struct Control {
@@ -46,7 +48,6 @@ pub fn check_page(html: &str, rules: &RuleSet, reported_ids: &HashSet<String>) -
     let mut svg_depth = 0usize;
     let mut h1_lines: Vec<usize> = Vec::new();
     let mut main_seen = false;
-    let mut seen_ids: HashSet<String> = HashSet::new();
     let mut label_depth = 0usize;
     let mut label_targets: HashSet<String> = HashSet::new();
     let mut unlabelled: Vec<Control> = Vec::new();
@@ -113,7 +114,7 @@ pub fn check_page(html: &str, rules: &RuleSet, reported_ids: &HashSet<String>) -
                 }
                 if let Some(id) = tag.attr("id")
                     && !id.trim().is_empty()
-                    && !seen_ids.insert(id.to_string())
+                    && !report.ids.insert(id.to_string())
                     && !reported_ids.contains(id)
                     && rules.is_on(Rule::IdUnique)
                 {
@@ -420,5 +421,17 @@ mod tests {
             "<script>document.write('<h1>x</h1><input>')</script>",
         );
         assert_eq!(check(&html).findings, []);
+    }
+
+    #[test]
+    fn ids_are_collected_with_every_rule_off() {
+        let mut rules = RuleSet::all();
+        for rule in Rule::ALL {
+            rules.disable(rule);
+        }
+        let html = "<h2 id=\"a\">x</h2><p id=\"\">y</p><sup id=\"fn-1\">";
+        let report = check_page(html, &rules, &HashSet::new());
+        let expected: HashSet<String> = ["a", "fn-1"].map(String::from).into();
+        assert_eq!(report.ids, expected);
     }
 }

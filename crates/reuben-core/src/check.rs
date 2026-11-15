@@ -126,6 +126,8 @@ pub struct HtmlReport {
     pub findings: Vec<Finding>,
     /// Local links still to be checked against what the build produced.
     pub links: Vec<LocalLink>,
+    /// Every id in the finished page, for checking links to `#anchors`.
+    pub ids: HashSet<String>,
 }
 
 /// Runs the HTML-pass rules over a page's finished HTML. `built` is the output file the HTML is written to.
@@ -152,6 +154,7 @@ pub fn html_pass(
     HtmlReport {
         findings,
         links: report.links,
+        ids: report.ids,
     }
 }
 

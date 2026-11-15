@@ -21,7 +21,7 @@ use crate::dirs::{self, DirDefaults};
 use crate::error::{Error, ErrorKind};
 use crate::frontmatter::{self, FrontMatter};
 use crate::headings::TocEntry;
-use crate::links::{PageIndex, Target};
+use crate::links::{AnchorRequest, LinkProblem, PageIndex, Target};
 use crate::output::{Output, OutputFile, check_out_dir, write_atomic};
 use crate::route::{Route, route_for_page, route_for_template};
 use crate::script::helpers::url_for;
@@ -156,14 +156,20 @@ struct Rendered {
     findings: Vec<Finding>,
     /// Local links of the page, to be checked once every output file is known.
     links: Vec<LocalLink>,
+    /// Every id in the page, for the anchors other pages link to.
+    ids: HashSet<String>,
+    /// The `#anchor`s this page's source links ask for, to be checked against their target's ids.
+    anchors: Vec<AnchorRequest>,
 }
 
 impl Rendered {
-    fn unchecked(html: String) -> Self {
+    fn unchecked(html: String, anchors: Vec<AnchorRequest>) -> Self {
         Self {
             html,
             findings: Vec::new(),
             links: Vec::new(),
+            ids: HashSet::new(),
+            anchors,
         }
     }
 }
@@ -352,9 +358,9 @@ impl Site {
             pages: &index,
         };
         let render_one = |page: &&Page| -> Result<Rendered, Vec<Error>> {
-            let (html, tree) = self.render_page(page, &scopes)?;
+            let (html, tree, anchors) = self.render_page(page, &scopes)?;
             splice::ensure_no_placeholders(&page.source, &html).map_err(|e| vec![e])?;
-            Ok(check_html(page, html, tree))
+            Ok(check_html(page, html, tree, anchors))
         };
         // A pool that can't start is reported, and the build carries on with rayon's default pool.
         let pool =
@@ -395,6 +401,9 @@ impl Site {
         let mut partial_pages = 0;
         let mut findings: Vec<Finding> = Vec::new();
         let mut page_links: Vec<(&Page, Vec<LocalLink>)> = Vec::new();
+        // Only Markdown pages are anchor targets, keyed by their path under `content/`.
+        let mut page_ids: HashMap<&Path, HashSet<String>> = HashMap::new();
+        let mut page_anchors: Vec<(&Page, Vec<AnchorRequest>)> = Vec::new();
         // Merged in page order so neither output, errors nor findings depend on which thread finished first.
         for (page, result) in pages.iter().zip(rendered) {
             let is_partial = is_partial_css(&page.route.file);
@@ -424,6 +433,10 @@ impl Site {
                 Ok(done) => {
                     findings.extend(done.findings);
                     page_links.push((page, done.links));
+                    if page.kind == PageKind::Markdown {
+                        page_ids.insert(page.rel.as_path(), done.ids);
+                    }
+                    page_anchors.push((page, done.anchors));
                     output.files.insert(
                         page.route.file.clone(),
                         OutputFile::Bytes(done.html.into_bytes()),
@@ -496,6 +509,27 @@ impl Site {
                 warnings.push(
                     "sitemap.xml skipped: base_url must be absolute (http:// or https://)".into(),
                 );
+            }
+        }
+
+        // Unlike `link-target`, this runs on a failed build too: a target that didn't render is skipped, not blamed.
+        for (page, anchors) in &page_anchors {
+            for anchor in anchors {
+                let missing = page_ids
+                    .get(anchor.target.as_path())
+                    .is_some_and(|ids| !ids.contains(&anchor.fragment));
+                if missing {
+                    errors.push(Error::new(
+                        &page.source,
+                        ErrorKind::Link {
+                            problem: LinkProblem::NoAnchor {
+                                target: anchor.target.clone(),
+                                fragment: anchor.fragment.clone(),
+                            },
+                            location: anchor.location,
+                        },
+                    ));
+                }
             }
         }
 
@@ -605,14 +639,14 @@ impl Site {
         &self,
         page: &Page,
         scopes: &page::SiteScopes<'_>,
-    ) -> Result<(String, Option<TreeReport>), Vec<Error>> {
-        let (body, mut scope, layout_name, tree) = match page.kind {
+    ) -> Result<(String, Option<TreeReport>, Vec<AnchorRequest>), Vec<Error>> {
+        let (body, mut scope, layout_name, tree, anchors) = match page.kind {
             PageKind::Markdown => {
                 let page::RenderedBody {
                     doc,
                     scope,
                     outputs,
-                    ..
+                    anchors,
                 } = page::render_body(page, &self.engine, &self.config, scopes)?;
                 let name = page
                     .front_matter
@@ -620,7 +654,7 @@ impl Site {
                     .as_deref()
                     .or_else(|| collections::layout_of(&page.rel, &self.config));
                 let tree = check::tree_pass(&page.source, &page.rules, &doc, &outputs);
-                (html::render(&doc), scope, name, Some(tree))
+                (html::render(&doc), scope, name, Some(tree), anchors)
             }
             PageKind::Template { escape } => {
                 let (text, scope) =
@@ -630,9 +664,9 @@ impl Site {
                 let own = page.front_matter_sources.get("layout") == Some(&page.source);
                 let name = page.front_matter.layout.as_deref().filter(|_| own);
                 if name.is_none() {
-                    return Ok((text, None));
+                    return Ok((text, None, Vec::new()));
                 }
-                (text, scope, name, None)
+                (text, scope, name, None, Vec::new())
             }
         };
         let layout = layout::find_layout(layout_name, &self.root, self.config.theme.as_deref())
@@ -653,7 +687,7 @@ impl Site {
             }),
             (None, PageKind::Template { .. }) => body,
         };
-        Ok((html, tree))
+        Ok((html, tree, anchors))
     }
 
     fn css_job(
@@ -754,13 +788,18 @@ impl Site {
 
 /// Runs the HTML pass on a page's finished text, with the tree pass's findings. Only HTML pages are checked:
 /// Markdown pages and `.html` templates. Other templates are CSS, XML and the like.
-fn check_html(page: &Page, html: String, tree: Option<TreeReport>) -> Rendered {
+fn check_html(
+    page: &Page,
+    html: String,
+    tree: Option<TreeReport>,
+    anchors: Vec<AnchorRequest>,
+) -> Rendered {
     let is_html = match page.kind {
         PageKind::Markdown => true,
         PageKind::Template { .. } => page.route.file.extension().is_some_and(|e| e == "html"),
     };
     if !is_html {
-        return Rendered::unchecked(html);
+        return Rendered::unchecked(html, anchors);
     }
     let (mut findings, reported_ids) =
         tree.map_or_else(Default::default, |t| (t.findings, t.reported_ids));
@@ -776,6 +815,8 @@ fn check_html(page: &Page, html: String, tree: Option<TreeReport>) -> Rendered {
         html,
         findings,
         links: report.links,
+        ids: report.ids,
+        anchors,
     }
 }
 

@@ -127,3 +127,81 @@ fn failed_target_is_not_doubled() {
     assert_eq!(errors.len(), 1, "{errors:?}");
     assert!(errors[0].path.ends_with("c.md"));
 }
+
+#[test]
+fn anchors_must_exist() {
+    let tmp = site_of(&[
+        ("content/b.md", &page("[x](@/c.md#top)\n\n[y](@/c.md#nope)")),
+        ("content/c.md", &page("# Top")),
+    ]);
+    let errors = build(&tmp).unwrap_err();
+    assert_eq!(errors.len(), 1, "{errors:?}");
+    assert!(errors[0].path.ends_with("b.md"));
+    assert_eq!(errors[0].location().unwrap().line, 6);
+    assert_eq!(
+        errors[0].kind.to_string(),
+        "links to `#nope` on `c.md`, which has no such id"
+    );
+}
+
+#[test]
+fn layout_and_raw_ids_count() {
+    let tmp = site_of(&[
+        (
+            "layouts/wide.html",
+            "<!doctype html><html lang=\"en\"><head><title>T</title></head><body><nav id=\"menu\"></nav><main>{{ content }}</main></body></html>",
+        ),
+        ("content/b.md", &page("[m](@/c.md#menu) [r](@/c.md#raw)")),
+        (
+            "content/c.md",
+            "---\ntitle: C\nlayout: wide\n---\n<div id=\"raw\">x</div>\n",
+        ),
+    ]);
+    build(&tmp).unwrap();
+}
+
+#[test]
+fn self_anchor_via_file() {
+    let tmp = site_of(&[("content/b.md", &page("[l](b.md#later)\n\n## Later"))]);
+    build(&tmp).unwrap();
+}
+
+#[test]
+fn link_errors_are_identical_across_jobs() {
+    let mut files: Vec<(String, String)> = Vec::new();
+    for i in 0..40 {
+        files.push((
+            format!("content/p{i}.md"),
+            page(&format!(
+                "# H{i}\n\n[a](@/p{}.md#nope{i})\n\n[b](@/p{}.md#h{})",
+                (i + 1) % 40,
+                (i + 2) % 40,
+                (i + 2) % 40
+            )),
+        ));
+    }
+    files.push(("content/bad.md".into(), page("[z](@/missing.md)")));
+    let refs: Vec<(&str, &str)> = files
+        .iter()
+        .map(|(a, b)| (a.as_str(), b.as_str()))
+        .collect();
+    let tmp = site_of(&refs);
+    let run = |jobs| {
+        let failure = Site::load(tmp.path())
+            .unwrap()
+            .build(&BuildOptions {
+                drafts: false,
+                out: tmp.path().join("dist"),
+                jobs,
+            })
+            .unwrap_err();
+        failure
+            .errors
+            .iter()
+            .map(|e| format!("{e} {:?}", e.location()))
+            .collect::<Vec<_>>()
+    };
+    let one = run(Some(1));
+    assert!(one.len() >= 41, "{one:?}");
+    assert_eq!(one, run(None));
+}
