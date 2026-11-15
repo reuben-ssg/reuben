@@ -286,3 +286,84 @@ fn template_pages_are_not_targets() {
         "{messages:?}"
     );
 }
+
+#[test]
+fn url_for_in_a_layout() {
+    let tmp = site_of(&[
+        (
+            "reuben.toml",
+            "title = \"S\"\nbase_url = \"https://x.dev/sub/\"\n",
+        ),
+        (
+            "layouts/l.html",
+            "<!doctype html><html lang=\"en\"><head><title>T</title></head><body><main><a href=\"{{ url_for(\"@/c.md#top\") }}\">c</a>{{ content }}</main></body></html>",
+        ),
+        ("content/b.md", "---\ntitle: B\nlayout: l\n---\nb\n"),
+        ("content/c.md", &page("# Top")),
+    ]);
+    build(&tmp).unwrap();
+    let html = built(&tmp, "b/index.html");
+    assert!(html.contains("href=\"https://x.dev/sub/c/#top\""), "{html}");
+}
+
+#[test]
+fn url_for_relative_follows_the_page() {
+    let tmp = site_of(&[
+        ("includes/card.rhai", "fn card() { url_for(\"c.md\") }\n"),
+        ("content/a/b.md", &page("[{{ card() }}]()")),
+        ("content/a/c.md", &page("c")),
+        ("content/x.md", &page("[{{ card() }}]()")),
+        ("content/c.md", &page("c")),
+    ]);
+    build(&tmp).unwrap();
+    assert!(built(&tmp, "a/b/index.html").contains("/a/c/"));
+    let x = built(&tmp, "x/index.html");
+    assert!(x.contains("/c/") && !x.contains("/a/c/"), "{x}");
+}
+
+#[test]
+fn url_for_errors_are_script_errors() {
+    let tmp = site_of(&[(
+        "content/p.md",
+        &page("text\n\n{{ url_for(\"@/nope.md\") }}"),
+    )]);
+    let errors = build(&tmp).unwrap_err();
+    assert_eq!(errors.len(), 1, "{errors:?}");
+    assert!(matches!(errors[0].kind, ErrorKind::Script(_)), "{errors:?}");
+    assert_eq!(errors[0].location().unwrap().line, 6);
+    assert!(
+        errors[0].kind.to_string().contains("no page `nope.md`"),
+        "{errors:?}"
+    );
+}
+
+#[test]
+fn url_for_in_data_needs_a_page() {
+    let tmp = site_of(&[
+        ("data/x.rhai", "url_for(\"@/c.md\")\n"),
+        ("content/c.md", &page("c")),
+    ]);
+    let errors = build(&tmp).unwrap_err();
+    assert!(
+        errors
+            .iter()
+            .any(|e| e.kind.to_string().contains("needs a page being built")),
+        "{errors:?}"
+    );
+}
+
+#[test]
+fn markdown_helper_resolves_links() {
+    let tmp = site_of(&[
+        ("content/b.md", &page("{{ markdown(\"[c](@/c.md)\") }}")),
+        ("content/c.md", &page("c")),
+    ]);
+    build(&tmp).unwrap();
+    assert!(built(&tmp, "b/index.html").contains("href=\"/c/\""));
+
+    let tmp = site_of(&[("content/b.md", &page("{{ markdown(\"[n](@/nope.md)\") }}"))]);
+    let errors = build(&tmp).unwrap_err();
+    assert_eq!(errors.len(), 1, "{errors:?}");
+    assert!(matches!(errors[0].kind, ErrorKind::Script(_)), "{errors:?}");
+    assert!(errors[0].kind.to_string().contains("nope.md"), "{errors:?}");
+}

@@ -26,7 +26,7 @@ use crate::output::{Output, OutputFile, check_out_dir, write_atomic};
 use crate::page::Failed;
 use crate::route::{Route, route_for_page, route_for_template};
 use crate::script::helpers::url_for;
-use crate::script::{Html, ScriptEngine};
+use crate::script::{Html, LinkContext, ScriptEngine, with_link_context};
 use crate::sitemap;
 use crate::template::{self, Escape};
 use crate::theme::{PageShell, builtin_page};
@@ -641,6 +641,19 @@ impl Site {
     /// Renders one page or template to its final output text, layout included. A Markdown page also returns what the
     /// tree pass found in its final body tree.
     pub(crate) fn render_page(
+        &self,
+        page: &Page,
+        scopes: &page::SiteScopes<'_>,
+    ) -> Result<(String, Option<TreeReport>, Vec<AnchorRequest>), Failed> {
+        let ctx = LinkContext {
+            index: Arc::clone(scopes.pages),
+            page_rel: page.rel.clone(),
+            base_path: check::base_path(&self.config.base_url),
+        };
+        with_link_context(ctx, || self.render_page_in_context(page, scopes))
+    }
+
+    fn render_page_in_context(
         &self,
         page: &Page,
         scopes: &page::SiteScopes<'_>,
