@@ -28,6 +28,10 @@ pub fn render(error: &Error, source: Option<&str>, root: &Path) -> String {
         },
         ErrorKind::Block(e) => (&e.message, e.span, &[]),
         ErrorKind::Math { message, location } => (message, *location, &[]),
+        ErrorKind::Link { problem, location } => {
+            let message = problem.to_string();
+            return located("error", &message, &error.path, *location, source, root).0;
+        }
         ErrorKind::Css {
             message,
             location: Some(location),

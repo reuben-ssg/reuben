@@ -184,6 +184,23 @@ fn build_warns_but_succeeds() {
 }
 
 #[test]
+fn broken_source_link_shows_a_snippet() {
+    let tmp = broken_site(&[
+        ("content/index.md", "---\ntitle: Home\n---\nhi\n"),
+        ("content/a.md", "---\ntitle: A\n---\n[x](@/_index.md)\n"),
+    ]);
+    reuben()
+        .args(["build", "--root"])
+        .arg(tmp.path())
+        .assert()
+        .code(1)
+        .stderr(predicates::str::contains(
+            "error: no page `_index.md`; did you mean `index.md`?",
+        ))
+        .stderr(predicates::str::contains("--> content/a.md:4:"));
+}
+
+#[test]
 fn failed_build_still_ends_with_error_summary() {
     use assert_fs::prelude::*;
     let tmp = assert_fs::TempDir::new().unwrap();
