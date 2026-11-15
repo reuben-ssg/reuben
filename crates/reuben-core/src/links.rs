@@ -252,6 +252,23 @@ pub fn resolve_tree(
     (problems, anchors)
 }
 
+/// The destinations of the source links in `doc`, as written.
+pub fn source_links(doc: &Document) -> Vec<String> {
+    fn collect(node: &Node, out: &mut Vec<String>) {
+        if let NodeKind::Link { url, .. } = &node.kind
+            && parse_source_link(url).is_some()
+        {
+            out.push(url.clone());
+        }
+        for child in &node.children {
+            collect(child, out);
+        }
+    }
+    let mut out = Vec::new();
+    collect(doc, &mut out);
+    out
+}
+
 fn walk(
     node: &mut Node,
     from_rel: &Path,
@@ -449,6 +466,26 @@ mod tests {
                 target: PathBuf::from("d.md")
             }
         );
+    }
+
+    #[test]
+    fn odd_destinations() {
+        assert_eq!(
+            resolve("@/../x.md", "x.md").unwrap_err(),
+            LinkProblem::OutsideContent {
+                link: "@/../x.md".to_string()
+            }
+        );
+        assert_eq!(
+            parse_source_link("@/").unwrap().unwrap_err(),
+            LinkProblem::NotMarkdown {
+                link: "@/".to_string()
+            }
+        );
+        assert!(parse_source_link("?x.md").is_none());
+        assert!(parse_source_link("C:x.md").is_none());
+        let link = parse_source_link("a%ZZ.md").unwrap().unwrap();
+        assert_eq!(link.path, "a%ZZ.md");
     }
 
     #[test]

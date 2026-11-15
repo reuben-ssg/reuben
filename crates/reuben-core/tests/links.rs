@@ -92,12 +92,66 @@ fn every_bad_link_is_reported() {
     assert_eq!(message(8), "link `../../x.md` points outside content/");
     assert_eq!(message(10), "link `@/d` must name a .md file");
     assert!(message(12).starts_with("math:"));
-    assert!(
+    assert_eq!(
         on_page
             .iter()
             .filter(|e| matches!(e.kind, ErrorKind::Link { .. }))
-            .count()
-            == 4
+            .count(),
+        4
+    );
+}
+
+#[test]
+fn block_error_keeps_link_errors() {
+    let tmp = site_of(&[("content/p.md", &page("{{ nope( }}\n\n[a](@/nope.md)"))]);
+    let errors = build(&tmp).unwrap_err();
+    assert_eq!(errors.len(), 2, "{errors:?}");
+    assert!(
+        errors
+            .iter()
+            .any(|e| matches!(e.kind, ErrorKind::Script(_))),
+        "{errors:?}"
+    );
+    assert!(
+        errors
+            .iter()
+            .any(|e| e.kind.to_string() == "no page `nope.md`"),
+        "{errors:?}"
+    );
+}
+
+#[test]
+fn images_are_left_alone() {
+    let tmp = site_of(&[("content/p.md", &page("![alt](x.md)"))]);
+    build(&tmp).unwrap();
+    assert!(
+        built(&tmp, "p/index.html").contains("src=\"x.md\""),
+        "{}",
+        built(&tmp, "p/index.html")
+    );
+}
+
+#[test]
+fn percent_encoded_fragment_matches_a_non_ascii_id() {
+    let tmp = site_of(&[
+        ("content/b.md", &page("[c](@/c.md#caf%C3%A9)")),
+        ("content/c.md", &page("# Café")),
+    ]);
+    build(&tmp).unwrap();
+}
+
+#[test]
+fn markdown_in_data_needs_a_page() {
+    let tmp = site_of(&[
+        ("data/x.rhai", "#{ h: markdown(\"[c](@/c.md)\") }\n"),
+        ("content/c.md", &page("c")),
+    ]);
+    let errors = build(&tmp).unwrap_err();
+    assert!(
+        errors
+            .iter()
+            .any(|e| e.kind.to_string().contains("needs a page being built")),
+        "{errors:?}"
     );
 }
 
@@ -268,7 +322,7 @@ fn failed_target_anchor_is_skipped() {
         errors.iter().all(|e| e.path.ends_with("c.md")),
         "{errors:?}"
     );
-    assert!(!errors.is_empty());
+    assert_eq!(errors.len(), 1, "{errors:?}");
 }
 
 #[test]
@@ -316,9 +370,10 @@ fn url_for_relative_follows_the_page() {
         ("content/c.md", &page("c")),
     ]);
     build(&tmp).unwrap();
-    assert!(built(&tmp, "a/b/index.html").contains("/a/c/"));
+    let b = built(&tmp, "a/b/index.html");
+    assert!(b.contains("<a href=\"\">/a/c/</a>"), "{b}");
     let x = built(&tmp, "x/index.html");
-    assert!(x.contains("/c/") && !x.contains("/a/c/"), "{x}");
+    assert!(x.contains("<a href=\"\">/c/</a>"), "{x}");
 }
 
 #[test]

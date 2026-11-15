@@ -197,7 +197,8 @@ fn broken_source_link_shows_a_snippet() {
         .stderr(predicates::str::contains(
             "error: no page `_index.md`; did you mean `index.md`?",
         ))
-        .stderr(predicates::str::contains("--> content/a.md:4:"));
+        .stderr(predicates::str::contains("--> content/a.md:4:"))
+        .stderr(predicates::str::contains("[x](@/_index.md)"));
 }
 
 #[test]

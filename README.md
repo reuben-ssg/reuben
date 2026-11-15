@@ -134,6 +134,7 @@ Relative paths resolve against the page being built, including in an include or 
 A relative path in `markdown()` output resolves the same way.
 The fragment check covers only the Markdown of a page, not `url_for` results or links inside `markdown()` output, because that text may land anywhere on the page.
 A `markdown()` link is still resolved, and a missing file there is an error, but its `#fragment` isn't checked.
+Outside a page being built, such as in a `data/` file, `url_for` and `markdown()` can't resolve a source link, so it is an error there.
 
 ## License
 

@@ -645,12 +645,18 @@ impl Site {
         page: &Page,
         scopes: &page::SiteScopes<'_>,
     ) -> Result<(String, Option<TreeReport>, Vec<AnchorRequest>), Failed> {
-        let ctx = LinkContext {
-            index: Arc::clone(scopes.pages),
+        with_link_context(self.link_context(page, scopes.pages), || {
+            self.render_page_in_context(page, scopes)
+        })
+    }
+
+    /// What `url_for` and `markdown()` resolve source links against while `page` is being evaluated.
+    pub(crate) fn link_context(&self, page: &Page, index: &Arc<PageIndex>) -> LinkContext {
+        LinkContext {
+            index: Arc::clone(index),
             page_rel: page.rel.clone(),
             base_path: check::base_path(&self.config.base_url),
-        };
-        with_link_context(ctx, || self.render_page_in_context(page, scopes))
+        }
     }
 
     fn render_page_in_context(

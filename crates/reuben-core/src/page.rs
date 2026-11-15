@@ -204,9 +204,7 @@ pub fn render_body(
             }
         }
     }
-    if !errors.is_empty() {
-        return Err(errors.into());
-    }
+    // A failed block is spliced as `Output::Nothing`, so link and math errors on the page still surface.
     splice::splice(&mut doc, &outputs);
     // Ids are assigned first so a heading's slug reads its LaTeX, not the MathML's annotation.
     let toc = headings::toc_array(&headings::assign_ids(&mut doc));

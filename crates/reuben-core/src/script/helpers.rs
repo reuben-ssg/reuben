@@ -7,7 +7,7 @@ use rhai::{Array, Dynamic, Engine, EvalAltResult, NativeCallContext};
 use super::{Html, IncludeFiles, collection, with_current_link};
 use crate::doc::Origin;
 use crate::html::{escape_text, render};
-use crate::links::{parse_source_link, resolve_tree};
+use crate::links::{parse_source_link, resolve_tree, source_links};
 use crate::markdown::parse;
 use crate::math::render_math;
 
@@ -53,15 +53,18 @@ pub fn register(engine: &mut Engine, site_root: &Path, include_files: &IncludeFi
                     format!("math at {}:{}: {message}", span.line, span.column)
                 })?;
                 // Anchors aren't checked here: the output may land anywhere on the page.
-                let problems = with_current_link(|ctx| {
-                    ctx.map(|ctx| {
-                        resolve_tree(&mut doc, &ctx.page_rel, &ctx.index, &ctx.base_path).0
-                    })
-                })
-                .unwrap_or_default();
-                if !problems.is_empty() {
-                    let messages: Vec<String> =
-                        problems.iter().map(|(_, p)| p.to_string()).collect();
+                let messages: Vec<String> = with_current_link(|ctx| match ctx {
+                    Some(ctx) => resolve_tree(&mut doc, &ctx.page_rel, &ctx.index, &ctx.base_path)
+                        .0
+                        .iter()
+                        .map(|(_, p)| p.to_string())
+                        .collect(),
+                    None => source_links(&doc)
+                        .into_iter()
+                        .map(|dest| format!("markdown: `{dest}` needs a page being built"))
+                        .collect(),
+                });
+                if !messages.is_empty() {
                     return Err(messages.join("; ").into());
                 }
                 Ok(Html {
