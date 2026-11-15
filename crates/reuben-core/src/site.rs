@@ -21,6 +21,7 @@ use crate::dirs::{self, DirDefaults};
 use crate::error::{Error, ErrorKind};
 use crate::frontmatter::{self, FrontMatter};
 use crate::headings::TocEntry;
+use crate::links::{PageIndex, Target};
 use crate::output::{Output, OutputFile, check_out_dir, write_atomic};
 use crate::route::{Route, route_for_page, route_for_template};
 use crate::script::helpers::url_for;
@@ -85,6 +86,9 @@ pub struct Site {
     /// Folders (relative to `content/`) whose `_dir.toml` failed to load. Their pages stay in the site, but their
     /// render errors are dropped because the `_dir.toml` error already explains them.
     broken_dirs: BTreeSet<PathBuf>,
+    /// Markdown files under `content/` (relative to it) that failed to load. Links to them resolve, so the
+    /// file's own error isn't repeated on every page that links to it.
+    failed_markdown: Vec<PathBuf>,
     /// An `includes/*.rhai` file failed, so nothing that runs Rhai is rendered: every call into the includes would
     /// fail and bury the real error.
     pub(crate) includes_broken: bool,
@@ -194,6 +198,7 @@ impl Site {
         let (dirs, mut dir_errors) = dirs::load(&content);
         errors.append(&mut dir_errors);
         let mut asset_rels = Vec::new();
+        let mut failed_markdown = Vec::new();
         for (path, rel) in walk(&content, &mut errors) {
             let is_markdown = path.extension().is_some_and(|e| e == "md");
             if !is_markdown && path.file_name().is_some_and(|n| n == "_dir.toml") {
@@ -222,6 +227,9 @@ impl Site {
                 Ok(Some(page)) => pages.push(page),
                 Ok(None) => asset_rels.push(rel),
                 Err(f) => {
+                    if is_markdown {
+                        failed_markdown.push(rel.clone());
+                    }
                     errors.extend(f.errors);
                     // The broken `_dir.toml` is already reported, and without its defaults a page would only add
                     // misleading errors (a missing title, say). Problems in the file itself are its own.
@@ -289,9 +297,37 @@ impl Site {
             engine: Arc::new(engine),
             load_errors: errors,
             broken_dirs: dirs.broken().clone(),
+            failed_markdown,
             includes_broken,
             site_map: site_scope,
         })
+    }
+
+    /// Every Markdown page a link can name, drafts included but marked as excluded unless `drafts` is set.
+    pub(crate) fn page_index(&self, drafts: bool) -> PageIndex {
+        let loaded = self
+            .pages
+            .iter()
+            .filter(|p| p.kind == PageKind::Markdown && !p.from_static)
+            .map(|p| {
+                (
+                    p.rel.clone(),
+                    Target {
+                        url: p.route.url.clone(),
+                        excluded_draft: p.draft_excluded && !drafts,
+                    },
+                )
+            });
+        let failed = self.failed_markdown.iter().map(|rel| {
+            (
+                rel.clone(),
+                Target {
+                    url: route_for_page(rel).url,
+                    excluded_draft: false,
+                },
+            )
+        });
+        PageIndex::new(loaded.chain(failed))
     }
 
     /// Renders the whole site into memory. Nothing touches the disk.
@@ -308,10 +344,12 @@ impl Site {
         errors.append(&mut collection_errors);
 
         let mut output = Output::default();
+        let index = Arc::new(self.page_index(opts.drafts));
         let scopes = page::SiteScopes {
             site: &self.site_map,
             data: &self.data.value,
             collections: &collections,
+            pages: &index,
         };
         let render_one = |page: &&Page| -> Result<Rendered, Vec<Error>> {
             let (html, tree) = self.render_page(page, &scopes)?;
@@ -574,6 +612,7 @@ impl Site {
                     doc,
                     scope,
                     outputs,
+                    ..
                 } = page::render_body(page, &self.engine, &self.config, scopes)?;
                 let name = page
                     .front_matter

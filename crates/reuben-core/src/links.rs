@@ -3,6 +3,8 @@
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
+use crate::doc::{Document, Node, NodeKind, Span};
+
 /// A link destination that names a Markdown source file.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SourceLink {
@@ -227,6 +229,59 @@ impl PageIndex {
     }
 }
 
+/// A link's `#fragment`, to be checked against the target page's heading ids once every page has rendered.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AnchorRequest {
+    pub target: PathBuf,
+    pub fragment: String,
+    pub location: Span,
+}
+
+/// Rewrites every source link in `doc` (written in the page at `from_rel`) to its page URL under `base_path`.
+/// A link that can't be resolved is left as written and reported with the link's position.
+pub fn resolve_tree(
+    doc: &mut Document,
+    from_rel: &Path,
+    index: &PageIndex,
+    base_path: &str,
+) -> (Vec<(Span, LinkProblem)>, Vec<AnchorRequest>) {
+    let mut problems = Vec::new();
+    let mut anchors = Vec::new();
+    let base = base_path.trim_end_matches('/');
+    walk(doc, from_rel, index, base, &mut problems, &mut anchors);
+    (problems, anchors)
+}
+
+fn walk(
+    node: &mut Node,
+    from_rel: &Path,
+    index: &PageIndex,
+    base: &str,
+    problems: &mut Vec<(Span, LinkProblem)>,
+    anchors: &mut Vec<AnchorRequest>,
+) {
+    if let NodeKind::Link { url, .. } = &mut node.kind
+        && let Some(parsed) = parse_source_link(url)
+    {
+        match parsed.and_then(|link| index.resolve(from_rel, &link).map(|r| (link, r))) {
+            Ok((link, resolved)) => {
+                *url = format!("{base}{}{}", resolved.route_url, resolved.suffix);
+                if let Some(fragment) = link.fragment {
+                    anchors.push(AnchorRequest {
+                        target: resolved.target,
+                        fragment,
+                        location: node.span,
+                    });
+                }
+            }
+            Err(problem) => problems.push((node.span, problem)),
+        }
+    }
+    for child in &mut node.children {
+        walk(child, from_rel, index, base, problems, anchors);
+    }
+}
+
 fn edit_distance(a: &str, b: &str) -> usize {
     let a: Vec<char> = a.chars().collect();
     let b: Vec<char> = b.chars().collect();
@@ -259,6 +314,34 @@ mod tests {
             (PathBuf::from("a/index.md"), target("/a/")),
             (PathBuf::from("c.md"), target("/c/")),
         ])
+    }
+
+    fn tree(markdown: &str) -> crate::doc::Document {
+        crate::markdown::parse(markdown, 1)
+    }
+
+    #[test]
+    fn code_is_left_alone() {
+        let mut doc = tree("`[x](a.md)`\n\n```\n[y](b.md)\n```");
+        let before = doc.clone();
+        let (problems, anchors) =
+            resolve_tree(&mut doc, Path::new("p.md"), &PageIndex::default(), "");
+        assert!(problems.is_empty() && anchors.is_empty());
+        assert_eq!(doc, before);
+    }
+
+    #[test]
+    fn reference_links_resolve() {
+        let mut doc = tree("[x][r]\n\n[r]: ../c.md");
+        let (problems, _) = resolve_tree(&mut doc, Path::new("a/b.md"), &index(), "");
+        assert!(problems.is_empty(), "{problems:?}");
+        fn find(n: &crate::doc::Node) -> Option<String> {
+            if let crate::doc::NodeKind::Link { url, .. } = &n.kind {
+                return Some(url.clone());
+            }
+            n.children.iter().find_map(find)
+        }
+        assert_eq!(find(&doc).as_deref(), Some("/c/"));
     }
 
     fn resolve(dest: &str, from: &str) -> Result<Resolved, LinkProblem> {

@@ -5,6 +5,7 @@
 use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use rhai::{Array, Dynamic, Map};
 
@@ -88,10 +89,12 @@ impl Site {
 
         // After a broken include the sidecar and the page's blocks would only fail on the include's account.
         if !self.includes_broken {
+            let index = Arc::new(self.page_index(false));
             let scopes = SiteScopes {
                 site: &self.site_map,
                 data: &self.data.value,
                 collections: &collections,
+                pages: &index,
             };
             match page::build_scope(found, &self.engine, &self.config, &scopes) {
                 // A sidecar that fails fails the render too, with the same error, so only a good one goes on.
