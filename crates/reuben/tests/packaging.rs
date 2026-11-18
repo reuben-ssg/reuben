@@ -27,11 +27,11 @@ fn licence_copies_match_root() {
 }
 
 #[test]
-fn version_is_0_1_0() {
+fn version_comes_from_the_workspace() {
     Command::cargo_bin("reuben")
         .unwrap()
         .arg("--version")
         .assert()
         .success()
-        .stdout("reuben 0.1.0\n");
+        .stdout(concat!("reuben ", env!("CARGO_PKG_VERSION"), "\n"));
 }

@@ -15,9 +15,13 @@ The crates are published by hand from a local checkout.
 ## One-time setup (needs Nick's yes)
 
 1. Create the `release` environment in the repository settings, with Nick as the required reviewer.
+   Don't enable "Prevent self-review".
+   Nick is the only reviewer and pushes the tags, so the gate could never be approved.
 2. If the environment gets a deployment-branch rule, it must allow `main`.
    The publish job runs in the context of `main`, so a rule that allows only tags blocks it.
-3. For the first release only, create a short-lived (7-day) npm token that can publish `reuben-ssg`.
+3. For the first release only, create a short-lived (7-day) granular npm token with read and write access to all packages.
+   It can't be scoped to `reuben-ssg` because the package doesn't exist yet.
+   If the npm account requires 2FA for writes, tick "Bypass 2FA" on the token, or the publish fails after approval.
    Save it as the `NPM_TOKEN` secret in the `release` environment.
    The first publish needs a token because trusted publishing can't be configured for a package that doesn't exist yet.
 4. Make sure `publish-npm.yml` is on `main` before the first tag is pushed.
@@ -25,14 +29,18 @@ The crates are published by hand from a local checkout.
 
 ## Release
 
-1. Bump the workspace version with `cargo set-version --workspace X.Y.Z`, and merge the change to `main`.
-2. Ask Nick. **Needs Nick's yes.**
+1. Bump the workspace version with `cargo set-version --workspace X.Y.Z`, which comes from cargo-edit (`cargo install cargo-edit`).
+   Commit the updated `Cargo.lock` with the bump, and merge the change to `main`.
+   The Release workflow's `plan` job fails on a pull request when `release.yml` is stale, so it is what catches a stale `release.yml`.
+   If `main` gets branch protection, make `plan` a required check alongside CI.
+2. Get Nick's yes before tagging.
 3. Tag `vX.Y.Z` on `main` and push the tag.
    The tag must equal the crate version, or dist refuses to run.
 4. The GitHub Release appears when the `Release` workflow finishes, with no approval.
    Check that its assets include `reuben-installer.sh`, `reuben-installer.ps1` and `reuben-npm-package.tar.gz`.
-5. Approve the `release` environment on the `Publish npm` run in the Actions tab to publish `reuben-ssg`. **Needs Nick's yes.**
-6. Ask Nick, then publish the crates in dependency order. **Needs Nick's yes.**
+5. Approve the `release` environment on the `Publish npm` run in the Actions tab to publish `reuben-ssg`, once Nick has said yes.
+   A tag containing `-`, such as `v0.2.0-rc.1`, publishes under the `next` dist-tag instead of `latest`.
+6. Once Nick has said yes, check out the `vX.Y.Z` tag in a clean checkout and publish the crates in dependency order from there.
 
    ```sh
    cargo publish -p reuben-a11y

@@ -59,4 +59,8 @@ jobs:
             unset NODE_AUTH_TOKEN
             sed -i '/_authToken/d' "$NPM_CONFIG_USERCONFIG"
           fi
-          npm publish --access public --provenance "$TARBALL"
+          tag=latest
+          case "$TAG" in
+            *-*) tag=next ;;
+          esac
+          npm publish --access public --provenance --tag "$tag" "$TARBALL"
