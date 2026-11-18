@@ -7,10 +7,12 @@ mod includes;
 pub(crate) use includes::list_rhai;
 
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use crate::blocks::{Block, BlockKind};
 use crate::doc::{Origin, Span};
 use crate::html::escape_output;
+use crate::links::PageIndex;
 use crate::splice::{Markup, Output};
 use crate::template::Escape;
 
@@ -68,6 +70,33 @@ impl std::fmt::Debug for ScriptEngine {
 
 thread_local! {
     static CURRENT_FILE: std::cell::RefCell<String> = const { std::cell::RefCell::new(String::new()) };
+    static LINK_CONTEXT: std::cell::RefCell<Option<LinkContext>> = const { std::cell::RefCell::new(None) };
+}
+
+/// The page being rendered, which `url_for` and `markdown()` resolve source links against.
+#[derive(Clone)]
+pub struct LinkContext {
+    pub index: Arc<PageIndex>,
+    /// The page's path relative to `content/`.
+    pub page_rel: PathBuf,
+    pub base_path: String,
+}
+
+/// Runs `f` with `ctx` as this thread's link context, then restores the previous one.
+pub fn with_link_context<R>(ctx: LinkContext, f: impl FnOnce() -> R) -> R {
+    struct Restore(Option<LinkContext>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            LINK_CONTEXT.with(|c| *c.borrow_mut() = self.0.take());
+        }
+    }
+    let _restore = Restore(LINK_CONTEXT.with(|c| c.borrow_mut().replace(ctx)));
+    f()
+}
+
+/// Calls `f` with this thread's link context, or `None` outside a page render.
+fn with_current_link<R>(f: impl FnOnce(Option<&LinkContext>) -> R) -> R {
+    LINK_CONTEXT.with(|c| f(c.borrow().as_ref()))
 }
 
 impl ScriptEngine {

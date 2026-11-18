@@ -1,14 +1,18 @@
 //! Evaluates a page: sidecar script, then its blocks in one scope, spliced into the document tree.
 
+use std::sync::Arc;
+
 use rhai::serde::to_dynamic;
 use rhai::{Dynamic, Map, Scope};
 
 use crate::blocks::{self};
+use crate::check;
 use crate::collections;
 use crate::config::Config;
 use crate::doc::Document;
 use crate::error::{Error, ErrorKind};
 use crate::headings;
+use crate::links::{self, AnchorRequest, PageIndex};
 use crate::markdown;
 use crate::math;
 use crate::script::ScriptEngine;
@@ -124,6 +128,7 @@ pub struct SiteScopes<'a> {
     pub site: &'a Map,
     pub data: &'a Map,
     pub collections: &'a Map,
+    pub pages: &'a Arc<PageIndex>,
 }
 
 /// The scope for a page or template: its constants, then the sidecar script's variables.
@@ -153,6 +158,25 @@ pub struct RenderedBody {
     pub doc: Document,
     pub scope: Scope<'static>,
     pub outputs: Vec<Output>,
+    /// The `#fragment`s of resolved source links, to check once every page has rendered.
+    pub anchors: Vec<AnchorRequest>,
+}
+
+/// Why a page didn't render. A page that failed after its links were resolved still hands over its anchor requests,
+/// so the pages it links to are checked in the same run.
+#[derive(Debug, Default)]
+pub struct Failed {
+    pub errors: Vec<Error>,
+    pub anchors: Vec<AnchorRequest>,
+}
+
+impl From<Vec<Error>> for Failed {
+    fn from(errors: Vec<Error>) -> Self {
+        Self {
+            errors,
+            anchors: Vec::new(),
+        }
+    }
 }
 
 /// Every block's error is collected rather than stopping at the first.
@@ -161,7 +185,7 @@ pub fn render_body(
     engine: &ScriptEngine,
     config: &Config,
     scopes: &SiteScopes<'_>,
-) -> Result<RenderedBody, Vec<Error>> {
+) -> Result<RenderedBody, Failed> {
     let mut scope = build_scope(page, engine, config, scopes)?;
 
     let skip = markdown::code_ranges(&page.body);
@@ -180,20 +204,27 @@ pub fn render_body(
             }
         }
     }
-    if !errors.is_empty() {
-        return Err(errors);
-    }
+    // A failed block is spliced as `Output::Nothing`, so link and math errors on the page still surface.
     splice::splice(&mut doc, &outputs);
     // Ids are assigned first so a heading's slug reads its LaTeX, not the MathML's annotation.
     let toc = headings::toc_array(&headings::assign_ids(&mut doc));
-    math::render_math(&mut doc).map_err(|errors| {
-        errors
-            .into_iter()
-            .map(|(location, message)| {
-                Error::new(&page.source, ErrorKind::Math { message, location })
-            })
-            .collect::<Vec<_>>()
-    })?;
+    let (link_problems, anchors) = links::resolve_tree(
+        &mut doc,
+        &page.rel,
+        scopes.pages,
+        &check::base_path(&config.base_url),
+    );
+    errors.extend(link_problems.into_iter().map(|(location, problem)| {
+        Error::new(&page.source, ErrorKind::Link { problem, location })
+    }));
+    if let Err(math_errors) = math::render_math(&mut doc) {
+        errors.extend(math_errors.into_iter().map(|(location, message)| {
+            Error::new(&page.source, ErrorKind::Math { message, location })
+        }));
+    }
+    if !errors.is_empty() {
+        return Err(Failed { errors, anchors });
+    }
 
     // Constants can't be reassigned, so the layout's `page` is swapped for a copy carrying the final toc.
     if let Some(mut page_map) = scope.get_value::<Map>("page") {
@@ -205,5 +236,6 @@ pub fn render_body(
         doc,
         scope,
         outputs,
+        anchors,
     })
 }

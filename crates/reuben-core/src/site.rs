@@ -21,10 +21,12 @@ use crate::dirs::{self, DirDefaults};
 use crate::error::{Error, ErrorKind};
 use crate::frontmatter::{self, FrontMatter};
 use crate::headings::TocEntry;
+use crate::links::{AnchorRequest, LinkProblem, PageIndex, Target};
 use crate::output::{Output, OutputFile, check_out_dir, write_atomic};
+use crate::page::Failed;
 use crate::route::{Route, route_for_page, route_for_template};
 use crate::script::helpers::url_for;
-use crate::script::{Html, ScriptEngine};
+use crate::script::{Html, LinkContext, ScriptEngine, with_link_context};
 use crate::sitemap;
 use crate::template::{self, Escape};
 use crate::theme::{PageShell, builtin_page};
@@ -85,6 +87,9 @@ pub struct Site {
     /// Folders (relative to `content/`) whose `_dir.toml` failed to load. Their pages stay in the site, but their
     /// render errors are dropped because the `_dir.toml` error already explains them.
     broken_dirs: BTreeSet<PathBuf>,
+    /// Markdown files under `content/` (relative to it) that failed to load. Links to them resolve, so the
+    /// file's own error isn't repeated on every page that links to it.
+    failed_markdown: Vec<PathBuf>,
     /// An `includes/*.rhai` file failed, so nothing that runs Rhai is rendered: every call into the includes would
     /// fail and bury the real error.
     pub(crate) includes_broken: bool,
@@ -152,6 +157,10 @@ struct Rendered {
     findings: Vec<Finding>,
     /// Local links of the page, to be checked once every output file is known.
     links: Vec<LocalLink>,
+    /// Every id in the page, for the anchors other pages link to.
+    ids: HashSet<String>,
+    /// The `#anchor`s this page's source links ask for, to be checked against their target's ids.
+    anchors: Vec<AnchorRequest>,
 }
 
 impl Rendered {
@@ -160,6 +169,8 @@ impl Rendered {
             html,
             findings: Vec::new(),
             links: Vec::new(),
+            ids: HashSet::new(),
+            anchors: Vec::new(),
         }
     }
 }
@@ -194,6 +205,7 @@ impl Site {
         let (dirs, mut dir_errors) = dirs::load(&content);
         errors.append(&mut dir_errors);
         let mut asset_rels = Vec::new();
+        let mut failed_markdown = Vec::new();
         for (path, rel) in walk(&content, &mut errors) {
             let is_markdown = path.extension().is_some_and(|e| e == "md");
             if !is_markdown && path.file_name().is_some_and(|n| n == "_dir.toml") {
@@ -222,6 +234,9 @@ impl Site {
                 Ok(Some(page)) => pages.push(page),
                 Ok(None) => asset_rels.push(rel),
                 Err(f) => {
+                    if is_markdown {
+                        failed_markdown.push(rel.clone());
+                    }
                     errors.extend(f.errors);
                     // The broken `_dir.toml` is already reported, and without its defaults a page would only add
                     // misleading errors (a missing title, say). Problems in the file itself are its own.
@@ -289,9 +304,37 @@ impl Site {
             engine: Arc::new(engine),
             load_errors: errors,
             broken_dirs: dirs.broken().clone(),
+            failed_markdown,
             includes_broken,
             site_map: site_scope,
         })
+    }
+
+    /// Every Markdown page a link can name, drafts included but marked as excluded unless `drafts` is set.
+    pub(crate) fn page_index(&self, drafts: bool) -> PageIndex {
+        let loaded = self
+            .pages
+            .iter()
+            .filter(|p| p.kind == PageKind::Markdown && !p.from_static)
+            .map(|p| {
+                (
+                    p.rel.clone(),
+                    Target {
+                        url: p.route.url.clone(),
+                        excluded_draft: p.draft_excluded && !drafts,
+                    },
+                )
+            });
+        let failed = self.failed_markdown.iter().map(|rel| {
+            (
+                rel.clone(),
+                Target {
+                    url: route_for_page(rel).url,
+                    excluded_draft: false,
+                },
+            )
+        });
+        PageIndex::new(loaded.chain(failed))
     }
 
     /// Renders the whole site into memory. Nothing touches the disk.
@@ -308,15 +351,18 @@ impl Site {
         errors.append(&mut collection_errors);
 
         let mut output = Output::default();
+        let index = Arc::new(self.page_index(opts.drafts));
         let scopes = page::SiteScopes {
             site: &self.site_map,
             data: &self.data.value,
             collections: &collections,
+            pages: &index,
         };
-        let render_one = |page: &&Page| -> Result<Rendered, Vec<Error>> {
-            let (html, tree) = self.render_page(page, &scopes)?;
-            splice::ensure_no_placeholders(&page.source, &html).map_err(|e| vec![e])?;
-            Ok(check_html(page, html, tree))
+        let render_one = |page: &&Page| -> Result<Rendered, Failed> {
+            let (html, tree, anchors) = self.render_page(page, &scopes)?;
+            splice::ensure_no_placeholders(&page.source, &html)
+                .map_err(|e| Failed::from(vec![e]))?;
+            Ok(check_html(page, html, tree, anchors))
         };
         // A pool that can't start is reported, and the build carries on with rayon's default pool.
         let pool =
@@ -333,8 +379,8 @@ impl Site {
                 },
             );
         // Skipped pages count as failed with nothing to add, so templated partials still import as empty.
-        let rendered: Vec<Result<Rendered, Vec<Error>>> = if self.includes_broken {
-            pages.iter().map(|_| Err(Vec::new())).collect()
+        let rendered: Vec<Result<Rendered, Failed>> = if self.includes_broken {
+            pages.iter().map(|_| Err(Failed::default())).collect()
         } else {
             in_pool(pool.as_ref(), || pages.par_iter().map(render_one).collect())
         };
@@ -357,12 +403,15 @@ impl Site {
         let mut partial_pages = 0;
         let mut findings: Vec<Finding> = Vec::new();
         let mut page_links: Vec<(&Page, Vec<LocalLink>)> = Vec::new();
+        // Only Markdown pages are anchor targets, keyed by their path under `content/`.
+        let mut page_ids: HashMap<&Path, HashSet<String>> = HashMap::new();
+        let mut page_anchors: Vec<(&Page, Vec<AnchorRequest>)> = Vec::new();
         // Merged in page order so neither output, errors nor findings depend on which thread finished first.
         for (page, result) in pages.iter().zip(rendered) {
             let is_partial = is_partial_css(&page.route.file);
             partial_pages += usize::from(is_partial);
             let result = match result {
-                Err(_) if self.in_broken_dir(page) => Err(Vec::new()),
+                Err(_) if self.in_broken_dir(page) => Err(Failed::default()),
                 other => other,
             };
             if is_css(&page.route.file) {
@@ -386,12 +435,19 @@ impl Site {
                 Ok(done) => {
                     findings.extend(done.findings);
                     page_links.push((page, done.links));
+                    if page.kind == PageKind::Markdown {
+                        page_ids.insert(page.rel.as_path(), done.ids);
+                    }
+                    page_anchors.push((page, done.anchors));
                     output.files.insert(
                         page.route.file.clone(),
                         OutputFile::Bytes(done.html.into_bytes()),
                     );
                 }
-                Err(mut e) => errors.append(&mut e),
+                Err(mut failed) => {
+                    errors.append(&mut failed.errors);
+                    page_anchors.push((page, failed.anchors));
+                }
             }
         }
         let statics = self.static_sources(opts.drafts);
@@ -458,6 +514,27 @@ impl Site {
                 warnings.push(
                     "sitemap.xml skipped: base_url must be absolute (http:// or https://)".into(),
                 );
+            }
+        }
+
+        // Unlike `link-target`, this runs on a failed build too: a target that didn't render is skipped, not blamed.
+        for (page, anchors) in &page_anchors {
+            for anchor in anchors {
+                let missing = page_ids
+                    .get(anchor.target.as_path())
+                    .is_some_and(|ids| !ids.contains(&anchor.fragment));
+                if missing {
+                    errors.push(Error::new(
+                        &page.source,
+                        ErrorKind::Link {
+                            problem: LinkProblem::NoAnchor {
+                                target: anchor.target.clone(),
+                                fragment: anchor.fragment.clone(),
+                            },
+                            location: anchor.location,
+                        },
+                    ));
+                }
             }
         }
 
@@ -567,13 +644,33 @@ impl Site {
         &self,
         page: &Page,
         scopes: &page::SiteScopes<'_>,
-    ) -> Result<(String, Option<TreeReport>), Vec<Error>> {
-        let (body, mut scope, layout_name, tree) = match page.kind {
+    ) -> Result<(String, Option<TreeReport>, Vec<AnchorRequest>), Failed> {
+        with_link_context(self.link_context(page, scopes.pages), || {
+            self.render_page_in_context(page, scopes)
+        })
+    }
+
+    /// What `url_for` and `markdown()` resolve source links against while `page` is being evaluated.
+    pub(crate) fn link_context(&self, page: &Page, index: &Arc<PageIndex>) -> LinkContext {
+        LinkContext {
+            index: Arc::clone(index),
+            page_rel: page.rel.clone(),
+            base_path: check::base_path(&self.config.base_url),
+        }
+    }
+
+    fn render_page_in_context(
+        &self,
+        page: &Page,
+        scopes: &page::SiteScopes<'_>,
+    ) -> Result<(String, Option<TreeReport>, Vec<AnchorRequest>), Failed> {
+        let (body, mut scope, layout_name, tree, anchors) = match page.kind {
             PageKind::Markdown => {
                 let page::RenderedBody {
                     doc,
                     scope,
                     outputs,
+                    anchors,
                 } = page::render_body(page, &self.engine, &self.config, scopes)?;
                 let name = page
                     .front_matter
@@ -581,7 +678,7 @@ impl Site {
                     .as_deref()
                     .or_else(|| collections::layout_of(&page.rel, &self.config));
                 let tree = check::tree_pass(&page.source, &page.rules, &doc, &outputs);
-                (html::render(&doc), scope, name, Some(tree))
+                (html::render(&doc), scope, name, Some(tree), anchors)
             }
             PageKind::Template { escape } => {
                 let (text, scope) =
@@ -591,19 +688,24 @@ impl Site {
                 let own = page.front_matter_sources.get("layout") == Some(&page.source);
                 let name = page.front_matter.layout.as_deref().filter(|_| own);
                 if name.is_none() {
-                    return Ok((text, None));
+                    return Ok((text, None, Vec::new()));
                 }
-                (text, scope, name, None)
+                (text, scope, name, None, Vec::new())
             }
+        };
+        let failed = |errors| Failed {
+            errors,
+            anchors: anchors.clone(),
         };
         let layout = layout::find_layout(layout_name, &self.root, self.config.theme.as_deref())
             .map_err(|mut e| {
                 e.path.clone_from(&page.source);
-                vec![e]
+                failed(vec![e])
             })?;
         let html = match (layout, page.kind) {
             (Some(path), _) => {
-                layout::render_layout(&path, &self.engine, &mut scope, Html::new(body))?
+                layout::render_layout(&path, &self.engine, &mut scope, Html::new(body))
+                    .map_err(failed)?
             }
             (None, PageKind::Markdown) => builtin_page(&PageShell {
                 title: &page.front_matter.title,
@@ -614,7 +716,7 @@ impl Site {
             }),
             (None, PageKind::Template { .. }) => body,
         };
-        Ok((html, tree))
+        Ok((html, tree, anchors))
     }
 
     fn css_job(
@@ -715,7 +817,12 @@ impl Site {
 
 /// Runs the HTML pass on a page's finished text, with the tree pass's findings. Only HTML pages are checked:
 /// Markdown pages and `.html` templates. Other templates are CSS, XML and the like.
-fn check_html(page: &Page, html: String, tree: Option<TreeReport>) -> Rendered {
+fn check_html(
+    page: &Page,
+    html: String,
+    tree: Option<TreeReport>,
+    anchors: Vec<AnchorRequest>,
+) -> Rendered {
     let is_html = match page.kind {
         PageKind::Markdown => true,
         PageKind::Template { .. } => page.route.file.extension().is_some_and(|e| e == "html"),
@@ -737,6 +844,8 @@ fn check_html(page: &Page, html: String, tree: Option<TreeReport>) -> Rendered {
         html,
         findings,
         links: report.links,
+        ids: report.ids,
+        anchors,
     }
 }
 

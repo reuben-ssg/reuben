@@ -5,6 +5,7 @@
 use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use rhai::{Array, Dynamic, Map};
 
@@ -14,7 +15,7 @@ use crate::error::{Error, ErrorKind};
 use crate::locate::{self, Format};
 use crate::page::{self, SiteScopes};
 use crate::script::collection::Collection;
-use crate::script::{helpers, list_rhai};
+use crate::script::{helpers, list_rhai, with_link_context};
 use crate::site::{Page, Site, include_dirs};
 
 /// Where a name's value was set. A `line` is `None` when the file has no single line for it.
@@ -88,19 +89,24 @@ impl Site {
 
         // After a broken include the sidecar and the page's blocks would only fail on the include's account.
         if !self.includes_broken {
+            let index = Arc::new(self.page_index(found.draft_excluded));
             let scopes = SiteScopes {
                 site: &self.site_map,
                 data: &self.data.value,
                 collections: &collections,
+                pages: &index,
             };
-            match page::build_scope(found, &self.engine, &self.config, &scopes) {
+            let built = with_link_context(self.link_context(found, &index), || {
+                page::build_scope(found, &self.engine, &self.config, &scopes)
+            });
+            match built {
                 // A sidecar that fails fails the render too, with the same error, so only a good one goes on.
                 Ok(scope) => {
                     self.sidecar_entries(found, &scope, &mut texts, &mut entries);
                     if let Err(e) = self.render_page(found, &scopes)
                         && !self.in_broken_dir(found)
                     {
-                        errors.extend(e);
+                        errors.extend(e.errors);
                     }
                 }
                 Err(e) => errors.extend(e),

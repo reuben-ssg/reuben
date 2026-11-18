@@ -5,6 +5,7 @@ use std::path::PathBuf;
 use crate::blocks::BlockError;
 use crate::doc::Span;
 use crate::frontmatter::FrontMatterError;
+use crate::links::LinkProblem;
 use crate::script::ScriptError;
 
 #[derive(Debug, Clone, thiserror::Error)]
@@ -26,6 +27,11 @@ pub enum ErrorKind {
     Block(BlockError),
     #[error("math: {message}")]
     Math { message: String, location: Span },
+    #[error("{problem}")]
+    Link {
+        problem: LinkProblem,
+        location: Span,
+    },
     #[error("css: {message}")]
     Css {
         message: String,
@@ -72,6 +78,10 @@ impl Clone for ErrorKind {
                 message: message.clone(),
                 location: *location,
             },
+            Self::Link { problem, location } => Self::Link {
+                problem: problem.clone(),
+                location: *location,
+            },
             Self::Css { message, location } => Self::Css {
                 message: message.clone(),
                 location: *location,
@@ -100,7 +110,7 @@ impl Error {
         match &self.kind {
             ErrorKind::Script(e) => e.location,
             ErrorKind::Block(e) => Some(e.span),
-            ErrorKind::Math { location, .. } => Some(*location),
+            ErrorKind::Math { location, .. } | ErrorKind::Link { location, .. } => Some(*location),
             ErrorKind::Css { location, .. } => *location,
             _ => None,
         }

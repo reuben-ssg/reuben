@@ -4,9 +4,10 @@ use std::path::{Path, PathBuf};
 
 use rhai::{Array, Dynamic, Engine, EvalAltResult, NativeCallContext};
 
-use super::{Html, IncludeFiles, collection};
+use super::{Html, IncludeFiles, collection, with_current_link};
 use crate::doc::Origin;
 use crate::html::{escape_text, render};
+use crate::links::{parse_source_link, resolve_tree, source_links};
 use crate::markdown::parse;
 use crate::math::render_math;
 
@@ -51,6 +52,21 @@ pub fn register(engine: &mut Engine, site_root: &Path, include_files: &IncludeFi
                     let (span, message) = &errors[0];
                     format!("math at {}:{}: {message}", span.line, span.column)
                 })?;
+                // Anchors aren't checked here: the output may land anywhere on the page.
+                let messages: Vec<String> = with_current_link(|ctx| match ctx {
+                    Some(ctx) => resolve_tree(&mut doc, &ctx.page_rel, &ctx.index, &ctx.base_path)
+                        .0
+                        .iter()
+                        .map(|(_, p)| p.to_string())
+                        .collect(),
+                    None => source_links(&doc)
+                        .into_iter()
+                        .map(|dest| format!("markdown: `{dest}` needs a page being built"))
+                        .collect(),
+                });
+                if !messages.is_empty() {
+                    return Err(messages.join("; ").into());
+                }
                 Ok(Html {
                     markup: render(&doc),
                     origin: origin_of(&ctx, &markdown_files),
@@ -68,7 +84,22 @@ pub fn register(engine: &mut Engine, site_root: &Path, include_files: &IncludeFi
 /// Registering again replaces the earlier `url_for`, so this is also how the real `base_url` is applied.
 pub fn register_url_for(engine: &mut Engine, base_url: &str) {
     let base = base_url.to_string();
-    engine.register_fn("url_for", move |path: &str| url_for(&base, path));
+    engine.register_fn("url_for", move |path: &str| -> RhaiResult<String> {
+        let Some(parsed) = parse_source_link(path) else {
+            return Ok(url_for(&base, path));
+        };
+        let resolved = with_current_link(|ctx| {
+            let ctx = ctx.ok_or_else(|| format!("url_for: `{path}` needs a page being built"))?;
+            parsed
+                .and_then(|link| ctx.index.resolve(&ctx.page_rel, &link))
+                .map_err(|problem| format!("url_for: {problem}"))
+        })?;
+        Ok(format!(
+            "{}{}",
+            url_for(&base, &resolved.route_url),
+            resolved.suffix
+        ))
+    });
 }
 
 pub fn url_for(base_url: &str, path: &str) -> String {
@@ -188,6 +219,19 @@ mod tests {
         let src = format!("load_data({:?})", abs.to_str().unwrap());
         let err = run(&engine, &src).unwrap_err();
         assert!(err.to_string().contains("outside the site"), "{err}");
+    }
+
+    #[test]
+    fn url_for_keeps_plain_paths() {
+        let mut engine = ScriptEngine::new(Path::new("."));
+        engine.set_base_url("https://x.dev/");
+        for (arg, want) in [
+            ("/a.css", "https://x.dev/a.css"),
+            ("https://y.dev/a.md", "https://x.dev/https://y.dev/a.md"),
+        ] {
+            let got = run(&engine, &format!("url_for(\"{arg}\")")).unwrap();
+            assert_eq!(got.into_string().unwrap(), want);
+        }
     }
 
     #[test]

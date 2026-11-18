@@ -84,6 +84,58 @@ reuben explain /blog/x/
 
 It exits 1 if loading the site found errors, after printing them.
 
+## Linking to pages
+
+Link to a page by naming its source file, and Reuben writes the page's real URL into the built site.
+Links then keep working when a page moves or its URL changes.
+
+```markdown
+See the [scope guide](@/writing-guide/style/scope.md#assumptions).
+```
+
+builds to `<a href="/writing-guide/style/scope/#assumptions">`.
+
+There are two forms:
+
+- `@/path.md` starts at `content/`, so `@/writing-guide/style/scope.md` always means that file.
+- A relative path such as `scope.md`, `./scope.md` or `../style/scope.md` starts at the folder of the page that contains the link.
+
+A destination is a source link when it starts with `@/`, or when it has no scheme, doesn't start with `/` or `#`, and its path ends in `.md`.
+A fragment (`#assumptions`) or query (`?x=1`) is kept as written.
+Any other link builds exactly as before, and a link that starts with `/` is a plain URL even if it ends in `.md`.
+Raw HTML links aren't rewritten.
+
+Every source link that can't be resolved is a build error at the link's file and line, reported with all the other errors in the run:
+
+```text
+error: no page `_index.md`; did you mean `index.md`?
+  --> content/a.md:4:1
+```
+
+| Message                                                 | Cause                                                              |
+| ------------------------------------------------------- | ------------------------------------------------------------------ |
+| ``no page `x.md` ``                                     | No such file under `content/`, with a suggestion when one is near. |
+| ``links to `x.md`, a draft that isn't built ...``       | The target is a draft and the build isn't using `--drafts`.        |
+| ``link `../../x.md` points outside content/``           | The path climbs above `content/`.                                  |
+| ``link `@/x.txt` must name a .md file``                 | An `@/` link to something that isn't Markdown.                     |
+| ``links to `#id` on `x.md`, which has no such id``      | The target page's built HTML has no element with that id.          |
+
+There is no `_index.md` alias: link to `index.md`.
+These are errors, not accessibility findings, so `a11y.disable` doesn't switch them off.
+
+Layouts and includes can use the same forms with `url_for`, which is how to link from outside Markdown, such as a navigation bar:
+
+```html
+<a href="{{ url_for("@/portfolio/index.md") }}">Portfolio</a>
+```
+
+`url_for` joins the full `base_url`, so the result also works in feeds, while a Markdown source link gets only the base path, such as `/sub/writing-guide/`, so the output stays portable between hosts.
+Relative paths resolve against the page being built, including in an include or layout it uses, so use `@/` in includes and layouts shared across folders.
+A relative path in `markdown()` output resolves the same way.
+The fragment check covers only the Markdown of a page, not `url_for` results or links inside `markdown()` output, because that text may land anywhere on the page.
+A `markdown()` link is still resolved, and a missing file there is an error, but its `#fragment` isn't checked.
+Outside a page being built, such as in a `data/` file, `url_for` and `markdown()` can't resolve a source link, so it is an error there.
+
 ## License
 
 Licensed under either of

@@ -26,6 +26,17 @@ fn entry<'a>(ex: &'a Explanation, name: &str) -> &'a Entry {
 const POST: &str = "---\ntitle: Hello\n---\nBody.\n";
 
 #[test]
+fn sidecar_url_for_source_links_is_no_error() {
+    let tmp = site(&[
+        ("content/p.md", POST),
+        ("content/p.rhai", "let u = url_for(\"@/q.md\");\n"),
+        ("content/q.md", POST),
+    ]);
+    let ex = explain(&tmp, "content/p.md");
+    assert!(ex.errors.is_empty(), "{:?}", ex.errors);
+}
+
+#[test]
 fn four_layers_show_the_winner() {
     let tmp = site(&[
         (

@@ -17,6 +17,7 @@ pub mod headings;
 pub mod highlight;
 pub mod html;
 pub mod layout;
+pub mod links;
 pub mod locate;
 pub mod markdown;
 pub mod math;
