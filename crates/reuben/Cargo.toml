@@ -1,6 +1,6 @@
 [package]
 name = "reuben"
-version = "0.0.0"
+version.workspace = true
 description = "The tastiest SSG. A static site generator with Rhai scripting in Markdown."
 readme = "../../README.md"
 keywords = ["static-site", "ssg", "markdown", "rhai"]
