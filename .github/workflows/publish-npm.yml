@@ -32,8 +32,8 @@ jobs:
         run: |
           name=$(tar -xzOf "$TARBALL" package/package.json | jq -r .name)
           version=$(tar -xzOf "$TARBALL" package/package.json | jq -r .version)
-          if [ "$name" != "reuben-ssg" ] || [ "v$version" != "$TAG" ]; then
-            echo "::error::package is $name@$version, expected reuben-ssg@${TAG#v}"
+          if [ "$name" != "@reuben-ssg/reuben" ] || [ "v$version" != "$TAG" ]; then
+            echo "::error::package is $name@$version, expected @reuben-ssg/reuben@${TAG#v}"
             exit 1
           fi
 

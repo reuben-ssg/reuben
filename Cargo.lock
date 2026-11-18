@@ -1908,7 +1908,7 @@ dependencies = [
 
 [[package]]
 name = "reuben"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "assert_cmd",
  "assert_fs",
@@ -1920,14 +1920,14 @@ dependencies = [
 
 [[package]]
 name = "reuben-a11y"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "html5ever",
 ]
 
 [[package]]
 name = "reuben-core"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "assert_fs",
  "comrak",
