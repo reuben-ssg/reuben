@@ -1,8 +1,10 @@
 [package]
 name = "reuben-core"
-version = "0.0.0"
+version.workspace = true
 description = "Core build pipeline for the Reuben static site generator."
-publish = false
+readme = "README.md"
+keywords = ["static-site", "ssg", "markdown", "rhai"]
+categories = ["web-programming"]
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true

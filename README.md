@@ -9,6 +9,34 @@ Includes are plain Rhai functions, so every variable a page uses can be traced b
 
 Reuben is in early development: `reuben build`, `serve`, `check` and `explain` work today, but anything may still change.
 
+## Install
+
+In a site project, add Reuben as a dev dependency from npm:
+
+```sh
+npm install --save-dev reuben-ssg
+```
+
+The npm package installs the prebuilt `reuben` command, so run it with `npx reuben build`.
+
+To install the `reuben` command from source with Cargo:
+
+```sh
+cargo install reuben
+```
+
+To install a prebuilt binary on macOS or Linux with the shell installer from the latest GitHub Release:
+
+```sh
+curl --proto '=https' --tlsv1.2 -LsSf https://github.com/reuben-ssg/reuben/releases/latest/download/reuben-installer.sh | sh
+```
+
+On Windows, use the PowerShell installer from the same release:
+
+```powershell
+powershell -ExecutionPolicy Bypass -c "irm https://github.com/reuben-ssg/reuben/releases/latest/download/reuben-installer.ps1 | iex"
+```
+
 ## Checks
 
 Every build checks each page for common accessibility problems, on both the Markdown tree and the final HTML.
