@@ -14,7 +14,7 @@ Reuben is in early development: `reuben build`, `serve`, `check` and `explain` w
 In a site project, add Reuben as a dev dependency from npm:
 
 ```sh
-npm install --save-dev reuben-ssg
+npm install --save-dev @reuben-ssg/reuben
 ```
 
 The npm package installs the prebuilt `reuben` command, so run it with `npx reuben build`.

@@ -1,6 +1,6 @@
 # Releasing Reuben
 
-A release publishes the prebuilt binaries and installers to a GitHub Release, the `reuben-ssg` package to npm, and the three crates to crates.io.
+A release publishes the prebuilt binaries and installers to a GitHub Release, the `@reuben-ssg/reuben` package to npm, and the three crates to crates.io.
 Steps marked **needs Nick's yes** must not run until Nick has said yes to that step.
 
 ## How the pieces fit
@@ -9,7 +9,7 @@ Pushing a `vX.Y.Z` tag starts the `Release` workflow (`release.yml`, generated b
 It builds the archives and installers and creates the GitHub Release without any approval.
 When `Release` finishes successfully for a pushed `v*` tag, GitHub starts the separate `Publish npm` workflow (`publish-npm.yml`) through `workflow_run`.
 That workflow runs in the `release` environment, so it waits for approval, then downloads `reuben-npm-package.tar.gz` from the GitHub Release.
-It checks that the package is `reuben-ssg` at the tag's version, then runs `npm publish --provenance`.
+It checks that the package is `@reuben-ssg/reuben` at the tag's version, then runs `npm publish --provenance`.
 The crates are published by hand from a local checkout.
 
 ## One-time setup (needs Nick's yes)
@@ -20,7 +20,8 @@ The crates are published by hand from a local checkout.
 2. If the environment gets a deployment-branch rule, it must allow `main`.
    The publish job runs in the context of `main`, so a rule that allows only tags blocks it.
 3. For the first release only, create a short-lived (7-day) granular npm token with read and write access to all packages.
-   It can't be scoped to `reuben-ssg` because the package doesn't exist yet.
+   It can't be limited to `@reuben-ssg/reuben` because the package doesn't exist yet.
+   Nick's npm account must be able to publish to the `@reuben-ssg` organization.
    If the npm account requires 2FA for writes, tick "Bypass 2FA" on the token, or the publish fails after approval.
    Save it as the `NPM_TOKEN` secret in the `release` environment.
    The first publish needs a token because trusted publishing can't be configured for a package that doesn't exist yet.
@@ -38,7 +39,7 @@ The crates are published by hand from a local checkout.
    The tag must equal the crate version, or dist refuses to run.
 4. The GitHub Release appears when the `Release` workflow finishes, with no approval.
    Check that its assets include `reuben-installer.sh`, `reuben-installer.ps1` and `reuben-npm-package.tar.gz`.
-5. Approve the `release` environment on the `Publish npm` run in the Actions tab to publish `reuben-ssg`, once Nick has said yes.
+5. Approve the `release` environment on the `Publish npm` run in the Actions tab to publish `@reuben-ssg/reuben`, once Nick has said yes.
    A tag containing `-`, such as `v0.2.0-rc.1`, publishes under the `next` dist-tag instead of `latest`.
 6. Once Nick has said yes, check out the `vX.Y.Z` tag in a clean checkout and publish the crates in dependency order from there.
 
@@ -53,17 +54,18 @@ The crates are published by hand from a local checkout.
 ## Check
 
 ```sh
-npx -p reuben-ssg reuben --version
+npx -p @reuben-ssg/reuben reuben --version
 cargo install reuben
 reuben --version
 ```
 
 Both `reuben --version` outputs must print the new version.
 The npm package's command is `reuben`, which is why the check names the package with `-p`.
+An npm config with `minimum-release-age` refuses a version until it is that old, so the npm check may have to wait or run elsewhere.
 
 ## After the first release (needs Nick's yes)
 
-1. On npmjs.com, open the `reuben-ssg` package settings and add a trusted publisher with these values:
+1. On npmjs.com, open the `@reuben-ssg/reuben` package settings and add a trusted publisher with these values:
    - Repository: `reuben-ssg/reuben`
    - Workflow file: `publish-npm.yml`
    - Environment: `release`
@@ -73,3 +75,8 @@ The npm package's command is `reuben`, which is why the check names the package 
    Later releases then publish with no secret, and `publish-npm.yml` falls back to OIDC when `NPM_TOKEN` is empty.
 
 npm provenance points at `publish-npm.yml` on the commit of `main` at publish time, not at the tagged commit.
+
+## History
+
+Version 0.1.0 was published to npm as the unscoped `reuben-ssg`, which is deprecated in favour of `@reuben-ssg/reuben`.
+The deprecated name stays in Nick's account so nobody else can take it.

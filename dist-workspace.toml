@@ -18,7 +18,9 @@ hosting = "github"
 # Whether to install an updater program
 install-updater = false
 # The npm package name for the npm installer
-npm-package = "reuben-ssg"
+npm-package = "reuben"
+# The npm scope; the package publishes as @reuben-ssg/reuben
+npm-scope = "@reuben-ssg"
 # Whether to enable GitHub Attestations
 github-attestations = true
 # Which actions to run on pull requests
