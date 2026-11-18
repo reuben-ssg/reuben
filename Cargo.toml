@@ -36,3 +36,8 @@ criterion = { version = "0.8", default-features = false }
 assert_cmd = "2.2"
 assert_fs = "1.1"
 predicates = "3.1"
+
+# The profile that 'dist' will build with
+[profile.dist]
+inherits = "release"
+lto = "thin"
