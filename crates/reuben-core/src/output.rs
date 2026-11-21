@@ -16,7 +16,8 @@ pub enum OutputFile {
     Bytes(Vec<u8>),
     /// Copied from this source path when the output is written.
     Copy(PathBuf),
-    /// Already written into the staging directory while rendering.
+    /// Already written into the staging directory while rendering. Only `Site::build`'s internal streaming path
+    /// produces this; `Site::render` never returns it.
     Staged,
 }
 
@@ -50,6 +51,8 @@ pub(crate) fn prepare_staging(out: &Path) -> Result<PathBuf, Error> {
 /// untouched and `staging` is removed.
 pub(crate) fn finish_atomic(output: &Output, out: &Path, staging: &Path) -> Result<(), Vec<Error>> {
     let result = paths(out).map_err(|e| vec![e]).and_then(|(real, _, old)| {
+        // Rechecked here because `out` may have changed while the site rendered, and the swap deletes it.
+        check_out_dir(&real).map_err(|e| vec![e])?;
         stage(output, staging).and_then(|()| swap(staging, &real, &old).map_err(|e| vec![e]))
     });
     if result.is_err() {
@@ -358,6 +361,24 @@ mod tests {
             "old"
         );
         assert!(!staging.exists());
+    }
+
+    #[test]
+    fn finish_atomic_refuses_out_that_turned_foreign() {
+        let tmp = TempDir::new().unwrap();
+        let out = tmp.path().join("dist");
+        std::fs::create_dir_all(&out).unwrap();
+        let staging = prepare_staging(&out).unwrap();
+        std::fs::write(out.join("keep.txt"), "mine").unwrap();
+        let errs = finish_atomic(&one_page(), &out, &staging).unwrap_err();
+        assert_eq!(errs.len(), 1);
+        assert!(matches!(errs[0].kind, ErrorKind::UnsafeOutputDir));
+        assert_eq!(
+            std::fs::read_to_string(out.join("keep.txt")).unwrap(),
+            "mine"
+        );
+        assert!(!staging.exists());
+        assert!(!tmp.path().join(".dist.reuben-old").exists());
     }
 
     #[cfg(unix)]

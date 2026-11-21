@@ -354,7 +354,7 @@ impl Site {
         PageIndex::new(loaded.chain(failed))
     }
 
-    /// Renders the whole site into memory. Nothing touches the disk.
+    /// Renders the whole site into memory. Nothing touches the disk, and no file is `OutputFile::Staged`.
     pub fn render(&self, opts: &RenderOptions) -> Result<(Output, BuildReport), Failure> {
         self.render_into(opts, None)
     }
@@ -620,31 +620,29 @@ impl Site {
 
     /// Renders the site and swaps it into `opts.out`. A failed build leaves the previous output untouched.
     pub fn build(&self, opts: &BuildOptions) -> Result<BuildReport, Failure> {
-        let (staging, out_error) =
-            match check_out_dir(&opts.out).and_then(|()| prepare_staging(&opts.out)) {
-                Ok(staging) => (Some(staging), None),
-                Err(e) => (None, Some(e)),
-            };
+        let staging = check_out_dir(&opts.out).and_then(|()| prepare_staging(&opts.out));
         let rendered = self.render_into(
             &RenderOptions {
                 drafts: opts.drafts,
                 jobs: opts.jobs,
             },
-            staging.as_deref(),
+            staging.as_deref().ok(),
         );
         let (output, report, staging) = match (rendered, staging) {
-            (Ok((output, report)), Some(staging)) => (output, report, staging),
-            (Ok((_, report)), None) => {
+            (Ok((output, report)), Ok(staging)) => (output, report, staging),
+            (Ok((_, report)), Err(e)) => {
                 return Err(Failure {
-                    errors: out_error.into_iter().collect(),
+                    errors: vec![e],
                     findings: report.findings,
                 });
             }
             (Err(mut failure), staging) => {
-                if let Some(staging) = staging {
-                    let _ = fs::remove_dir_all(staging);
+                match staging {
+                    Ok(staging) => {
+                        let _ = fs::remove_dir_all(staging);
+                    }
+                    Err(e) => failure.errors.push(e),
                 }
-                failure.errors.extend(out_error);
                 Error::sort(&mut failure.errors);
                 return Err(failure);
             }
