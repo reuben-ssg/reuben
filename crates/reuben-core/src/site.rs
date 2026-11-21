@@ -21,6 +21,7 @@ use crate::dirs::{self, DirDefaults};
 use crate::error::{Error, ErrorKind};
 use crate::frontmatter::{self, FrontMatter};
 use crate::headings::TocEntry;
+use crate::lastmod;
 use crate::links::{AnchorRequest, LinkProblem, PageIndex, Target};
 use crate::output::{Output, OutputFile, check_out_dir, write_atomic};
 use crate::page::Failed;
@@ -494,7 +495,7 @@ impl Site {
             if self.config.base_url.starts_with("http://")
                 || self.config.base_url.starts_with("https://")
             {
-                let mut urls: Vec<String> = pages
+                let listed: Vec<&&Page> = pages
                     .iter()
                     .filter(|p| {
                         p.route.url != "/404.html"
@@ -505,9 +506,19 @@ impl Site {
                                 }
                             }
                     })
-                    .map(|p| url_for(&self.config.base_url, &p.route.url))
                     .collect();
-                urls.sort();
+                let sources: Vec<&Path> = listed.iter().map(|p| p.source.as_path()).collect();
+                let dates = lastmod::source_dates(&self.root, &sources);
+                let mut urls: Vec<(String, Option<jiff::civil::Date>)> = listed
+                    .iter()
+                    .map(|p| {
+                        (
+                            url_for(&self.config.base_url, &p.route.url),
+                            dates.get(&p.source).copied(),
+                        )
+                    })
+                    .collect();
+                urls.sort_by(|a, b| a.0.cmp(&b.0));
                 output.files.insert(
                     PathBuf::from("sitemap.xml"),
                     OutputFile::Bytes(sitemap::render(&urls).into_bytes()),

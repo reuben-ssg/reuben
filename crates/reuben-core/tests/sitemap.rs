@@ -91,3 +91,12 @@ fn sitemap_can_be_disabled() {
     assert!(!tmp.path().join("dist/sitemap.xml").exists());
     assert!(report.warnings.is_empty());
 }
+
+#[test]
+fn sitemap_has_lastmod() {
+    let (tmp, _) = run("sitemap = true\nbase_url = \"https://x.dev/\"\n", &[]);
+    let xml = fs::read_to_string(tmp.path().join("dist/sitemap.xml")).unwrap();
+    let urls = xml.matches("<url>").count();
+    assert!(urls > 0);
+    assert_eq!(xml.matches("<lastmod>").count(), urls, "{xml}");
+}
