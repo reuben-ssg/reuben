@@ -147,7 +147,7 @@ fn convert<'a>(node: &'a AstNode<'a>, line_offset: usize, options: &Options) -> 
 
 /// Whether `body` holds a block opener, `{{` or `{%`. Without one there is nothing to extract, so the code-range
 /// parse can be skipped.
-pub fn has_blocks(body: &str) -> bool {
+pub(crate) fn has_blocks(body: &str) -> bool {
     body.contains("{{") || body.contains("{%")
 }
 

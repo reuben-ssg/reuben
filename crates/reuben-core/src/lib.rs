@@ -16,7 +16,7 @@ pub mod frontmatter;
 pub mod headings;
 pub mod highlight;
 pub mod html;
-pub mod lastmod;
+pub(crate) mod lastmod;
 pub mod layout;
 pub mod links;
 pub mod locate;
