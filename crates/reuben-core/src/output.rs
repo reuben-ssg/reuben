@@ -83,34 +83,41 @@ fn stage(output: &Output, staging: &Path) -> Result<(), Vec<Error>> {
     remove_dir(staging).map_err(|e| vec![e])?;
     fs::create_dir_all(staging).map_err(|e| vec![Error::new(staging, e)])?;
     let mut errors = Vec::new();
-    let dirs: BTreeSet<PathBuf> = output
+    // Each file's destination and parent, joined once.
+    let targets: Vec<(PathBuf, PathBuf, &OutputFile)> = output
         .files
-        .keys()
-        .filter_map(|rel| staging.join(rel).parent().map(Path::to_path_buf))
+        .iter()
+        .map(|(rel, file)| {
+            let dest = staging.join(rel);
+            let parent = dest.parent().unwrap_or(staging).to_path_buf();
+            (dest, parent, file)
+        })
         .collect();
-    for dir in &dirs {
+    let dirs: BTreeSet<&Path> = targets
+        .iter()
+        .map(|(_, parent, _)| parent.as_path())
+        .collect();
+    for dir in dirs {
         if let Err(e) = fs::create_dir_all(dir) {
             errors.push(Error::new(dir, e));
         }
     }
     // Files whose directory couldn't be made are skipped: the directory's error already explains them.
-    let failed_dirs: Vec<&PathBuf> = errors.iter().map(|e| &e.path).collect();
-    let files: Vec<(&PathBuf, &OutputFile)> = output
-        .files
-        .iter()
-        .filter(|(rel, _)| {
-            let parent = staging.join(rel).parent().map(Path::to_path_buf);
-            !parent.is_some_and(|p| failed_dirs.iter().any(|d| p.starts_with(d)))
-        })
-        .collect();
+    let files: Vec<&(PathBuf, PathBuf, &OutputFile)> = if errors.is_empty() {
+        targets.iter().collect()
+    } else {
+        targets
+            .iter()
+            .filter(|(_, parent, _)| !errors.iter().any(|e| parent.starts_with(&e.path)))
+            .collect()
+    };
     // Collected in path order, so the errors come out the same on every run.
     let write_errors: Vec<Error> = files
         .par_iter()
-        .filter_map(|(rel, file)| {
-            let dest = staging.join(rel);
+        .filter_map(|(dest, _, file)| {
             let written = match file {
-                OutputFile::Bytes(bytes) => fs::write(&dest, bytes).map_err(|e| (dest.clone(), e)),
-                OutputFile::Copy(src) => fs::copy(src, &dest)
+                OutputFile::Bytes(bytes) => fs::write(dest, bytes).map_err(|e| (dest.clone(), e)),
+                OutputFile::Copy(src) => fs::copy(src, dest)
                     .map(|_| ())
                     .map_err(|e| (src.clone(), e)),
             };
@@ -146,7 +153,9 @@ fn swap(staging: &Path, out: &Path, old: &Path) -> Result<(), Error> {
     Ok(())
 }
 
-/// Deletes a directory tree with its entries removed in parallel. Best effort: a failure leaves files behind.
+/// Deletes a directory tree, removing its top-level entries in parallel. Each subtree goes through
+/// `remove_dir_all`, which is safe against a directory being swapped for a symlink mid-delete, and a symlink is
+/// removed itself, never followed. Best effort: a failure leaves files behind.
 fn remove_tree_par(dir: &Path) {
     let Ok(entries) = fs::read_dir(dir) else {
         return;
@@ -155,7 +164,7 @@ fn remove_tree_par(dir: &Path) {
     entries.par_iter().for_each(|entry| {
         let path = entry.path();
         if entry.file_type().is_ok_and(|t| t.is_dir()) {
-            remove_tree_par(&path);
+            let _ = fs::remove_dir_all(&path);
         } else {
             let _ = fs::remove_file(&path);
         }
@@ -247,5 +256,44 @@ mod tests {
             "old"
         );
         assert!(!tmp.path().join(".dist.reuben-staging").exists());
+    }
+
+    #[test]
+    fn every_missing_copy_source_is_reported_in_path_order() {
+        let tmp = TempDir::new().unwrap();
+        let mut output = one_page();
+        let (a, b) = (
+            tmp.path().join("a-missing.css"),
+            tmp.path().join("b-missing.css"),
+        );
+        output
+            .files
+            .insert("css/b.css".into(), OutputFile::Copy(b.clone()));
+        output
+            .files
+            .insert("css/a.css".into(), OutputFile::Copy(a.clone()));
+        let errs = write_atomic(&output, &tmp.path().join("dist")).unwrap_err();
+        let paths: Vec<&Path> = errs.iter().map(|e| e.path.as_path()).collect();
+        assert_eq!(paths, [a.as_path(), b.as_path()]);
+        assert!(!tmp.path().join("dist").exists());
+        assert!(!tmp.path().join(".dist.reuben-staging").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn old_output_symlink_is_removed_not_followed() {
+        let tmp = TempDir::new().unwrap();
+        tmp.child("outside/keep.txt").write_str("mine").unwrap();
+        tmp.child("dist/.reuben-output").write_str("").unwrap();
+        tmp.child("dist/sub/old.html").write_str("old").unwrap();
+        std::os::unix::fs::symlink(tmp.path().join("outside"), tmp.path().join("dist/link"))
+            .unwrap();
+        write_atomic(&one_page(), &tmp.path().join("dist")).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(tmp.path().join("outside/keep.txt")).unwrap(),
+            "mine"
+        );
+        assert!(!tmp.path().join(".dist.reuben-old").exists());
+        assert!(!tmp.path().join("dist/link").exists());
     }
 }
