@@ -190,6 +190,7 @@ impl Site {
         let config = config::load(root, opts.env.as_deref()).map_err(|e| vec![e])?;
         let mut engine = ScriptEngine::new(root);
         engine.set_base_url(&config.base_url);
+        engine.set_markdown(&config.markdown);
         let include_errors = engine
             .load_includes(&include_dirs(root, &config))
             .err()

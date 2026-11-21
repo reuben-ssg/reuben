@@ -108,6 +108,12 @@ impl ScriptEngine {
         helpers::register_url_for(&mut self.engine, base_url);
     }
 
+    /// Makes `markdown()` follow the site's `[markdown]` wherever it runs, data scripts included.
+    /// A page render's `LinkContext` still supplies its own settings. Call before loading includes or data.
+    pub fn set_markdown(&mut self, config: &MarkdownConfig) {
+        helpers::register_markdown(&mut self.engine, &self.include_files, config.clone());
+    }
+
     pub fn new(site_root: &Path) -> Self {
         let mut engine = rhai::Engine::new();
         engine.set_max_call_levels(32);
