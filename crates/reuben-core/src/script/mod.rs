@@ -114,6 +114,8 @@ impl ScriptEngine {
         engine.set_max_operations(1_000_000);
         engine.set_max_expr_depths(64, 32);
         engine.set_max_string_size(10_000_000);
+        // Rhai's `sync` string interner sleeps 10 ms whenever two threads contend for it.
+        engine.set_max_strings_interned(0);
         engine.set_max_array_size(100_000);
         engine.set_max_map_size(100_000);
         engine.disable_symbol("eval");

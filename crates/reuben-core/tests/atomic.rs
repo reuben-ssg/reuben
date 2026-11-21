@@ -124,3 +124,19 @@ fn symlinked_out_dir_keeps_its_link() {
         }
     }
 }
+
+#[test]
+fn rebuild_removes_old_output() {
+    let tmp = fixture("basic");
+    tmp.child("content/gone.md")
+        .write_str("---\ntitle: Gone\n---\nbye\n")
+        .unwrap();
+    build(tmp.path()).unwrap();
+    assert!(tmp.path().join("dist/gone/index.html").exists());
+    fs::remove_file(tmp.path().join("content/gone.md")).unwrap();
+    build(tmp.path()).unwrap();
+    assert!(tmp.path().join("dist/index.html").exists());
+    assert!(!tmp.path().join("dist/gone").exists());
+    assert!(!tmp.path().join(".dist.reuben-old").exists());
+    assert!(!tmp.path().join(".dist.reuben-staging").exists());
+}

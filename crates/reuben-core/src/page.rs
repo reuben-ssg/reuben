@@ -95,7 +95,11 @@ pub(crate) fn precompute(
     if kind != PageKind::Markdown {
         return (Vec::new(), described());
     }
-    let skip = markdown::code_ranges_with(body, math);
+    let skip = if markdown::has_blocks(body) {
+        markdown::code_ranges_with(body, math)
+    } else {
+        Vec::new()
+    };
     let Ok(extracted) = blocks::extract(body, body_line, &skip) else {
         return (Vec::new(), described());
     };
@@ -190,7 +194,11 @@ pub fn render_body(
     let mut scope = build_scope(page, engine, config, scopes)?;
     let math = config.markdown.math;
 
-    let skip = markdown::code_ranges_with(&page.body, math);
+    let skip = if markdown::has_blocks(&page.body) {
+        markdown::code_ranges_with(&page.body, math)
+    } else {
+        Vec::new()
+    };
     let extracted = blocks::extract(&page.body, page.body_line, &skip)
         .map_err(|e| vec![Error::new(&page.source, ErrorKind::Block(e))])?;
     let mut doc = markdown::parse_with(&extracted.text, page.body_line, math);

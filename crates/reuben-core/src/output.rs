@@ -1,9 +1,11 @@
 //! The built site held in memory, and the atomic swap that puts it on disk.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
+
+use rayon::prelude::*;
 
 use crate::error::{Error, ErrorKind};
 use crate::site::OUTPUT_MARKER;
@@ -81,21 +83,41 @@ fn stage(output: &Output, staging: &Path) -> Result<(), Vec<Error>> {
     remove_dir(staging).map_err(|e| vec![e])?;
     fs::create_dir_all(staging).map_err(|e| vec![Error::new(staging, e)])?;
     let mut errors = Vec::new();
-    for (rel, file) in &output.files {
-        let dest = staging.join(rel);
-        let made = dest.parent().map_or(Ok(()), fs::create_dir_all);
-        let written = made
-            .map_err(|e| (dest.clone(), e))
-            .and_then(|()| match file {
+    let dirs: BTreeSet<PathBuf> = output
+        .files
+        .keys()
+        .filter_map(|rel| staging.join(rel).parent().map(Path::to_path_buf))
+        .collect();
+    for dir in &dirs {
+        if let Err(e) = fs::create_dir_all(dir) {
+            errors.push(Error::new(dir, e));
+        }
+    }
+    // Files whose directory couldn't be made are skipped: the directory's error already explains them.
+    let failed_dirs: Vec<&PathBuf> = errors.iter().map(|e| &e.path).collect();
+    let files: Vec<(&PathBuf, &OutputFile)> = output
+        .files
+        .iter()
+        .filter(|(rel, _)| {
+            let parent = staging.join(rel).parent().map(Path::to_path_buf);
+            !parent.is_some_and(|p| failed_dirs.iter().any(|d| p.starts_with(d)))
+        })
+        .collect();
+    // Collected in path order, so the errors come out the same on every run.
+    let write_errors: Vec<Error> = files
+        .par_iter()
+        .filter_map(|(rel, file)| {
+            let dest = staging.join(rel);
+            let written = match file {
                 OutputFile::Bytes(bytes) => fs::write(&dest, bytes).map_err(|e| (dest.clone(), e)),
                 OutputFile::Copy(src) => fs::copy(src, &dest)
                     .map(|_| ())
                     .map_err(|e| (src.clone(), e)),
-            });
-        if let Err((path, e)) = written {
-            errors.push(Error::new(path, e));
-        }
-    }
+            };
+            written.err().map(|(path, e)| Error::new(path, e))
+        })
+        .collect();
+    errors.extend(write_errors);
     let marker = staging.join(OUTPUT_MARKER);
     if let Err(e) = fs::write(&marker, "") {
         errors.push(Error::new(&marker, e));
@@ -120,8 +142,25 @@ fn swap(staging: &Path, out: &Path, old: &Path) -> Result<(), Error> {
         return Err(Error::new(out, e));
     }
     // The new output is in place; a failure to delete the old one isn't a failed build.
-    let _ = fs::remove_dir_all(old);
+    remove_tree_par(old);
     Ok(())
+}
+
+/// Deletes a directory tree with its entries removed in parallel. Best effort: a failure leaves files behind.
+fn remove_tree_par(dir: &Path) {
+    let Ok(entries) = fs::read_dir(dir) else {
+        return;
+    };
+    let entries: Vec<_> = entries.flatten().collect();
+    entries.par_iter().for_each(|entry| {
+        let path = entry.path();
+        if entry.file_type().is_ok_and(|t| t.is_dir()) {
+            remove_tree_par(&path);
+        } else {
+            let _ = fs::remove_file(&path);
+        }
+    });
+    let _ = fs::remove_dir(dir);
 }
 
 fn remove_dir(dir: &Path) -> Result<(), Error> {

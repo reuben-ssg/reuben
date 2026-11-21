@@ -133,3 +133,47 @@ fn summary_is_precomputed() {
     let site = Site::load(tmp.path()).unwrap();
     assert_eq!(site.pages[0].summary, "First paragraph here.");
 }
+
+#[test]
+fn load_order_is_stable() {
+    let tmp = big_site();
+    let order =
+        |site: &Site| -> Vec<PathBuf> { site.pages.iter().map(|p| p.rel.clone()).collect() };
+    let dist_bytes = |root: &std::path::Path| -> Vec<(PathBuf, Vec<u8>)> {
+        let mut files: Vec<(PathBuf, Vec<u8>)> = walkdir::WalkDir::new(root)
+            .into_iter()
+            .map(|e| e.unwrap())
+            .filter(|e| e.file_type().is_file())
+            .map(|e| {
+                (
+                    e.path().strip_prefix(root).unwrap().to_path_buf(),
+                    std::fs::read(e.path()).unwrap(),
+                )
+            })
+            .collect();
+        files.sort();
+        files
+    };
+    let first = Site::load(tmp.path()).unwrap();
+    let first_order = order(&first);
+    assert!(first_order.len() >= 201);
+    first
+        .build(&reuben_core::site::BuildOptions {
+            drafts: false,
+            out: tmp.path().join("dist"),
+            jobs: None,
+        })
+        .unwrap();
+    let first_dist = dist_bytes(&tmp.path().join("dist"));
+    for _ in 0..4 {
+        let site = Site::load(tmp.path()).unwrap();
+        assert_eq!(order(&site), first_order);
+        site.build(&reuben_core::site::BuildOptions {
+            drafts: false,
+            out: tmp.path().join("dist"),
+            jobs: None,
+        })
+        .unwrap();
+        assert_eq!(dist_bytes(&tmp.path().join("dist")), first_dist);
+    }
+}

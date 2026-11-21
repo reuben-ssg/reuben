@@ -145,6 +145,12 @@ fn convert<'a>(node: &'a AstNode<'a>, line_offset: usize, options: &Options) -> 
     }
 }
 
+/// Whether `body` holds a block opener, `{{` or `{%`. Without one there is nothing to extract, so the code-range
+/// parse can be skipped.
+pub fn has_blocks(body: &str) -> bool {
+    body.contains("{{") || body.contains("{%")
+}
+
 /// Byte ranges of `body` covered by code blocks, inline code and math, where `{{` must stay literal.
 pub fn code_ranges(body: &str) -> Vec<std::ops::Range<usize>> {
     code_ranges_with(body, false)
@@ -179,6 +185,14 @@ pub fn code_ranges_with(body: &str, math: bool) -> Vec<std::ops::Range<usize>> {
 mod tests {
     use super::*;
     use crate::doc::{Alignment, NodeKind, Span};
+
+    #[test]
+    fn has_blocks_finds_openers() {
+        assert!(has_blocks("a {{ b }}"));
+        assert!(has_blocks("{% x %}"));
+        assert!(!has_blocks("a { b } %"));
+        assert!(!has_blocks("}}"));
+    }
 
     #[test]
     fn smart_punctuation_in_text() {

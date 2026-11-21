@@ -207,30 +207,39 @@ impl Site {
         errors.append(&mut dir_errors);
         let mut asset_rels = Vec::new();
         let mut failed_markdown = Vec::new();
-        for (path, rel) in walk(&content, &mut errors) {
+        let to_load: Vec<(PathBuf, PathBuf)> = walk(&content, &mut errors)
+            .into_iter()
+            .filter(|(path, rel)| {
+                let is_markdown = path.extension().is_some_and(|e| e == "md");
+                if !is_markdown && path.file_name().is_some_and(|n| n == "_dir.toml") {
+                    return false;
+                }
+                // Sidecars hold build scripts, which must never be published.
+                if path
+                    .extension()
+                    .is_some_and(|e| e.eq_ignore_ascii_case("rhai"))
+                {
+                    return false;
+                }
+                !(rel
+                    .components()
+                    .any(|c| c.as_os_str().to_string_lossy().starts_with('.'))
+                    || is_junk(rel))
+            })
+            .collect();
+        // Loaded in parallel; zipping the results back with the walk list keeps walk order.
+        let loaded_all: Vec<_> = to_load
+            .par_iter()
+            .map(|(path, rel)| {
+                if path.extension().is_some_and(|e| e == "md") {
+                    load_page(path, rel, Some(&dirs), PageKind::Markdown, config.a11y).map(Some)
+                } else {
+                    load_template(path, rel, Some(&dirs), config.a11y)
+                }
+            })
+            .collect();
+        for ((path, rel), loaded) in to_load.into_iter().zip(loaded_all) {
             let is_markdown = path.extension().is_some_and(|e| e == "md");
-            if !is_markdown && path.file_name().is_some_and(|n| n == "_dir.toml") {
-                continue;
-            }
-            // Sidecars hold build scripts, which must never be published.
-            if path
-                .extension()
-                .is_some_and(|e| e.eq_ignore_ascii_case("rhai"))
-            {
-                continue;
-            }
-            if rel
-                .components()
-                .any(|c| c.as_os_str().to_string_lossy().starts_with('.'))
-                || is_junk(&rel)
-            {
-                continue;
-            }
-            let loaded = if is_markdown {
-                load_page(&path, &rel, Some(&dirs), PageKind::Markdown, config.a11y).map(Some)
-            } else {
-                load_template(&path, &rel, Some(&dirs), config.a11y)
-            };
             match loaded {
                 Ok(Some(page)) => pages.push(page),
                 Ok(None) => asset_rels.push(rel),
@@ -259,11 +268,16 @@ impl Site {
         let static_dir = root.join("static");
         let mut static_files = Vec::new();
         if static_dir.exists() {
-            for (path, rel) in walk(&static_dir, &mut errors) {
-                if is_junk(&rel) {
-                    continue;
-                }
-                match load_template(&path, &rel, None, config.a11y) {
+            let to_load: Vec<(PathBuf, PathBuf)> = walk(&static_dir, &mut errors)
+                .into_iter()
+                .filter(|(_, rel)| !is_junk(rel))
+                .collect();
+            let loaded_all: Vec<_> = to_load
+                .par_iter()
+                .map(|(path, rel)| load_template(path, rel, None, config.a11y))
+                .collect();
+            for ((_, rel), loaded) in to_load.into_iter().zip(loaded_all) {
+                match loaded {
                     Ok(Some(mut page)) => {
                         page.draft_excluded = page.front_matter.draft;
                         pages.push(page);
