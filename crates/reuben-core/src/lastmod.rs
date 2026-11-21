@@ -9,9 +9,11 @@ use jiff::Timestamp;
 use jiff::civil::Date;
 use jiff::tz::TimeZone;
 
-/// The UTC date of each source's last commit when it is tracked and unmodified, otherwise of its modification time.
+/// The UTC date of each source's last commit when the index tracks it, otherwise of its modification time.
 ///
-/// A source with neither is absent. Git problems of any kind fall back to modification times.
+/// A tracked file edited since its last commit still gets the commit date, and one that was never committed gets its file time.
+/// Reuben never reads working-tree content through git (no `status`, no diff), so filters and other repository config can't run commands.
+/// A source with neither a commit nor a file time is absent. Git problems of any kind fall back to modification times.
 pub fn source_dates(root: &Path, sources: &[&Path]) -> HashMap<PathBuf, Date> {
     let git = GitState::read(root);
     let mut dates = HashMap::new();
@@ -27,7 +29,7 @@ pub fn source_dates(root: &Path, sources: &[&Path]) -> HashMap<PathBuf, Date> {
 struct GitState {
     top: PathBuf,
     commit_times: HashMap<String, i64>,
-    dirty: HashSet<String>,
+    tracked: HashSet<String>,
 }
 
 impl GitState {
@@ -47,20 +49,11 @@ impl GitState {
                 ".",
             ],
         )?;
-        let status = git(
-            root,
-            &[
-                "--no-optional-locks",
-                "status",
-                "--porcelain",
-                "-z",
-                "--untracked-files=all",
-            ],
-        )?;
+        let tracked = git(root, &["ls-files", "-z", "--full-name"])?;
         Some(GitState {
             top,
             commit_times: parse_log(&log),
-            dirty: parse_status(&status),
+            tracked: parse_tracked(&tracked),
         })
     }
 
@@ -72,7 +65,7 @@ impl GitState {
             .map(|c| c.as_os_str().to_str())
             .collect::<Option<Vec<_>>>()?
             .join("/");
-        if self.dirty.contains(&key) {
+        if !self.tracked.contains(&key) {
             return None;
         }
         let time = *self.commit_times.get(&key)?;
@@ -137,23 +130,12 @@ fn parse_log(out: &[u8]) -> HashMap<String, i64> {
     times
 }
 
-fn parse_status(out: &[u8]) -> HashSet<String> {
-    let mut dirty = HashSet::new();
-    let mut entries = out.split(|&b| b == 0).filter(|e| !e.is_empty());
-    while let Some(entry) = entries.next() {
-        if entry.len() < 4 {
-            continue;
-        }
-        if let Ok(path) = std::str::from_utf8(&entry[3..]) {
-            dirty.insert(path.to_string());
-        }
-        if matches!(entry[0], b'R' | b'C')
-            && let Some(Ok(old)) = entries.next().map(std::str::from_utf8)
-        {
-            dirty.insert(old.to_string());
-        }
-    }
-    dirty
+fn parse_tracked(out: &[u8]) -> HashSet<String> {
+    out.split(|&b| b == 0)
+        .filter(|p| !p.is_empty())
+        .filter_map(|p| std::str::from_utf8(p).ok())
+        .map(str::to_string)
+        .collect()
 }
 
 fn mtime_date(path: &Path) -> Option<Date> {
@@ -245,7 +227,7 @@ mod tests {
     }
 
     #[test]
-    fn lastmod_modified_uses_mtime() {
+    fn lastmod_modified_keeps_commit_date() {
         if !git_available() {
             return;
         }
@@ -255,8 +237,24 @@ mod tests {
         run_git(tmp.path(), &["init", "-q"], None);
         commit_all(tmp.path(), "2024-03-05T12:00:00Z");
         fs::write(&file, "edited").unwrap();
-        assert_eq!(one(tmp.path(), &file), mtime_date(&file));
-        assert_ne!(one(tmp.path(), &file), Some(date(2024, 3, 5)));
+        // `git status` would be needed to notice the edit, and it can run repository-configured filters.
+        assert_eq!(one(tmp.path(), &file), Some(date(2024, 3, 5)));
+    }
+
+    #[test]
+    fn lastmod_added_never_committed_uses_mtime() {
+        if !git_available() {
+            return;
+        }
+        let tmp = TempDir::new().unwrap();
+        let first = tmp.path().join("first.md");
+        fs::write(&first, "x").unwrap();
+        run_git(tmp.path(), &["init", "-q"], None);
+        commit_all(tmp.path(), "2024-03-05T12:00:00Z");
+        let added = tmp.path().join("added.md");
+        fs::write(&added, "y").unwrap();
+        run_git(tmp.path(), &["add", "added.md"], None);
+        assert_eq!(one(tmp.path(), &added), mtime_date(&added));
     }
 
     #[test]
@@ -381,7 +379,7 @@ mod tests {
     }
 
     #[test]
-    fn lastmod_staged_edit_uses_mtime() {
+    fn lastmod_staged_edit_keeps_commit_date() {
         if !git_available() {
             return;
         }
@@ -392,6 +390,42 @@ mod tests {
         commit_all(tmp.path(), "2024-03-05T12:00:00Z");
         fs::write(&file, "edited").unwrap();
         run_git(tmp.path(), &["add", "a.md"], None);
-        assert_eq!(one(tmp.path(), &file), mtime_date(&file));
+        // Same trade-off as an unstaged edit: only the index and log are read, never the working tree through git.
+        assert_eq!(one(tmp.path(), &file), Some(date(2024, 3, 5)));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn lastmod_ignores_repository_clean_filter() {
+        use std::os::unix::fs::PermissionsExt;
+
+        if !git_available() {
+            return;
+        }
+        let tmp = TempDir::new().unwrap();
+        let repo = tmp.path().join("repo");
+        let file = repo.join("content/a.md");
+        fs::create_dir_all(file.parent().unwrap()).unwrap();
+        fs::write(&file, "x").unwrap();
+        fs::write(repo.join(".gitattributes"), "*.md filter=evil\n").unwrap();
+        run_git(&repo, &["init", "-q"], None);
+        commit_all(&repo, "2024-03-05T12:00:00Z");
+        let marker = tmp.path().join("ran");
+        let script = tmp.path().join("clean.sh");
+        fs::write(
+            &script,
+            format!("#!/bin/sh\ntouch '{}'\ncat\n", marker.display()),
+        )
+        .unwrap();
+        fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).unwrap();
+        run_git(
+            &repo,
+            &["config", "filter.evil.clean", script.to_str().unwrap()],
+            None,
+        );
+        let _ = fs::remove_file(&marker);
+        fs::write(&file, "x").unwrap();
+        assert!(one(&repo, &file).is_some());
+        assert!(!marker.exists(), "repository config ran a clean filter");
     }
 }
