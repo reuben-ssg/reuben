@@ -5,10 +5,11 @@ use std::path::{Path, PathBuf};
 use rhai::{Array, Dynamic, Engine, EvalAltResult, NativeCallContext};
 
 use super::{Html, IncludeFiles, collection, with_current_link};
+use crate::config::MarkdownConfig;
 use crate::doc::Origin;
-use crate::html::{escape_text, render};
+use crate::html::{HtmlOptions, escape_text, render_opts};
 use crate::links::{parse_source_link, resolve_tree, source_links};
-use crate::markdown::parse;
+use crate::markdown::parse_with;
 use crate::math::render_math;
 
 type RhaiResult<T> = Result<T, Box<EvalAltResult>>;
@@ -36,22 +37,46 @@ pub const NAMES: [&str; 7] = [
 
 pub fn register(engine: &mut Engine, site_root: &Path, include_files: &IncludeFiles) {
     let root: PathBuf = site_root.to_path_buf();
-    let (raw_files, markdown_files) = (include_files.clone(), include_files.clone());
+    let raw_files = include_files.clone();
     engine
         .register_fn("raw", move |ctx: NativeCallContext, s: &str| Html {
             markup: s.to_string(),
             origin: origin_of(&ctx, &raw_files),
         })
         .register_fn("escape", |s: &str| escape_text(s).into_owned())
+        .register_fn("sort_by", |items: &mut Array, key: &str| {
+            collection::sorted(items, key)
+        })
+        .register_fn("format_date", format_date)
+        .register_fn("load_data", move |path: &str| load_data(&root, path));
+    register_markdown(engine, include_files, MarkdownConfig::default());
+    register_url_for(engine, "/");
+}
+
+/// Registering again replaces the earlier `markdown`, so this is also how the site's `[markdown]` is applied.
+/// `default` is what a call outside a page render uses, such as one from a data script.
+pub fn register_markdown(
+    engine: &mut Engine,
+    include_files: &IncludeFiles,
+    default: MarkdownConfig,
+) {
+    let markdown_files = include_files.clone();
+    engine
         // Never runs `{{ }}` blocks: it only parses and renders Markdown.
         .register_fn(
             "markdown",
             move |ctx: NativeCallContext, s: &str| -> RhaiResult<Html> {
-                let mut doc = parse(s, 1);
-                render_math(&mut doc).map_err(|errors| {
-                    let (span, message) = &errors[0];
-                    format!("math at {}:{}: {message}", span.line, span.column)
-                })?;
+                let config = with_current_link(|ctx| {
+                    ctx.map_or_else(|| default.clone(), |c| c.markdown.clone())
+                });
+                let math = config.math;
+                let mut doc = parse_with(s, 1, math);
+                if math {
+                    render_math(&mut doc).map_err(|errors| {
+                        let (span, message) = &errors[0];
+                        format!("math at {}:{}: {message}", span.line, span.column)
+                    })?;
+                }
                 // Anchors aren't checked here: the output may land anywhere on the page.
                 let messages: Vec<String> = with_current_link(|ctx| match ctx {
                     Some(ctx) => resolve_tree(&mut doc, &ctx.page_rel, &ctx.index, &ctx.base_path)
@@ -68,17 +93,11 @@ pub fn register(engine: &mut Engine, site_root: &Path, include_files: &IncludeFi
                     return Err(messages.join("; ").into());
                 }
                 Ok(Html {
-                    markup: render(&doc),
+                    markup: render_opts(&doc, &HtmlOptions::from(&config)),
                     origin: origin_of(&ctx, &markdown_files),
                 })
             },
-        )
-        .register_fn("sort_by", |items: &mut Array, key: &str| {
-            collection::sorted(items, key)
-        })
-        .register_fn("format_date", format_date)
-        .register_fn("load_data", move |path: &str| load_data(&root, path));
-    register_url_for(engine, "/");
+        );
 }
 
 /// Registering again replaces the earlier `url_for`, so this is also how the real `base_url` is applied.

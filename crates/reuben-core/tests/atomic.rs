@@ -124,3 +124,150 @@ fn symlinked_out_dir_keeps_its_link() {
         }
     }
 }
+
+#[test]
+fn rebuild_removes_old_output() {
+    let tmp = fixture("basic");
+    tmp.child("content/gone.md")
+        .write_str("---\ntitle: Gone\n---\nbye\n")
+        .unwrap();
+    build(tmp.path()).unwrap();
+    assert!(tmp.path().join("dist/gone/index.html").exists());
+    fs::remove_file(tmp.path().join("content/gone.md")).unwrap();
+    build(tmp.path()).unwrap();
+    assert!(tmp.path().join("dist/index.html").exists());
+    assert!(!tmp.path().join("dist/gone").exists());
+    assert!(!tmp.path().join(".dist.reuben-old").exists());
+    assert!(!tmp.path().join(".dist.reuben-staging").exists());
+}
+
+/// Every file under `dir`, keyed by its path relative to `dir`.
+fn snapshot(dir: &Path) -> std::collections::BTreeMap<std::path::PathBuf, Vec<u8>> {
+    fn walk(
+        root: &Path,
+        dir: &Path,
+        files: &mut std::collections::BTreeMap<std::path::PathBuf, Vec<u8>>,
+    ) {
+        for entry in fs::read_dir(dir).unwrap() {
+            let path = entry.unwrap().path();
+            if path.is_dir() {
+                walk(root, &path, files);
+            } else {
+                let rel = path.strip_prefix(root).unwrap().to_path_buf();
+                files.insert(rel, fs::read(&path).unwrap());
+            }
+        }
+    }
+    let mut files = std::collections::BTreeMap::new();
+    walk(dir, dir, &mut files);
+    files
+}
+
+fn entry_names(dir: &Path) -> Vec<String> {
+    let mut names: Vec<String> = fs::read_dir(dir)
+        .unwrap()
+        .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+        .collect();
+    names.sort();
+    names
+}
+
+#[test]
+fn streamed_build_matches_in_memory() {
+    use reuben_core::output::OutputFile;
+    let tmp = fixture("templates");
+    tmp.child("data/site.json")
+        .write_str(r#"{"name": "Rye"}"#)
+        .unwrap();
+    tmp.child("content/deli.md")
+        .write_str("---\ntitle: Deli\n---\nBaked at {{ data.site.name }}.\n")
+        .unwrap();
+    let site = Site::load(tmp.path()).unwrap();
+    let (output, _) = site
+        .render(&RenderOptions {
+            drafts: false,
+            jobs: None,
+        })
+        .unwrap();
+    let expected: std::collections::BTreeMap<_, _> = output
+        .files
+        .iter()
+        .map(|(rel, file)| {
+            let bytes = match file {
+                OutputFile::Bytes(b) => b.clone(),
+                OutputFile::Copy(src) => fs::read(src).unwrap(),
+                other => panic!("{rel:?} is {other:?}"),
+            };
+            (rel.clone(), bytes)
+        })
+        .collect();
+    assert!(expected.contains_key(Path::new("theme.css")));
+    assert!(expected.contains_key(Path::new("logo.png")));
+    assert!(expected.contains_key(Path::new("deli/index.html")));
+    build(tmp.path()).unwrap();
+    let mut built = snapshot(&tmp.path().join("dist"));
+    assert_eq!(built.remove(Path::new(".reuben-output")), Some(Vec::new()));
+    assert_eq!(built, expected);
+}
+
+#[test]
+fn failed_streamed_build_keeps_dist() {
+    let tmp = fixture("basic");
+    for i in 0..50 {
+        tmp.child(format!("content/many/p{i:02}.md"))
+            .write_str(&format!("---\ntitle: P{i}\n---\nPage {i}\n"))
+            .unwrap();
+    }
+    build(tmp.path()).unwrap();
+    let before = snapshot(&tmp.path().join("dist"));
+    tmp.child("content/many/p25.md")
+        .write_str("---\ntitle: P25\n---\nok\n\n{{ nope() }}\n")
+        .unwrap();
+    tmp.child("content/many/p00.md")
+        .write_str("---\ntitle: P0\n---\nchanged\n")
+        .unwrap();
+    let errs = build(tmp.path()).unwrap_err();
+    assert!(errs.iter().any(|e| e.path.ends_with("p25.md")), "{errs:?}");
+    assert_eq!(snapshot(&tmp.path().join("dist")), before);
+    assert!(!tmp.path().join(".dist.reuben-staging").exists());
+    assert!(!tmp.path().join(".dist.reuben-old").exists());
+}
+
+#[cfg(unix)]
+#[test]
+fn streamed_build_into_symlink() {
+    let tmp = fixture("basic");
+    let real = tmp.path().join("real");
+    fs::create_dir_all(&real).unwrap();
+    std::os::unix::fs::symlink(&real, tmp.path().join("dist")).unwrap();
+    build(tmp.path()).unwrap();
+    assert!(
+        fs::symlink_metadata(tmp.path().join("dist"))
+            .unwrap()
+            .is_symlink()
+    );
+    assert_eq!(fs::read_link(tmp.path().join("dist")).unwrap(), real);
+    assert!(real.join("index.html").is_file());
+    assert!(real.join("notes/index.html").is_file());
+    assert!(real.join(".reuben-output").is_file());
+    assert!(!tmp.path().join(".real.reuben-staging").exists());
+    assert!(!tmp.path().join(".dist.reuben-staging").exists());
+}
+
+#[test]
+fn out_dir_refused_before_rendering() {
+    let tmp = fixture("basic");
+    tmp.child("dist/keep.txt").write_str("mine").unwrap();
+    let before = entry_names(tmp.path());
+    let errs = build(tmp.path()).unwrap_err();
+    assert!(
+        errs.iter()
+            .any(|e| matches!(e.kind, reuben_core::error::ErrorKind::UnsafeOutputDir)),
+        "{errs:?}"
+    );
+    assert_eq!(entry_names(tmp.path()), before);
+    assert_eq!(
+        entry_names(&tmp.path().join("dist")),
+        vec!["keep.txt".to_string()]
+    );
+}

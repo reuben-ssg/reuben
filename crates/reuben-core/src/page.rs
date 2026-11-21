@@ -89,16 +89,21 @@ pub(crate) fn precompute(
     description: Option<&str>,
     body: &str,
     body_line: usize,
+    math: bool,
 ) -> (Vec<headings::TocEntry>, String) {
     let described = || description.map_or_else(String::new, str::to_string);
     if kind != PageKind::Markdown {
         return (Vec::new(), described());
     }
-    let skip = markdown::code_ranges(body);
+    let skip = if markdown::has_blocks(body) {
+        markdown::code_ranges_with(body, math)
+    } else {
+        Vec::new()
+    };
     let Ok(extracted) = blocks::extract(body, body_line, &skip) else {
         return (Vec::new(), described());
     };
-    let mut doc = markdown::parse(&extracted.text, body_line);
+    let mut doc = markdown::parse_with(&extracted.text, body_line, math);
     let toc = headings::assign_ids_before_blocks(&mut doc);
     let summary = match description {
         Some(d) => d.to_string(),
@@ -187,11 +192,16 @@ pub fn render_body(
     scopes: &SiteScopes<'_>,
 ) -> Result<RenderedBody, Failed> {
     let mut scope = build_scope(page, engine, config, scopes)?;
+    let math = config.markdown.math;
 
-    let skip = markdown::code_ranges(&page.body);
+    let skip = if markdown::has_blocks(&page.body) {
+        markdown::code_ranges_with(&page.body, math)
+    } else {
+        Vec::new()
+    };
     let extracted = blocks::extract(&page.body, page.body_line, &skip)
         .map_err(|e| vec![Error::new(&page.source, ErrorKind::Block(e))])?;
-    let mut doc = markdown::parse(&extracted.text, page.body_line);
+    let mut doc = markdown::parse_with(&extracted.text, page.body_line, math);
 
     let mut outputs = Vec::with_capacity(extracted.blocks.len());
     let mut errors = Vec::new();
@@ -217,10 +227,12 @@ pub fn render_body(
     errors.extend(link_problems.into_iter().map(|(location, problem)| {
         Error::new(&page.source, ErrorKind::Link { problem, location })
     }));
-    if let Err(math_errors) = math::render_math(&mut doc) {
-        errors.extend(math_errors.into_iter().map(|(location, message)| {
-            Error::new(&page.source, ErrorKind::Math { message, location })
-        }));
+    if math {
+        if let Err(math_errors) = math::render_math(&mut doc) {
+            errors.extend(math_errors.into_iter().map(|(location, message)| {
+                Error::new(&page.source, ErrorKind::Math { message, location })
+            }));
+        }
     }
     if !errors.is_empty() {
         return Err(Failed { errors, anchors });

@@ -46,7 +46,7 @@ fn run(config: &str, extra: &[(&str, &str)]) -> (TempDir, BuildReport) {
 
 #[test]
 fn sitemap_lists_pages_without_drafts_or_404() {
-    let (tmp, report) = run("base_url = \"https://x.dev/\"\n", &[]);
+    let (tmp, report) = run("sitemap = true\nbase_url = \"https://x.dev/\"\n", &[]);
     let xml = fs::read_to_string(tmp.path().join("dist/sitemap.xml")).unwrap();
     let locs: Vec<&str> = xml
         .split("<loc>")
@@ -59,7 +59,7 @@ fn sitemap_lists_pages_without_drafts_or_404() {
 
 #[test]
 fn relative_base_url_skips_with_warning() {
-    let (tmp, report) = run("", &[]);
+    let (tmp, report) = run("sitemap = true\n", &[]);
     assert!(!tmp.path().join("dist/sitemap.xml").exists());
     assert_eq!(
         report.warnings,
@@ -70,7 +70,7 @@ fn relative_base_url_skips_with_warning() {
 #[test]
 fn user_sitemap_wins() {
     let (tmp, report) = run(
-        "base_url = \"https://x.dev/\"\n",
+        "sitemap = true\nbase_url = \"https://x.dev/\"\n",
         &[("static/sitemap.xml", "<mine/>")],
     );
     let out = fs::read_to_string(tmp.path().join("dist/sitemap.xml")).unwrap();
@@ -79,8 +79,24 @@ fn user_sitemap_wins() {
 }
 
 #[test]
+fn sitemap_is_off_by_default() {
+    let (tmp, report) = run("base_url = \"https://x.dev/\"\n", &[]);
+    assert!(!tmp.path().join("dist/sitemap.xml").exists());
+    assert!(report.warnings.is_empty());
+}
+
+#[test]
 fn sitemap_can_be_disabled() {
     let (tmp, report) = run("sitemap = false\n", &[]);
     assert!(!tmp.path().join("dist/sitemap.xml").exists());
     assert!(report.warnings.is_empty());
+}
+
+#[test]
+fn sitemap_has_lastmod() {
+    let (tmp, _) = run("sitemap = true\nbase_url = \"https://x.dev/\"\n", &[]);
+    let xml = fs::read_to_string(tmp.path().join("dist/sitemap.xml")).unwrap();
+    let urls = xml.matches("<url>").count();
+    assert!(urls > 0);
+    assert_eq!(xml.matches("<lastmod>").count(), urls, "{xml}");
 }

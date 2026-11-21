@@ -21,8 +21,9 @@ use crate::dirs::{self, DirDefaults};
 use crate::error::{Error, ErrorKind};
 use crate::frontmatter::{self, FrontMatter};
 use crate::headings::TocEntry;
+use crate::lastmod;
 use crate::links::{AnchorRequest, LinkProblem, PageIndex, Target};
-use crate::output::{Output, OutputFile, check_out_dir, write_atomic};
+use crate::output::{self, Output, OutputFile, check_out_dir, finish_atomic, prepare_staging};
 use crate::page::Failed;
 use crate::route::{Route, route_for_page, route_for_template};
 use crate::script::helpers::url_for;
@@ -189,6 +190,7 @@ impl Site {
         let config = config::load(root, opts.env.as_deref()).map_err(|e| vec![e])?;
         let mut engine = ScriptEngine::new(root);
         engine.set_base_url(&config.base_url);
+        engine.set_markdown(&config.markdown);
         let include_errors = engine
             .load_includes(&include_dirs(root, &config))
             .err()
@@ -206,30 +208,39 @@ impl Site {
         errors.append(&mut dir_errors);
         let mut asset_rels = Vec::new();
         let mut failed_markdown = Vec::new();
-        for (path, rel) in walk(&content, &mut errors) {
+        let to_load: Vec<(PathBuf, PathBuf)> = walk(&content, &mut errors)
+            .into_iter()
+            .filter(|(path, rel)| {
+                let is_markdown = path.extension().is_some_and(|e| e == "md");
+                if !is_markdown && path.file_name().is_some_and(|n| n == "_dir.toml") {
+                    return false;
+                }
+                // Sidecars hold build scripts, which must never be published.
+                if path
+                    .extension()
+                    .is_some_and(|e| e.eq_ignore_ascii_case("rhai"))
+                {
+                    return false;
+                }
+                !(rel
+                    .components()
+                    .any(|c| c.as_os_str().to_string_lossy().starts_with('.'))
+                    || is_junk(rel))
+            })
+            .collect();
+        // Loaded in parallel; zipping the results back with the walk list keeps walk order.
+        let loaded_all: Vec<_> = to_load
+            .par_iter()
+            .map(|(path, rel)| {
+                if path.extension().is_some_and(|e| e == "md") {
+                    load_page(path, rel, Some(&dirs), PageKind::Markdown, config.a11y).map(Some)
+                } else {
+                    load_template(path, rel, Some(&dirs), config.a11y)
+                }
+            })
+            .collect();
+        for ((path, rel), loaded) in to_load.into_iter().zip(loaded_all) {
             let is_markdown = path.extension().is_some_and(|e| e == "md");
-            if !is_markdown && path.file_name().is_some_and(|n| n == "_dir.toml") {
-                continue;
-            }
-            // Sidecars hold build scripts, which must never be published.
-            if path
-                .extension()
-                .is_some_and(|e| e.eq_ignore_ascii_case("rhai"))
-            {
-                continue;
-            }
-            if rel
-                .components()
-                .any(|c| c.as_os_str().to_string_lossy().starts_with('.'))
-                || is_junk(&rel)
-            {
-                continue;
-            }
-            let loaded = if is_markdown {
-                load_page(&path, &rel, Some(&dirs), PageKind::Markdown, config.a11y).map(Some)
-            } else {
-                load_template(&path, &rel, Some(&dirs), config.a11y)
-            };
             match loaded {
                 Ok(Some(page)) => pages.push(page),
                 Ok(None) => asset_rels.push(rel),
@@ -258,11 +269,16 @@ impl Site {
         let static_dir = root.join("static");
         let mut static_files = Vec::new();
         if static_dir.exists() {
-            for (path, rel) in walk(&static_dir, &mut errors) {
-                if is_junk(&rel) {
-                    continue;
-                }
-                match load_template(&path, &rel, None, config.a11y) {
+            let to_load: Vec<(PathBuf, PathBuf)> = walk(&static_dir, &mut errors)
+                .into_iter()
+                .filter(|(_, rel)| !is_junk(rel))
+                .collect();
+            let loaded_all: Vec<_> = to_load
+                .par_iter()
+                .map(|(path, rel)| load_template(path, rel, None, config.a11y))
+                .collect();
+            for ((_, rel), loaded) in to_load.into_iter().zip(loaded_all) {
+                match loaded {
                     Ok(Some(mut page)) => {
                         page.draft_excluded = page.front_matter.draft;
                         pages.push(page);
@@ -284,12 +300,14 @@ impl Site {
             _ => Vec::new(),
         };
 
+        let math = config.markdown.math;
         pages.par_iter_mut().for_each(|page| {
             (page.pre_block_toc, page.summary) = page::precompute(
                 page.kind,
                 page.front_matter.description.as_deref(),
                 &page.body,
                 page.body_line,
+                math,
             );
         });
 
@@ -337,8 +355,18 @@ impl Site {
         PageIndex::new(loaded.chain(failed))
     }
 
-    /// Renders the whole site into memory. Nothing touches the disk.
+    /// Renders the whole site into memory. Nothing touches the disk, and no file is `OutputFile::Staged`.
     pub fn render(&self, opts: &RenderOptions) -> Result<(Output, BuildReport), Failure> {
+        self.render_into(opts, None)
+    }
+
+    /// Renders the site, writing each page except CSS into `stage` as soon as it renders and keeping only its
+    /// `OutputFile::Staged` entry. Without a `stage` nothing touches the disk.
+    fn render_into(
+        &self,
+        opts: &RenderOptions,
+        stage: Option<&Path>,
+    ) -> Result<(Output, BuildReport), Failure> {
         let (pages, drafts): (Vec<&Page>, Vec<&Page>) = self
             .pages
             .iter()
@@ -362,7 +390,18 @@ impl Site {
             let (html, tree, anchors) = self.render_page(page, &scopes)?;
             splice::ensure_no_placeholders(&page.source, &html)
                 .map_err(|e| Failed::from(vec![e]))?;
-            Ok(check_html(page, html, tree, anchors))
+            let mut done = check_html(page, html, tree, anchors);
+            if let Some(stage) = stage.filter(|_| !is_css(&page.route.file)) {
+                if let Err(e) = output::write_staged(stage, &page.route.file, done.html.as_bytes())
+                {
+                    return Err(Failed {
+                        errors: vec![e],
+                        anchors: done.anchors,
+                    });
+                }
+                done.html = String::new();
+            }
+            Ok(done)
         };
         // A pool that can't start is reported, and the build carries on with rayon's default pool.
         let pool =
@@ -439,10 +478,12 @@ impl Site {
                         page_ids.insert(page.rel.as_path(), done.ids);
                     }
                     page_anchors.push((page, done.anchors));
-                    output.files.insert(
-                        page.route.file.clone(),
-                        OutputFile::Bytes(done.html.into_bytes()),
-                    );
+                    let file = if stage.is_some() {
+                        OutputFile::Staged
+                    } else {
+                        OutputFile::Bytes(done.html.into_bytes())
+                    };
+                    output.files.insert(page.route.file.clone(), file);
                 }
                 Err(mut failed) => {
                     errors.append(&mut failed.errors);
@@ -492,7 +533,7 @@ impl Site {
             if self.config.base_url.starts_with("http://")
                 || self.config.base_url.starts_with("https://")
             {
-                let mut urls: Vec<String> = pages
+                let listed: Vec<&&Page> = pages
                     .iter()
                     .filter(|p| {
                         p.route.url != "/404.html"
@@ -503,9 +544,19 @@ impl Site {
                                 }
                             }
                     })
-                    .map(|p| url_for(&self.config.base_url, &p.route.url))
                     .collect();
-                urls.sort();
+                let sources: Vec<&Path> = listed.iter().map(|p| p.source.as_path()).collect();
+                let dates = lastmod::source_dates(&self.root, &sources);
+                let mut urls: Vec<(String, Option<jiff::civil::Date>)> = listed
+                    .iter()
+                    .map(|p| {
+                        (
+                            url_for(&self.config.base_url, &p.route.url),
+                            dates.get(&p.source).copied(),
+                        )
+                    })
+                    .collect();
+                urls.sort_by(|a, b| a.0.cmp(&b.0));
                 output.files.insert(
                     PathBuf::from("sitemap.xml"),
                     OutputFile::Bytes(sitemap::render(&urls).into_bytes()),
@@ -570,26 +621,35 @@ impl Site {
 
     /// Renders the site and swaps it into `opts.out`. A failed build leaves the previous output untouched.
     pub fn build(&self, opts: &BuildOptions) -> Result<BuildReport, Failure> {
-        let out_error = check_out_dir(&opts.out).err();
-        let rendered = self.render(&RenderOptions {
-            drafts: opts.drafts,
-            jobs: opts.jobs,
-        });
-        let (output, report) = match (rendered, out_error) {
-            (Ok(done), None) => done,
-            (Ok((_, report)), Some(e)) => {
+        let staging = check_out_dir(&opts.out).and_then(|()| prepare_staging(&opts.out));
+        let rendered = self.render_into(
+            &RenderOptions {
+                drafts: opts.drafts,
+                jobs: opts.jobs,
+            },
+            staging.as_deref().ok(),
+        );
+        let (output, report, staging) = match (rendered, staging) {
+            (Ok((output, report)), Ok(staging)) => (output, report, staging),
+            (Ok((_, report)), Err(e)) => {
                 return Err(Failure {
                     errors: vec![e],
                     findings: report.findings,
                 });
             }
-            (Err(mut failure), out_error) => {
-                failure.errors.extend(out_error);
+            (Err(mut failure), staging) => {
+                match staging {
+                    Ok(staging) => {
+                        let _ = fs::remove_dir_all(staging);
+                    }
+                    Err(e) => failure.errors.push(e),
+                }
                 Error::sort(&mut failure.errors);
                 return Err(failure);
             }
         };
-        write_atomic(&output, &opts.out).map_err(|errors| Failure {
+        // Pages are already in `staging`; `out` changes only when the swap succeeds.
+        finish_atomic(&output, &opts.out, &staging).map_err(|errors| Failure {
             errors,
             findings: report.findings.clone(),
         })?;
@@ -656,6 +716,7 @@ impl Site {
             index: Arc::clone(index),
             page_rel: page.rel.clone(),
             base_path: check::base_path(&self.config.base_url),
+            markdown: self.config.markdown.clone(),
         }
     }
 
@@ -678,7 +739,13 @@ impl Site {
                     .as_deref()
                     .or_else(|| collections::layout_of(&page.rel, &self.config));
                 let tree = check::tree_pass(&page.source, &page.rules, &doc, &outputs);
-                (html::render(&doc), scope, name, Some(tree), anchors)
+                (
+                    html::render_opts(&doc, &html::HtmlOptions::from(&self.config.markdown)),
+                    scope,
+                    name,
+                    Some(tree),
+                    anchors,
+                )
             }
             PageKind::Template { escape } => {
                 let (text, scope) =
@@ -1150,5 +1217,34 @@ mod tests {
         assert!(!is_static_sidecar(&pages, dir, Path::new("other.rhai")));
         let none = [static_template(None)];
         assert!(!is_static_sidecar(&none, dir, Path::new("side.rhai")));
+    }
+
+    #[test]
+    fn render_into_streams_pages_but_not_css() {
+        use assert_fs::TempDir;
+        use assert_fs::prelude::*;
+        let tmp = TempDir::new().unwrap();
+        let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/sites/templates");
+        tmp.copy_from(fixture, &["**"]).unwrap();
+        let stage = tmp.path().join("stage");
+        fs::create_dir_all(&stage).unwrap();
+        let site = Site::load(tmp.path()).unwrap();
+        let opts = RenderOptions {
+            drafts: false,
+            jobs: None,
+        };
+        let (output, _) = site.render_into(&opts, Some(&stage)).unwrap();
+        let about = Path::new("about/index.html");
+        assert_eq!(output.files.get(about), Some(&OutputFile::Staged));
+        assert!(
+            fs::read_to_string(stage.join(about))
+                .unwrap()
+                .contains("<h1>About</h1>")
+        );
+        assert!(matches!(
+            output.files.get(Path::new("theme.css")),
+            Some(OutputFile::Bytes(_))
+        ));
+        assert!(!stage.join("theme.css").exists());
     }
 }

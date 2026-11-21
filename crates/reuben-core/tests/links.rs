@@ -68,6 +68,7 @@ fn base_path_is_prefixed() {
 #[test]
 fn every_bad_link_is_reported() {
     let tmp = site_of(&[
+        ("reuben.toml", "[markdown]\nmath = true\n"),
         (
             "content/p.md",
             &page(

@@ -103,3 +103,30 @@ fn hidden_and_junk_data_files_are_skipped() {
     let html = fs::read_to_string(tmp.path().join("dist/index.html")).unwrap();
     assert!(html.contains('1'), "{html}");
 }
+
+#[test]
+fn data_script_markdown_follows_markdown_config() {
+    let tmp = fixture();
+    tmp.child("reuben.toml")
+        .write_str("title = \"Deli\"\n\n[markdown]\nmath = true\nhighlight = true\n")
+        .unwrap();
+    tmp.child("data/notes.rhai")
+        .write_str(
+            "#{ math: markdown(\"$x$\"), code: markdown(\"```rust\\nfn main() {}\\n```\\n\") }",
+        )
+        .unwrap();
+    tmp.child("content/index.md")
+        .write_str("---\ntitle: Home\n---\n{{ data.notes.math }}\n\n{{ data.notes.code }}\n")
+        .unwrap();
+    let site = Site::load(tmp.path()).unwrap();
+    assert!(site.load_errors.is_empty(), "{:?}", site.load_errors);
+    site.build(&BuildOptions {
+        drafts: false,
+        out: tmp.path().join("dist"),
+        jobs: None,
+    })
+    .unwrap();
+    let html = fs::read_to_string(tmp.path().join("dist/index.html")).unwrap();
+    assert!(html.contains("<math"), "{html}");
+    assert!(html.contains("class=\"hl-"), "{html}");
+}

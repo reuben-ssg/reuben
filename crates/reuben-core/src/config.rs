@@ -18,9 +18,30 @@ pub struct Config {
     pub collections: BTreeMap<String, CollectionConfig>,
     pub sitemap: bool,
     pub css: CssConfig,
+    pub markdown: MarkdownConfig,
     /// The accessibility rules that are on for every page, before a page's own switches.
     pub a11y: RuleSet,
     pub sources: BTreeMap<String, PathBuf>,
+}
+
+/// The `[markdown]` table: every byte Reuben adds beyond the Markdown's own HTML is opt-in, except footnote back-links.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct MarkdownConfig {
+    pub highlight: bool,
+    pub math: bool,
+    /// Turning this off removes an accessibility feature.
+    pub footnote_backlinks: bool,
+}
+
+impl Default for MarkdownConfig {
+    fn default() -> Self {
+        Self {
+            highlight: false,
+            math: false,
+            footnote_backlinks: true,
+        }
+    }
 }
 
 /// The `[a11y]` table: rules switched off site-wide, by id.
@@ -72,6 +93,8 @@ struct Raw {
     sitemap: Option<bool>,
     #[serde(default)]
     css: CssConfig,
+    #[serde(default)]
+    markdown: MarkdownConfig,
     #[serde(default)]
     a11y: A11yConfig,
 }
@@ -154,27 +177,21 @@ pub fn load(root: &Path, env: Option<&str>) -> Result<Config, Error> {
         theme,
         params: raw.params,
         collections: raw.collections,
-        sitemap: raw.sitemap.unwrap_or(true),
+        sitemap: raw.sitemap.unwrap_or(false),
         css: raw.css,
+        markdown: raw.markdown,
         a11y,
         sources: layered.sources,
     })
 }
 
-/// Finds the file that set the key an "unknown field" error names, at the top level or inside a collection table.
+/// Finds the file that set the key an "unknown field" error names, at the top level or inside any table, including a collection's.
 fn blame(layered: &Layered, message: &str) -> Option<PathBuf> {
     let key = message.strip_prefix("unknown field `")?.split('`').next()?;
     let dotted = if layered.value.contains_key(key) {
         key.to_string()
     } else {
-        let folder = layered
-            .value
-            .get("collections")?
-            .as_object()?
-            .iter()
-            .find(|(_, table)| table.get(key).is_some())?
-            .0;
-        format!("collections.{folder}.{key}")
+        nested_path(&layered.value, key)?
     };
     let nested = format!("{dotted}.");
     layered
@@ -182,6 +199,22 @@ fn blame(layered: &Layered, message: &str) -> Option<PathBuf> {
         .iter()
         .find(|(k, _)| **k == dotted || k.starts_with(&nested))
         .map(|(_, file)| file.clone())
+}
+
+fn nested_path(value: &Map<String, Value>, key: &str) -> Option<String> {
+    for (table, body) in value {
+        let Some(body) = body.as_object() else {
+            continue;
+        };
+        if table == "collections" {
+            if let Some((name, _)) = body.iter().find(|(_, t)| t.get(key).is_some()) {
+                return Some(format!("collections.{name}.{key}"));
+            }
+        } else if table != "params" && body.contains_key(key) {
+            return Some(format!("{table}.{key}"));
+        }
+    }
+    None
 }
 
 fn merge_layer(layered: &mut Layered, file: &Path) -> Result<(), Error> {
@@ -402,10 +435,82 @@ mod tests {
     }
 
     #[test]
-    fn sitemap_defaults_on() {
+    fn sitemap_defaults_off() {
         let tmp = TempDir::new().unwrap();
-        assert!(load(tmp.path(), None).unwrap().sitemap);
-        write(&tmp, "reuben.toml", "sitemap = false\n");
         assert!(!load(tmp.path(), None).unwrap().sitemap);
+        write(&tmp, "reuben.toml", "sitemap = true\n");
+        assert!(load(tmp.path(), None).unwrap().sitemap);
+    }
+
+    #[test]
+    fn markdown_defaults() {
+        let tmp = TempDir::new().unwrap();
+        assert_eq!(
+            load(tmp.path(), None).unwrap().markdown,
+            MarkdownConfig {
+                highlight: false,
+                math: false,
+                footnote_backlinks: true,
+            }
+        );
+    }
+
+    #[test]
+    fn markdown_table_parses() {
+        let tmp = TempDir::new().unwrap();
+        write(
+            &tmp,
+            "reuben.toml",
+            "[markdown]\nhighlight = true\nmath = true\nfootnote_backlinks = false\n",
+        );
+        assert_eq!(
+            load(tmp.path(), None).unwrap().markdown,
+            MarkdownConfig {
+                highlight: true,
+                math: true,
+                footnote_backlinks: false,
+            }
+        );
+    }
+
+    #[test]
+    fn markdown_unknown_key_is_an_error() {
+        let tmp = TempDir::new().unwrap();
+        write(&tmp, "reuben.toml", "[markdown]\nmaths = true\n");
+        let err = load(tmp.path(), None).unwrap_err();
+        assert!(matches!(err.kind, ErrorKind::Config(_)), "{err}");
+        assert!(err.path.ends_with("reuben.toml"), "{err}");
+        assert!(err.to_string().contains("maths"), "{err}");
+    }
+
+    #[test]
+    fn unknown_markdown_key_in_env_file_blames_that_file() {
+        let tmp = TempDir::new().unwrap();
+        write(&tmp, "reuben.toml", "title = \"A\"\n");
+        write(&tmp, "reuben.production.toml", "[markdown]\nmaths = true\n");
+        let err = load(tmp.path(), Some("production")).unwrap_err();
+        assert!(err.path.ends_with("reuben.production.toml"), "{err}");
+        assert!(err.to_string().contains("maths"), "{err}");
+    }
+
+    #[test]
+    fn unknown_markdown_key_in_included_file_blames_that_file() {
+        let tmp = TempDir::new().unwrap();
+        write(&tmp, "reuben.toml", "include = [\"config/*.toml\"]\n");
+        write(&tmp, "config/1.toml", "[markdown]\nmaths = true\n");
+        let err = load(tmp.path(), None).unwrap_err();
+        assert!(err.path.ends_with("config/1.toml"), "{err}");
+    }
+
+    #[test]
+    fn unknown_css_and_a11y_keys_blame_the_file_that_set_them() {
+        let tmp = TempDir::new().unwrap();
+        write(&tmp, "reuben.toml", "title = \"A\"\n");
+        write(&tmp, "reuben.production.toml", "[css]\ntargts = []\n");
+        let err = load(tmp.path(), Some("production")).unwrap_err();
+        assert!(err.path.ends_with("reuben.production.toml"), "{err}");
+        write(&tmp, "reuben.production.toml", "[a11y]\ndisabel = []\n");
+        let err = load(tmp.path(), Some("production")).unwrap_err();
+        assert!(err.path.ends_with("reuben.production.toml"), "{err}");
     }
 }

@@ -17,7 +17,10 @@ pub fn generate(dir: &Path, pages: usize) -> io::Result<()> {
         }
         fs::write(path, text)
     };
-    write("reuben.toml", "title = \"Generated\"\n")?;
+    write(
+        "reuben.toml",
+        "title = \"Generated\"\n\n[markdown]\nhighlight = true\nmath = true\n",
+    )?;
     write(
         "layouts/default.html",
         "<!doctype html>\n<html><body><main>{{ content }}</main></body></html>\n",
@@ -80,6 +83,7 @@ mod tests {
         {
             OutputFile::Bytes(b) => String::from_utf8(b.clone()).unwrap(),
             OutputFile::Copy(_) => panic!("{rel} is a copy"),
+            OutputFile::Staged => panic!("{rel} was staged"),
         }
     }
 

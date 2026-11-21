@@ -25,6 +25,7 @@ fn build(tmp: &TempDir) -> Result<(), Failure> {
 #[test]
 fn one_build_reports_every_independent_error() {
     let tmp = site_of(&[
+        ("reuben.toml", "[markdown]\nmath = true\n"),
         ("content/a.md", "---\n---\nno title\n"),
         ("content/b.md", "---\ntitle: B\n---\n{{ nope( }}\n"),
         ("content/c.md", "---\ntitle: C\n---\n\n$\\frac{1}{$\n"),

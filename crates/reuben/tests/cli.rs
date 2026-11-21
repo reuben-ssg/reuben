@@ -1,4 +1,5 @@
 use assert_cmd::Command;
+use assert_fs::prelude::*;
 
 fn reuben() -> Command {
     Command::cargo_bin("reuben").unwrap()
@@ -14,7 +15,6 @@ fn prints_version() {
 }
 
 fn fixture(name: &str) -> assert_fs::TempDir {
-    use assert_fs::prelude::*;
     let tmp = assert_fs::TempDir::new().unwrap();
     let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("../reuben-core/tests/fixtures/sites")
@@ -76,6 +76,9 @@ fn build_accepts_env_flag() {
 #[test]
 fn warnings_print_to_stderr() {
     let tmp = fixture("basic");
+    tmp.child("reuben.toml")
+        .write_str("sitemap = true\n")
+        .unwrap();
     reuben()
         .args(["build", "--root"])
         .arg(tmp.path())

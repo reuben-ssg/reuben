@@ -10,6 +10,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use crate::blocks::{Block, BlockKind};
+use crate::config::MarkdownConfig;
 use crate::doc::{Origin, Span};
 use crate::html::escape_output;
 use crate::links::PageIndex;
@@ -80,6 +81,8 @@ pub struct LinkContext {
     /// The page's path relative to `content/`.
     pub page_rel: PathBuf,
     pub base_path: String,
+    /// What `markdown()` reads and writes: math, code highlighting, footnote back-links.
+    pub markdown: MarkdownConfig,
 }
 
 /// Runs `f` with `ctx` as this thread's link context, then restores the previous one.
@@ -105,12 +108,20 @@ impl ScriptEngine {
         helpers::register_url_for(&mut self.engine, base_url);
     }
 
+    /// Makes `markdown()` follow the site's `[markdown]` wherever it runs, data scripts included.
+    /// A page render's `LinkContext` still supplies its own settings. Call before loading includes or data.
+    pub fn set_markdown(&mut self, config: &MarkdownConfig) {
+        helpers::register_markdown(&mut self.engine, &self.include_files, config.clone());
+    }
+
     pub fn new(site_root: &Path) -> Self {
         let mut engine = rhai::Engine::new();
         engine.set_max_call_levels(32);
         engine.set_max_operations(1_000_000);
         engine.set_max_expr_depths(64, 32);
         engine.set_max_string_size(10_000_000);
+        // Rhai's `sync` string interner sleeps 10 ms whenever two threads contend for it.
+        engine.set_max_strings_interned(0);
         engine.set_max_array_size(100_000);
         engine.set_max_map_size(100_000);
         engine.disable_symbol("eval");
