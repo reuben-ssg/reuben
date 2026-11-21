@@ -194,7 +194,7 @@ fn read(output: &Output, key: &std::path::Path) -> io::Result<Vec<u8>> {
     match output.files.get(key) {
         Some(OutputFile::Bytes(b)) => Ok(b.clone()),
         Some(OutputFile::Copy(src)) => std::fs::read(src),
-        None => Err(io::ErrorKind::NotFound.into()),
+        Some(OutputFile::Staged) | None => Err(io::ErrorKind::NotFound.into()),
     }
 }
 

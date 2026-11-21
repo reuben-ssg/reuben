@@ -16,6 +16,8 @@ pub enum OutputFile {
     Bytes(Vec<u8>),
     /// Copied from this source path when the output is written.
     Copy(PathBuf),
+    /// Already written into the staging directory while rendering.
+    Staged,
 }
 
 /// The whole built site, keyed by path relative to the output directory.
@@ -30,22 +32,51 @@ pub struct Output {
 /// output, never under `content/` or `static/`, so a site walk can't pick them up. An `out` with no final component
 /// (`.`, `/`) has no sibling to stage in and is refused.
 pub fn write_atomic(output: &Output, out: &Path) -> Result<(), Vec<Error>> {
-    // A symlinked output is swapped at its real location so the link keeps pointing at the new build.
-    let real;
-    let out = if fs::symlink_metadata(out).is_ok_and(|m| m.is_symlink()) {
-        real = fs::canonicalize(out).map_err(|e| vec![Error::new(out, e)])?;
-        real.as_path()
-    } else {
-        out
-    };
-    let (staging, old) = sibling_dirs(out).map_err(|e| vec![e])?;
-    check_out_dir(out).map_err(|e| vec![e])?;
-    let result =
-        stage(output, &staging).and_then(|()| swap(&staging, out, &old).map_err(|e| vec![e]));
+    let (real, _, _) = paths(out).map_err(|e| vec![e])?;
+    check_out_dir(&real).map_err(|e| vec![e])?;
+    let staging = prepare_staging(out).map_err(|e| vec![e])?;
+    finish_atomic(output, out, &staging)
+}
+
+/// Empties and creates the staging directory beside `out`, and returns it.
+pub(crate) fn prepare_staging(out: &Path) -> Result<PathBuf, Error> {
+    let (_, staging, _) = paths(out)?;
+    remove_dir(&staging)?;
+    fs::create_dir_all(&staging).map_err(|e| Error::new(&staging, e))?;
+    Ok(staging)
+}
+
+/// Writes every file not yet in `staging` plus the marker, then swaps `staging` into `out`. On failure `out` is
+/// untouched and `staging` is removed.
+pub(crate) fn finish_atomic(output: &Output, out: &Path, staging: &Path) -> Result<(), Vec<Error>> {
+    let result = paths(out).map_err(|e| vec![e]).and_then(|(real, _, old)| {
+        stage(output, staging).and_then(|()| swap(staging, &real, &old).map_err(|e| vec![e]))
+    });
     if result.is_err() {
-        let _ = fs::remove_dir_all(&staging);
+        let _ = fs::remove_dir_all(staging);
     }
     result
+}
+
+/// Writes one rendered file into `staging`, creating its directory.
+pub(crate) fn write_staged(staging: &Path, rel: &Path, bytes: &[u8]) -> Result<(), Error> {
+    let dest = staging.join(rel);
+    if let Some(dir) = dest.parent() {
+        fs::create_dir_all(dir).map_err(|e| Error::new(dir, e))?;
+    }
+    fs::write(&dest, bytes).map_err(|e| Error::new(&dest, e))
+}
+
+/// The output's real location (a symlinked output is swapped where it points, so the link keeps pointing at the new
+/// build), and its staging and old siblings.
+fn paths(out: &Path) -> Result<(PathBuf, PathBuf, PathBuf), Error> {
+    let real = if fs::symlink_metadata(out).is_ok_and(|m| m.is_symlink()) {
+        fs::canonicalize(out).map_err(|e| Error::new(out, e))?
+    } else {
+        out.to_path_buf()
+    };
+    let (staging, old) = sibling_dirs(&real)?;
+    Ok((real, staging, old))
 }
 
 /// Refuses a non-empty directory that no earlier Reuben build created.
@@ -78,15 +109,14 @@ fn sibling_dirs(out: &Path) -> Result<(PathBuf, PathBuf), Error> {
     ))
 }
 
-/// Writes every file, collecting every failure rather than stopping at the first.
+/// Writes every file not already staged, collecting every failure rather than stopping at the first.
 fn stage(output: &Output, staging: &Path) -> Result<(), Vec<Error>> {
-    remove_dir(staging).map_err(|e| vec![e])?;
-    fs::create_dir_all(staging).map_err(|e| vec![Error::new(staging, e)])?;
     let mut errors = Vec::new();
     // Each file's destination and parent, joined once.
     let targets: Vec<(PathBuf, PathBuf, &OutputFile)> = output
         .files
         .iter()
+        .filter(|(_, file)| !matches!(file, OutputFile::Staged))
         .map(|(rel, file)| {
             let dest = staging.join(rel);
             let parent = dest.parent().unwrap_or(staging).to_path_buf();
@@ -120,6 +150,7 @@ fn stage(output: &Output, staging: &Path) -> Result<(), Vec<Error>> {
                 OutputFile::Copy(src) => fs::copy(src, dest)
                     .map(|_| ())
                     .map_err(|e| (src.clone(), e)),
+                OutputFile::Staged => Ok(()),
             };
             written.err().map(|(path, e)| Error::new(path, e))
         })
@@ -277,6 +308,56 @@ mod tests {
         assert_eq!(paths, [a.as_path(), b.as_path()]);
         assert!(!tmp.path().join("dist").exists());
         assert!(!tmp.path().join(".dist.reuben-staging").exists());
+    }
+
+    #[test]
+    fn finish_atomic_keeps_staged_files_and_writes_the_rest() {
+        let tmp = TempDir::new().unwrap();
+        tmp.child(".dist.reuben-staging/junk.txt")
+            .write_str("junk")
+            .unwrap();
+        let out = tmp.path().join("dist");
+        let staging = prepare_staging(&out).unwrap();
+        assert_eq!(staging, tmp.path().join(".dist.reuben-staging"));
+        assert!(!staging.join("junk.txt").exists());
+        std::fs::create_dir_all(staging.join("blog")).unwrap();
+        std::fs::write(staging.join("blog/index.html"), "streamed").unwrap();
+        let mut output = one_page();
+        output
+            .files
+            .insert("blog/index.html".into(), OutputFile::Staged);
+        finish_atomic(&output, &out, &staging).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(out.join("blog/index.html")).unwrap(),
+            "streamed"
+        );
+        assert_eq!(std::fs::read_to_string(out.join("a.html")).unwrap(), "new");
+        assert!(out.join(OUTPUT_MARKER).is_file());
+        assert!(!staging.exists());
+    }
+
+    #[test]
+    fn failed_finish_removes_staging_and_keeps_out() {
+        let tmp = TempDir::new().unwrap();
+        tmp.child("dist/.reuben-output").write_str("").unwrap();
+        tmp.child("dist/keep.html").write_str("old").unwrap();
+        let out = tmp.path().join("dist");
+        let staging = prepare_staging(&out).unwrap();
+        std::fs::write(staging.join("page.html"), "streamed").unwrap();
+        let mut output = one_page();
+        output.files.insert("page.html".into(), OutputFile::Staged);
+        let src = tmp.path().join("missing.css");
+        output
+            .files
+            .insert("m.css".into(), OutputFile::Copy(src.clone()));
+        let errs = finish_atomic(&output, &out, &staging).unwrap_err();
+        assert_eq!(errs.len(), 1);
+        assert_eq!(errs[0].path, src);
+        assert_eq!(
+            std::fs::read_to_string(out.join("keep.html")).unwrap(),
+            "old"
+        );
+        assert!(!staging.exists());
     }
 
     #[cfg(unix)]

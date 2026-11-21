@@ -23,7 +23,7 @@ use crate::frontmatter::{self, FrontMatter};
 use crate::headings::TocEntry;
 use crate::lastmod;
 use crate::links::{AnchorRequest, LinkProblem, PageIndex, Target};
-use crate::output::{Output, OutputFile, check_out_dir, write_atomic};
+use crate::output::{self, Output, OutputFile, check_out_dir, finish_atomic, prepare_staging};
 use crate::page::Failed;
 use crate::route::{Route, route_for_page, route_for_template};
 use crate::script::helpers::url_for;
@@ -356,6 +356,16 @@ impl Site {
 
     /// Renders the whole site into memory. Nothing touches the disk.
     pub fn render(&self, opts: &RenderOptions) -> Result<(Output, BuildReport), Failure> {
+        self.render_into(opts, None)
+    }
+
+    /// Renders the site, writing each page except CSS into `stage` as soon as it renders and keeping only its
+    /// `OutputFile::Staged` entry. Without a `stage` nothing touches the disk.
+    fn render_into(
+        &self,
+        opts: &RenderOptions,
+        stage: Option<&Path>,
+    ) -> Result<(Output, BuildReport), Failure> {
         let (pages, drafts): (Vec<&Page>, Vec<&Page>) = self
             .pages
             .iter()
@@ -379,7 +389,18 @@ impl Site {
             let (html, tree, anchors) = self.render_page(page, &scopes)?;
             splice::ensure_no_placeholders(&page.source, &html)
                 .map_err(|e| Failed::from(vec![e]))?;
-            Ok(check_html(page, html, tree, anchors))
+            let mut done = check_html(page, html, tree, anchors);
+            if let Some(stage) = stage.filter(|_| !is_css(&page.route.file)) {
+                if let Err(e) = output::write_staged(stage, &page.route.file, done.html.as_bytes())
+                {
+                    return Err(Failed {
+                        errors: vec![e],
+                        anchors: done.anchors,
+                    });
+                }
+                done.html = String::new();
+            }
+            Ok(done)
         };
         // A pool that can't start is reported, and the build carries on with rayon's default pool.
         let pool =
@@ -456,10 +477,12 @@ impl Site {
                         page_ids.insert(page.rel.as_path(), done.ids);
                     }
                     page_anchors.push((page, done.anchors));
-                    output.files.insert(
-                        page.route.file.clone(),
-                        OutputFile::Bytes(done.html.into_bytes()),
-                    );
+                    let file = if stage.is_some() {
+                        OutputFile::Staged
+                    } else {
+                        OutputFile::Bytes(done.html.into_bytes())
+                    };
+                    output.files.insert(page.route.file.clone(), file);
                 }
                 Err(mut failed) => {
                     errors.append(&mut failed.errors);
@@ -597,26 +620,37 @@ impl Site {
 
     /// Renders the site and swaps it into `opts.out`. A failed build leaves the previous output untouched.
     pub fn build(&self, opts: &BuildOptions) -> Result<BuildReport, Failure> {
-        let out_error = check_out_dir(&opts.out).err();
-        let rendered = self.render(&RenderOptions {
-            drafts: opts.drafts,
-            jobs: opts.jobs,
-        });
-        let (output, report) = match (rendered, out_error) {
-            (Ok(done), None) => done,
-            (Ok((_, report)), Some(e)) => {
+        let (staging, out_error) =
+            match check_out_dir(&opts.out).and_then(|()| prepare_staging(&opts.out)) {
+                Ok(staging) => (Some(staging), None),
+                Err(e) => (None, Some(e)),
+            };
+        let rendered = self.render_into(
+            &RenderOptions {
+                drafts: opts.drafts,
+                jobs: opts.jobs,
+            },
+            staging.as_deref(),
+        );
+        let (output, report, staging) = match (rendered, staging) {
+            (Ok((output, report)), Some(staging)) => (output, report, staging),
+            (Ok((_, report)), None) => {
                 return Err(Failure {
-                    errors: vec![e],
+                    errors: out_error.into_iter().collect(),
                     findings: report.findings,
                 });
             }
-            (Err(mut failure), out_error) => {
+            (Err(mut failure), staging) => {
+                if let Some(staging) = staging {
+                    let _ = fs::remove_dir_all(staging);
+                }
                 failure.errors.extend(out_error);
                 Error::sort(&mut failure.errors);
                 return Err(failure);
             }
         };
-        write_atomic(&output, &opts.out).map_err(|errors| Failure {
+        // Pages are already in `staging`; `out` changes only when the swap succeeds.
+        finish_atomic(&output, &opts.out, &staging).map_err(|errors| Failure {
             errors,
             findings: report.findings.clone(),
         })?;
@@ -1184,5 +1218,34 @@ mod tests {
         assert!(!is_static_sidecar(&pages, dir, Path::new("other.rhai")));
         let none = [static_template(None)];
         assert!(!is_static_sidecar(&none, dir, Path::new("side.rhai")));
+    }
+
+    #[test]
+    fn render_into_streams_pages_but_not_css() {
+        use assert_fs::TempDir;
+        use assert_fs::prelude::*;
+        let tmp = TempDir::new().unwrap();
+        let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/sites/templates");
+        tmp.copy_from(fixture, &["**"]).unwrap();
+        let stage = tmp.path().join("stage");
+        fs::create_dir_all(&stage).unwrap();
+        let site = Site::load(tmp.path()).unwrap();
+        let opts = RenderOptions {
+            drafts: false,
+            jobs: None,
+        };
+        let (output, _) = site.render_into(&opts, Some(&stage)).unwrap();
+        let about = Path::new("about/index.html");
+        assert_eq!(output.files.get(about), Some(&OutputFile::Staged));
+        assert!(
+            fs::read_to_string(stage.join(about))
+                .unwrap()
+                .contains("<h1>About</h1>")
+        );
+        assert!(matches!(
+            output.files.get(Path::new("theme.css")),
+            Some(OutputFile::Bytes(_))
+        ));
+        assert!(!stage.join("theme.css").exists());
     }
 }
