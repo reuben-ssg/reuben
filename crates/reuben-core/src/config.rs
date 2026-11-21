@@ -185,20 +185,13 @@ pub fn load(root: &Path, env: Option<&str>) -> Result<Config, Error> {
     })
 }
 
-/// Finds the file that set the key an "unknown field" error names, at the top level or inside a collection table.
+/// Finds the file that set the key an "unknown field" error names, at the top level or inside any table, including a collection's.
 fn blame(layered: &Layered, message: &str) -> Option<PathBuf> {
     let key = message.strip_prefix("unknown field `")?.split('`').next()?;
     let dotted = if layered.value.contains_key(key) {
         key.to_string()
     } else {
-        let folder = layered
-            .value
-            .get("collections")?
-            .as_object()?
-            .iter()
-            .find(|(_, table)| table.get(key).is_some())?
-            .0;
-        format!("collections.{folder}.{key}")
+        nested_path(&layered.value, key)?
     };
     let nested = format!("{dotted}.");
     layered
@@ -206,6 +199,22 @@ fn blame(layered: &Layered, message: &str) -> Option<PathBuf> {
         .iter()
         .find(|(k, _)| **k == dotted || k.starts_with(&nested))
         .map(|(_, file)| file.clone())
+}
+
+fn nested_path(value: &Map<String, Value>, key: &str) -> Option<String> {
+    for (table, body) in value {
+        let Some(body) = body.as_object() else {
+            continue;
+        };
+        if table == "collections" {
+            if let Some((name, _)) = body.iter().find(|(_, t)| t.get(key).is_some()) {
+                return Some(format!("collections.{name}.{key}"));
+            }
+        } else if table != "params" && body.contains_key(key) {
+            return Some(format!("{table}.{key}"));
+        }
+    }
+    None
 }
 
 fn merge_layer(layered: &mut Layered, file: &Path) -> Result<(), Error> {
@@ -470,6 +479,38 @@ mod tests {
         write(&tmp, "reuben.toml", "[markdown]\nmaths = true\n");
         let err = load(tmp.path(), None).unwrap_err();
         assert!(matches!(err.kind, ErrorKind::Config(_)), "{err}");
+        assert!(err.path.ends_with("reuben.toml"), "{err}");
         assert!(err.to_string().contains("maths"), "{err}");
+    }
+
+    #[test]
+    fn unknown_markdown_key_in_env_file_blames_that_file() {
+        let tmp = TempDir::new().unwrap();
+        write(&tmp, "reuben.toml", "title = \"A\"\n");
+        write(&tmp, "reuben.production.toml", "[markdown]\nmaths = true\n");
+        let err = load(tmp.path(), Some("production")).unwrap_err();
+        assert!(err.path.ends_with("reuben.production.toml"), "{err}");
+        assert!(err.to_string().contains("maths"), "{err}");
+    }
+
+    #[test]
+    fn unknown_markdown_key_in_included_file_blames_that_file() {
+        let tmp = TempDir::new().unwrap();
+        write(&tmp, "reuben.toml", "include = [\"config/*.toml\"]\n");
+        write(&tmp, "config/1.toml", "[markdown]\nmaths = true\n");
+        let err = load(tmp.path(), None).unwrap_err();
+        assert!(err.path.ends_with("config/1.toml"), "{err}");
+    }
+
+    #[test]
+    fn unknown_css_and_a11y_keys_blame_the_file_that_set_them() {
+        let tmp = TempDir::new().unwrap();
+        write(&tmp, "reuben.toml", "title = \"A\"\n");
+        write(&tmp, "reuben.production.toml", "[css]\ntargts = []\n");
+        let err = load(tmp.path(), Some("production")).unwrap_err();
+        assert!(err.path.ends_with("reuben.production.toml"), "{err}");
+        write(&tmp, "reuben.production.toml", "[a11y]\ndisabel = []\n");
+        let err = load(tmp.path(), Some("production")).unwrap_err();
+        assert!(err.path.ends_with("reuben.production.toml"), "{err}");
     }
 }
