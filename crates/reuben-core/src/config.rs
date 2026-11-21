@@ -18,9 +18,30 @@ pub struct Config {
     pub collections: BTreeMap<String, CollectionConfig>,
     pub sitemap: bool,
     pub css: CssConfig,
+    pub markdown: MarkdownConfig,
     /// The accessibility rules that are on for every page, before a page's own switches.
     pub a11y: RuleSet,
     pub sources: BTreeMap<String, PathBuf>,
+}
+
+/// The `[markdown]` table: every byte Reuben adds beyond the Markdown's own HTML is opt-in, except footnote back-links.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct MarkdownConfig {
+    pub highlight: bool,
+    pub math: bool,
+    /// Turning this off removes an accessibility feature.
+    pub footnote_backlinks: bool,
+}
+
+impl Default for MarkdownConfig {
+    fn default() -> Self {
+        Self {
+            highlight: false,
+            math: false,
+            footnote_backlinks: true,
+        }
+    }
 }
 
 /// The `[a11y]` table: rules switched off site-wide, by id.
@@ -72,6 +93,8 @@ struct Raw {
     sitemap: Option<bool>,
     #[serde(default)]
     css: CssConfig,
+    #[serde(default)]
+    markdown: MarkdownConfig,
     #[serde(default)]
     a11y: A11yConfig,
 }
@@ -154,8 +177,9 @@ pub fn load(root: &Path, env: Option<&str>) -> Result<Config, Error> {
         theme,
         params: raw.params,
         collections: raw.collections,
-        sitemap: raw.sitemap.unwrap_or(true),
+        sitemap: raw.sitemap.unwrap_or(false),
         css: raw.css,
+        markdown: raw.markdown,
         a11y,
         sources: layered.sources,
     })
@@ -402,10 +426,50 @@ mod tests {
     }
 
     #[test]
-    fn sitemap_defaults_on() {
+    fn sitemap_defaults_off() {
         let tmp = TempDir::new().unwrap();
-        assert!(load(tmp.path(), None).unwrap().sitemap);
-        write(&tmp, "reuben.toml", "sitemap = false\n");
         assert!(!load(tmp.path(), None).unwrap().sitemap);
+        write(&tmp, "reuben.toml", "sitemap = true\n");
+        assert!(load(tmp.path(), None).unwrap().sitemap);
+    }
+
+    #[test]
+    fn markdown_defaults() {
+        let tmp = TempDir::new().unwrap();
+        assert_eq!(
+            load(tmp.path(), None).unwrap().markdown,
+            MarkdownConfig {
+                highlight: false,
+                math: false,
+                footnote_backlinks: true,
+            }
+        );
+    }
+
+    #[test]
+    fn markdown_table_parses() {
+        let tmp = TempDir::new().unwrap();
+        write(
+            &tmp,
+            "reuben.toml",
+            "[markdown]\nhighlight = true\nmath = true\nfootnote_backlinks = false\n",
+        );
+        assert_eq!(
+            load(tmp.path(), None).unwrap().markdown,
+            MarkdownConfig {
+                highlight: true,
+                math: true,
+                footnote_backlinks: false,
+            }
+        );
+    }
+
+    #[test]
+    fn markdown_unknown_key_is_an_error() {
+        let tmp = TempDir::new().unwrap();
+        write(&tmp, "reuben.toml", "[markdown]\nmaths = true\n");
+        let err = load(tmp.path(), None).unwrap_err();
+        assert!(matches!(err.kind, ErrorKind::Config(_)), "{err}");
+        assert!(err.to_string().contains("maths"), "{err}");
     }
 }

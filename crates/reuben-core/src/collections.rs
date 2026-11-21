@@ -246,6 +246,7 @@ mod tests {
             collections,
             sitemap: false,
             css: Default::default(),
+            markdown: Default::default(),
             a11y: reuben_a11y::RuleSet::all(),
             sources: Default::default(),
         }

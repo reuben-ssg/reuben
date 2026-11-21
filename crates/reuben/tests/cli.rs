@@ -75,7 +75,11 @@ fn build_accepts_env_flag() {
 
 #[test]
 fn warnings_print_to_stderr() {
+    use assert_fs::prelude::*;
     let tmp = fixture("basic");
+    tmp.child("reuben.toml")
+        .write_str("sitemap = true\n")
+        .unwrap();
     reuben()
         .args(["build", "--root"])
         .arg(tmp.path())
