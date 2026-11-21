@@ -10,6 +10,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use crate::blocks::{Block, BlockKind};
+use crate::config::MarkdownConfig;
 use crate::doc::{Origin, Span};
 use crate::html::escape_output;
 use crate::links::PageIndex;
@@ -80,8 +81,8 @@ pub struct LinkContext {
     /// The page's path relative to `content/`.
     pub page_rel: PathBuf,
     pub base_path: String,
-    /// Whether `markdown()` reads `$...$` as math.
-    pub math: bool,
+    /// What `markdown()` reads and writes: math, code highlighting, footnote back-links.
+    pub markdown: MarkdownConfig,
 }
 
 /// Runs `f` with `ctx` as this thread's link context, then restores the previous one.

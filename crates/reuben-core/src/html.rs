@@ -5,20 +5,46 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 use std::fmt::Write;
 
+use crate::config::MarkdownConfig;
 use crate::doc::{Alignment, Document, Node, NodeKind};
 use crate::highlight::{Highlighter, default_highlighter};
 
-/// State the writer carries through the whole tree: the code highlighter, how many references each
+/// What the HTML writer does beyond the Markdown's own markup.
+pub struct HtmlOptions<'a> {
+    /// Highlights fenced code when set.
+    pub highlighter: Option<&'a dyn Highlighter>,
+    pub footnote_backlinks: bool,
+}
+
+impl Default for HtmlOptions<'_> {
+    fn default() -> Self {
+        HtmlOptions {
+            highlighter: None,
+            footnote_backlinks: true,
+        }
+    }
+}
+
+impl From<&MarkdownConfig> for HtmlOptions<'static> {
+    fn from(config: &MarkdownConfig) -> Self {
+        HtmlOptions {
+            highlighter: config.highlight.then(default_highlighter),
+            footnote_backlinks: config.footnote_backlinks,
+        }
+    }
+}
+
+/// State the writer carries through the whole tree: the options, how many references each
 /// footnote has (for its backrefs), and how many of those references have been written so far
 /// (to give repeated references distinct ids).
 struct RenderCtx<'a> {
-    highlighter: &'a dyn Highlighter,
+    opts: &'a HtmlOptions<'a>,
     totals: HashMap<usize, u32>,
     written: RefCell<HashMap<usize, u32>>,
 }
 
 impl<'a> RenderCtx<'a> {
-    fn of(doc: &Document, highlighter: &'a dyn Highlighter) -> Self {
+    fn of(doc: &Document, opts: &'a HtmlOptions<'a>) -> Self {
         fn walk(node: &Node, totals: &mut HashMap<usize, u32>) {
             if let NodeKind::FootnoteReference { index, .. } = node.kind {
                 *totals.entry(index).or_default() += 1;
@@ -28,34 +54,41 @@ impl<'a> RenderCtx<'a> {
         let mut totals = HashMap::new();
         walk(doc, &mut totals);
         RenderCtx {
-            highlighter,
+            opts,
             totals,
             written: RefCell::default(),
         }
     }
 }
 
-/// Renders a page body. Output follows the CommonMark reference renderer's layout.
+/// Renders a page body without highlighting. Output follows the CommonMark reference renderer's layout,
+/// except for footnotes, which are written with less markup.
 pub fn render(doc: &Document) -> String {
-    render_with(doc, default_highlighter())
+    render_opts(doc, &HtmlOptions::default())
 }
 
 /// Like [`render`], with a caller-supplied code highlighter.
 pub fn render_with(doc: &Document, highlighter: &dyn Highlighter) -> String {
+    render_opts(
+        doc,
+        &HtmlOptions {
+            highlighter: Some(highlighter),
+            ..HtmlOptions::default()
+        },
+    )
+}
+
+pub fn render_opts(doc: &Document, opts: &HtmlOptions) -> String {
     let mut out = String::new();
-    block(&mut out, doc, false, &RenderCtx::of(doc, highlighter));
+    block(&mut out, doc, false, &RenderCtx::of(doc, opts));
     out
 }
 
 /// Renders one node on its own, for stages that need a part of the page as HTML.
 pub(crate) fn render_node(node: &Node) -> String {
+    let opts = HtmlOptions::default();
     let mut out = String::new();
-    block(
-        &mut out,
-        node,
-        false,
-        &RenderCtx::of(node, default_highlighter()),
-    );
+    block(&mut out, node, false, &RenderCtx::of(node, &opts));
     out
 }
 
@@ -144,7 +177,9 @@ fn block(out: &mut String, node: &Node, tight: bool, ctx: &RenderCtx) {
         NodeKind::CodeBlock { info, literal } => {
             cr(out);
             let lang = info.split_whitespace().next();
-            let highlighted = lang.and_then(|lang| ctx.highlighter.highlight(lang, literal));
+            let highlighted = lang
+                .zip(ctx.opts.highlighter)
+                .and_then(|(lang, h)| h.highlight(lang, literal));
             out.push_str(if highlighted.is_some() {
                 "<pre class=\"hl-code\"><code"
             } else {
@@ -276,13 +311,17 @@ fn table(out: &mut String, node: &Node, alignments: &[Alignment], ctx: &RenderCt
 
 fn footnote_section(out: &mut String, node: &Node, ctx: &RenderCtx) {
     cr(out);
-    out.push_str("<section class=\"footnotes\" data-footnotes>\n<ol>\n");
+    out.push_str("<section class=\"footnotes\">\n<ol>\n");
     for def in &node.children {
         let NodeKind::FootnoteDefinition { label, index } = &def.kind else {
             continue;
         };
         let _ = write!(out, "<li id=\"fn-{}\">", url_attr(label));
-        let backref = footnote_backref(label, *index, ctx.totals.get(index).copied().unwrap_or(0));
+        let backref = if ctx.opts.footnote_backlinks {
+            footnote_backref(label, *index, ctx.totals.get(index).copied().unwrap_or(0))
+        } else {
+            String::new()
+        };
         let (last, rest) = match def.children.split_last() {
             Some((last, rest)) if last.kind == NodeKind::Paragraph => (Some(last), rest),
             _ => (None, def.children.as_slice()),
@@ -295,10 +334,13 @@ fn footnote_section(out: &mut String, node: &Node, ctx: &RenderCtx) {
                 cr(out);
                 out.push_str("<p>");
                 inlines(out, p, ctx);
-                out.push(' ');
-                out.push_str(&backref);
+                if !backref.is_empty() {
+                    out.push(' ');
+                    out.push_str(&backref);
+                }
                 out.push_str("</p>\n");
             }
+            None if backref.is_empty() => {}
             None => {
                 out.push_str(&backref);
                 out.push('\n');
@@ -316,16 +358,13 @@ fn footnote_backref(label: &str, index: usize, total: u32) -> String {
     for n in 1..=total {
         let (suffix, sup) = if n > 1 {
             html.push(' ');
-            (
-                format!("-{n}"),
-                format!("<sup class=\"footnote-ref\">{n}</sup>"),
-            )
+            (format!("-{n}"), format!("<sup>{n}</sup>"))
         } else {
             (String::new(), String::new())
         };
         let _ = write!(
             html,
-            "<a href=\"#fnref-{label}{suffix}\" class=\"footnote-backref\" data-footnote-backref data-footnote-backref-idx=\"{index}{suffix}\" aria-label=\"Back to reference {index}{suffix}\">↩{sup}</a>"
+            "<a href=\"#fnref-{label}{suffix}\" aria-label=\"Back to reference {index}{suffix}\">↩{sup}</a>"
         );
     }
     html
@@ -381,7 +420,7 @@ fn inline(out: &mut String, node: &Node, ctx: &RenderCtx) {
             };
             let _ = write!(
                 out,
-                "<sup class=\"footnote-ref\"><a href=\"#fn-{label}\" id=\"fnref-{label}{suffix}\" data-footnote-ref>{index}</a></sup>",
+                "<sup><a href=\"#fn-{label}\" id=\"fnref-{label}{suffix}\">{index}</a></sup>",
                 label = url_attr(label),
                 suffix = url_attr(&suffix),
             );
@@ -427,6 +466,64 @@ fn collect_text(node: &Node, s: &mut String) {
 mod tests {
     use super::*;
 
+    fn highlighted(doc: &Document) -> String {
+        render_opts(
+            doc,
+            &HtmlOptions {
+                highlighter: Some(default_highlighter()),
+                ..HtmlOptions::default()
+            },
+        )
+    }
+
+    #[test]
+    fn code_block_plain_when_highlight_off() {
+        let d = crate::markdown::parse("```rust\nlet a = 1 < 2;\n```\n", 1);
+        assert_eq!(
+            render(&d),
+            "<pre><code class=\"language-rust\">let a = 1 &lt; 2;\n</code></pre>\n"
+        );
+    }
+
+    #[test]
+    fn footnote_markup_is_minimal() {
+        let d = crate::markdown::parse("a[^1]\n\n[^1]: b\n", 1);
+        assert_eq!(
+            render(&d),
+            "<p>a<sup><a href=\"#fn-1\" id=\"fnref-1\">1</a></sup></p>\n<section class=\"footnotes\">\n<ol>\n<li id=\"fn-1\">\n<p>b <a href=\"#fnref-1\" aria-label=\"Back to reference 1\">↩</a></p>\n</li>\n</ol>\n</section>\n"
+        );
+    }
+
+    #[test]
+    fn footnote_backlinks_off() {
+        let d = crate::markdown::parse("a[^1]\n\n[^1]: b\n", 1);
+        let html = render_opts(
+            &d,
+            &HtmlOptions {
+                footnote_backlinks: false,
+                ..HtmlOptions::default()
+            },
+        );
+        assert!(
+            html.contains("<sup><a href=\"#fn-1\" id=\"fnref-1\">1</a></sup>"),
+            "{html}"
+        );
+        assert!(html.contains("<p>b</p>"), "{html}");
+        assert!(!html.contains("href=\"#fnref"), "{html}");
+    }
+
+    #[test]
+    fn repeated_reference_gets_numbered_backlink() {
+        let d = crate::markdown::parse("a[^1] b[^1]\n\n[^1]: n\n", 1);
+        let html = render(&d);
+        assert!(
+            html.contains(
+                "<a href=\"#fnref-1-2\" aria-label=\"Back to reference 1-2\">↩<sup>2</sup></a>"
+            ),
+            "{html}"
+        );
+    }
+
     #[test]
     fn escapes_text_and_attributes() {
         let d = crate::markdown::parse("[a < b](/a?x=1&y=\"2\")\n", 1);
@@ -440,7 +537,7 @@ mod tests {
     fn code_block_uses_highlighter() {
         let d = crate::markdown::parse("```rust\nfn a() {}\n```\n", 1);
         assert!(
-            render(&d)
+            highlighted(&d)
                 .contains("<pre class=\"hl-code\"><code class=\"language-rust\"><span class=\"hl-")
         );
     }
@@ -449,14 +546,14 @@ mod tests {
     fn unknown_language_stays_plain() {
         let d = crate::markdown::parse("```rhai\nlet x = 1 < 2;\n```\n", 1);
         assert_eq!(
-            render(&d),
+            highlighted(&d),
             "<pre><code class=\"language-rhai\">let x = 1 &lt; 2;\n</code></pre>\n"
         );
     }
 
     #[test]
     fn code_block_language_class() {
-        let html = render(&crate::markdown::parse("```rust\nlet x = 1 < 2;\n```\n", 1));
+        let html = highlighted(&crate::markdown::parse("```rust\nlet x = 1 < 2;\n```\n", 1));
         assert!(
             html.starts_with(
                 "<pre class=\"hl-code\"><code class=\"language-rust\"><span class=\"hl-"
@@ -468,22 +565,19 @@ mod tests {
     #[test]
     fn highlighted_code_is_escaped() {
         let src = "```rust\nlet s = \"</code></pre><script>\" & \"x\";\n```\n";
-        let html = render(&crate::markdown::parse(src, 1));
+        let html = highlighted(&crate::markdown::parse(src, 1));
         assert!(!html.contains("<script"), "{html}");
         assert!(html.contains("&lt;/code&gt;"), "{html}");
         assert!(html.contains("&amp;"), "{html}");
     }
 
+    /// Footnotes are left out: Reuben's footnote markup deliberately differs from comrak's.
     #[test]
-    fn table_footnote_and_strike_html_match_comrak() {
+    fn table_and_strike_html_match_comrak() {
         let inputs = [
             "| a | b |\n|:-|:-:|\n| 1 | 2 |\n",
             "| a | b | c |\n|--|-:|---|\n| 1 | **2** | [x](/y) |\n| | | |\n",
             "| a |\n|---|\n",
-            "x[^1]\n\n[^1]: note\n",
-            "A[^a] B[^b] A again[^a]\n\n[^a]: one\n[^b]: two\n",
-            "A[^a]\n\n[^a]: one\n\n    ```\n    code\n    ```\n",
-            "A[^a]\n\n[^a]: one\n\n    second\n",
             "~~gone~~ and *em*\n",
         ];
         for input in inputs {

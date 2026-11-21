@@ -658,7 +658,7 @@ impl Site {
             index: Arc::clone(index),
             page_rel: page.rel.clone(),
             base_path: check::base_path(&self.config.base_url),
-            math: self.config.markdown.math,
+            markdown: self.config.markdown.clone(),
         }
     }
 
@@ -681,7 +681,13 @@ impl Site {
                     .as_deref()
                     .or_else(|| collections::layout_of(&page.rel, &self.config));
                 let tree = check::tree_pass(&page.source, &page.rules, &doc, &outputs);
-                (html::render(&doc), scope, name, Some(tree), anchors)
+                (
+                    html::render_opts(&doc, &html::HtmlOptions::from(&self.config.markdown)),
+                    scope,
+                    name,
+                    Some(tree),
+                    anchors,
+                )
             }
             PageKind::Template { escape } => {
                 let (text, scope) =

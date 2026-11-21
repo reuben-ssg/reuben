@@ -6,7 +6,7 @@ use rhai::{Array, Dynamic, Engine, EvalAltResult, NativeCallContext};
 
 use super::{Html, IncludeFiles, collection, with_current_link};
 use crate::doc::Origin;
-use crate::html::{escape_text, render};
+use crate::html::{HtmlOptions, escape_text, render_opts};
 use crate::links::{parse_source_link, resolve_tree, source_links};
 use crate::markdown::parse_with;
 use crate::math::render_math;
@@ -47,7 +47,10 @@ pub fn register(engine: &mut Engine, site_root: &Path, include_files: &IncludeFi
         .register_fn(
             "markdown",
             move |ctx: NativeCallContext, s: &str| -> RhaiResult<Html> {
-                let math = with_current_link(|ctx| ctx.is_some_and(|c| c.math));
+                // Outside a page render, the defaults apply: no math, no highlighting, back-links on.
+                let config =
+                    with_current_link(|ctx| ctx.map(|c| c.markdown.clone()).unwrap_or_default());
+                let math = config.math;
                 let mut doc = parse_with(s, 1, math);
                 if math {
                     render_math(&mut doc).map_err(|errors| {
@@ -71,7 +74,7 @@ pub fn register(engine: &mut Engine, site_root: &Path, include_files: &IncludeFi
                     return Err(messages.join("; ").into());
                 }
                 Ok(Html {
-                    markup: render(&doc),
+                    markup: render_opts(&doc, &HtmlOptions::from(&config)),
                     origin: origin_of(&ctx, &markdown_files),
                 })
             },

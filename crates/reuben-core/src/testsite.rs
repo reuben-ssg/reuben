@@ -19,7 +19,7 @@ pub fn generate(dir: &Path, pages: usize) -> io::Result<()> {
     };
     write(
         "reuben.toml",
-        "title = \"Generated\"\n\n[markdown]\nmath = true\n",
+        "title = \"Generated\"\n\n[markdown]\nhighlight = true\nmath = true\n",
     )?;
     write(
         "layouts/default.html",

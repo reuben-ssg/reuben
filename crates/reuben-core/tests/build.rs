@@ -167,3 +167,17 @@ fn failed_collections_leave_previous_output() {
     assert!(build(tmp.path(), false).is_err());
     assert!(tmp.path().join("dist/index.html").exists());
 }
+
+#[test]
+fn markdown_helper_follows_the_markdown_table() {
+    let page = "---\ntitle: T\n---\n{{ markdown(\"a[^1]\\n\\n[^1]: b\\n\") }}\n";
+    let render = |config: &str| {
+        let tmp = TempDir::new().unwrap();
+        tmp.child("reuben.toml").write_str(config).unwrap();
+        tmp.child("content/index.md").write_str(page).unwrap();
+        build(tmp.path(), false).unwrap();
+        fs::read_to_string(tmp.path().join("dist/index.html")).unwrap()
+    };
+    assert!(render("").contains("aria-label=\"Back to reference 1\""));
+    assert!(!render("[markdown]\nfootnote_backlinks = false\n").contains("Back to reference"));
+}
