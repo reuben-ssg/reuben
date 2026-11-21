@@ -16,6 +16,9 @@ highlight = true
 math = true
 ```
 
+With math off, a `$…$` span is plain text, so a `{{ … }}` inside it is now a live block: `$x^{{2}}$` prints `$x^2$`, and `{{n}}` fails if `n` is undefined.
+A 0.1.1 site that used math needs `math = true` to keep those braces literal.
+
 ### Added
 
 A `[markdown]` table with `highlight`, `math` and `footnote_backlinks`.
@@ -39,4 +42,25 @@ The numbers and the scripts are in [reuben-ssg/benchmarks](https://github.com/re
 
 ### Library API
 
-`OutputFile` has a new `Staged` variant for pages already written during `Site::build`; `Site::render` never returns it.
+These changes to `reuben-core` break code that builds the changed structs with literals or calls the changed functions.
+
+Added:
+
+- `config::MarkdownConfig`, the `[markdown]` table, with public `highlight`, `math` and `footnote_backlinks` fields.
+- `html::HtmlOptions`, with `Default` and `From<&MarkdownConfig>`, and `html::render_opts`, which renders with those options.
+- `markdown::parse_with` and `markdown::code_ranges_with`, which take a `math` flag.
+- `script::ScriptEngine::set_markdown`, which makes `markdown()` follow the site's `[markdown]` outside a page render, data scripts included.
+
+Changed:
+
+- `Config` has a new public field `markdown: MarkdownConfig`.
+- `script::LinkContext` has a new public field `markdown: MarkdownConfig`, which `markdown()` uses during a page render.
+- `sitemap::render` takes `&[(String, Option<jiff::civil::Date>)]`, each URL with its last-modified date, instead of `&[String]`.
+- `OutputFile` has a new `Staged` variant for pages already written during `Site::build`; `Site::render` never returns it, and `output::write_atomic` skips it.
+
+Changed behavior, with the same signatures:
+
+- `html::render` no longer highlights code; use `render_with` or `render_opts` for highlighting.
+- `markdown::parse` and `markdown::code_ranges` no longer read `$…$` as math; use `parse_with(…, true)` or `code_ranges_with(…, true)`.
+- `page::render_body` follows `Config::markdown`, so it renders math and highlights code only when those are on.
+- `html::render` and its siblings write the smaller footnote markup described under "Changed output".

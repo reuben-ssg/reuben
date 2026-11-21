@@ -32,6 +32,9 @@ pub struct Output {
 /// The staging and old directories are siblings of `out` so the renames stay on one filesystem. They sit beside the
 /// output, never under `content/` or `static/`, so a site walk can't pick them up. An `out` with no final component
 /// (`.`, `/`) has no sibling to stage in and is refused.
+///
+/// Writes only `Bytes` and `Copy` entries. A `Staged` entry is skipped without an error, and the staging directory
+/// starts empty, so that file is missing from `out`; only `Site::build`'s streaming path produces `Staged`.
 pub fn write_atomic(output: &Output, out: &Path) -> Result<(), Vec<Error>> {
     let (real, _, _) = paths(out).map_err(|e| vec![e])?;
     check_out_dir(&real).map_err(|e| vec![e])?;
