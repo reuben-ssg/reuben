@@ -2,7 +2,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
 use std::time::SystemTime;
 
 use jiff::Timestamp;
@@ -39,7 +39,7 @@ impl GitState {
             root,
             &[
                 "log",
-                "--format=%x00%ct",
+                "--format=%x01%ct",
                 "--name-only",
                 "--no-renames",
                 "-z",
@@ -49,7 +49,13 @@ impl GitState {
         )?;
         let status = git(
             root,
-            &["status", "--porcelain", "-z", "--untracked-files=all"],
+            &[
+                "--no-optional-locks",
+                "status",
+                "--porcelain",
+                "-z",
+                "--untracked-files=all",
+            ],
         )?;
         Some(GitState {
             top,
@@ -85,45 +91,50 @@ fn git(root: &Path, args: &[&str]) -> Option<Vec<u8>> {
             "log.showSignature=false",
             "-c",
             "core.quotepath=false",
+            "-c",
+            "core.fsmonitor=false",
+            "-c",
+            "core.untrackedCache=false",
         ])
         .args(args)
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .env("GIT_OPTIONAL_LOCKS", "0")
+        .stdin(Stdio::null())
         .output()
         .ok()?;
     output.status.success().then_some(output.stdout)
 }
 
-/// Records are `NUL, commit time, NUL, "\n", path NUL, path NUL, ...`; commits are newest first, so the first time seen for a path wins.
+/// Each commit is a `\x01<commit time>` header followed by its NUL-separated paths; commits are newest first, so the first time seen for a path wins.
 fn parse_log(out: &[u8]) -> HashMap<String, i64> {
     let mut times = HashMap::new();
-    let mut tokens = out.split(|&b| b == 0);
     let mut current = None;
-    while let Some(token) = tokens.next() {
-        if token.is_empty() {
-            current = tokens
-                .next()
-                .and_then(|t| std::str::from_utf8(t).ok())
+    for token in out.split(|&b| b == 0) {
+        if let Some(header) = token.strip_prefix(b"\x01") {
+            let (time, rest) = match header.iter().position(|&b| b == b'\n') {
+                Some(i) => (&header[..i], &header[i + 1..]),
+                None => (header, &header[header.len()..]),
+            };
+            current = std::str::from_utf8(time)
+                .ok()
                 .and_then(|t| t.parse::<i64>().ok());
             if let Some(time) = current
-                && let Some(first) = tokens.next()
-                && let Some(path) = path_after_time(first)
+                && let Ok(path) = std::str::from_utf8(rest)
+                && !path.is_empty()
             {
-                times.entry(path).or_insert(time);
+                times.entry(path.to_string()).or_insert(time);
             }
-        } else if let Some(time) = current
-            && let Ok(path) = std::str::from_utf8(token)
+            continue;
+        }
+        let path = token.strip_prefix(b"\n").unwrap_or(token);
+        if let Some(time) = current
+            && !path.is_empty()
+            && let Ok(path) = std::str::from_utf8(path)
         {
             times.entry(path.to_string()).or_insert(time);
         }
     }
     times
-}
-
-fn path_after_time(token: &[u8]) -> Option<String> {
-    let token = token.strip_prefix(b"\n").unwrap_or(token);
-    if token.is_empty() {
-        return None;
-    }
-    std::str::from_utf8(token).ok().map(str::to_string)
 }
 
 fn parse_status(out: &[u8]) -> HashSet<String> {
@@ -160,7 +171,7 @@ mod tests {
     use assert_fs::TempDir;
     use jiff::civil::date;
 
-    use super::{mtime_date, source_dates};
+    use super::{mtime_date, parse_log, source_dates};
 
     fn git_available() -> bool {
         let ok = Command::new("git")
@@ -304,5 +315,83 @@ mod tests {
         run_git(tmp.path(), &["init", "-q"], None);
         commit_all(tmp.path(), "2022-05-06T12:00:00Z");
         assert_eq!(one(tmp.path(), &file), Some(date(2022, 5, 6)));
+    }
+
+    #[test]
+    fn parse_log_skips_commits_without_files() {
+        let out = b"\x011700000000\0\x011600000000\0\nf.md\0d/g.md\0\x011500000000\0\ng.md\0";
+        let map = parse_log(out);
+        assert_eq!(map.len(), 3, "{map:?}");
+        assert_eq!(map["f.md"], 1_600_000_000);
+        assert_eq!(map["d/g.md"], 1_600_000_000);
+        assert_eq!(map["g.md"], 1_500_000_000);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn lastmod_ignores_repository_fsmonitor() {
+        use std::os::unix::fs::PermissionsExt;
+
+        if !git_available() {
+            return;
+        }
+        let tmp = TempDir::new().unwrap();
+        let repo = tmp.path().join("repo");
+        fs::create_dir_all(&repo).unwrap();
+        let file = repo.join("a.md");
+        fs::write(&file, "x").unwrap();
+        run_git(&repo, &["init", "-q"], None);
+        commit_all(&repo, "2024-03-05T12:00:00Z");
+        let marker = tmp.path().join("ran");
+        let script = tmp.path().join("hook.sh");
+        fs::write(
+            &script,
+            format!("#!/bin/sh\ntouch '{}'\n", marker.display()),
+        )
+        .unwrap();
+        fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).unwrap();
+        run_git(
+            &repo,
+            &["config", "core.fsmonitor", script.to_str().unwrap()],
+            None,
+        );
+        assert_eq!(one(&repo, &file), Some(date(2024, 3, 5)));
+        assert!(!marker.exists(), "repository config ran a command");
+    }
+
+    #[test]
+    fn lastmod_rename_committed_and_uncommitted() {
+        if !git_available() {
+            return;
+        }
+        let tmp = TempDir::new().unwrap();
+        let old = tmp.path().join("old.md");
+        fs::write(&old, "some longer content so the rename is detected\n").unwrap();
+        run_git(tmp.path(), &["init", "-q"], None);
+        commit_all(tmp.path(), "2024-03-05T12:00:00Z");
+        run_git(tmp.path(), &["mv", "old.md", "new.md"], None);
+        let new = tmp.path().join("new.md");
+        assert_eq!(one(tmp.path(), &new), mtime_date(&new));
+        run_git(
+            tmp.path(),
+            &["commit", "-q", "-m", "mv"],
+            Some("2025-01-02T12:00:00Z"),
+        );
+        assert_eq!(one(tmp.path(), &new), Some(date(2025, 1, 2)));
+    }
+
+    #[test]
+    fn lastmod_staged_edit_uses_mtime() {
+        if !git_available() {
+            return;
+        }
+        let tmp = TempDir::new().unwrap();
+        let file = tmp.path().join("a.md");
+        fs::write(&file, "x").unwrap();
+        run_git(tmp.path(), &["init", "-q"], None);
+        commit_all(tmp.path(), "2024-03-05T12:00:00Z");
+        fs::write(&file, "edited").unwrap();
+        run_git(tmp.path(), &["add", "a.md"], None);
+        assert_eq!(one(tmp.path(), &file), mtime_date(&file));
     }
 }
