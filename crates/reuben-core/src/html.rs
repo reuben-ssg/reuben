@@ -487,7 +487,7 @@ mod tests {
             "~~gone~~ and *em*\n",
         ];
         for input in inputs {
-            let expected = comrak::markdown_to_html(input, &crate::markdown::options());
+            let expected = comrak::markdown_to_html(input, &crate::markdown::options(false));
             assert_eq!(
                 render(&crate::markdown::parse(input, 1)),
                 expected,

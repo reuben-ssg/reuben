@@ -5,14 +5,14 @@ use comrak::{Arena, Options};
 
 use crate::doc::{Alignment, Document, Node, NodeKind, Span};
 
-pub(crate) fn options() -> Options<'static> {
+pub(crate) fn options(math: bool) -> Options<'static> {
     let mut options = Options::default();
     options.extension.strikethrough = true;
     options.extension.table = true;
     options.extension.autolink = true;
     options.extension.tasklist = true;
     options.extension.footnotes = true;
-    options.extension.math_dollars = true;
+    options.extension.math_dollars = math;
     options.parse.smart = true;
     options.render.r#unsafe = true;
     options
@@ -20,8 +20,13 @@ pub(crate) fn options() -> Options<'static> {
 
 /// Parses a page body. `body_line` is the file line the body starts on, so spans point into the whole file.
 pub fn parse(body: &str, body_line: usize) -> Document {
+    parse_with(body, body_line, false)
+}
+
+/// Like `parse`, with `$...$` and `$$...$$` read as math when `math` is set.
+pub fn parse_with(body: &str, body_line: usize, math: bool) -> Document {
     let arena = Arena::new();
-    let options = options();
+    let options = options(math);
     let root = comrak::parse_document(&arena, body, &options);
     let mut doc = convert(root, body_line - 1, &options);
     // comrak numbers footnotes by first reference and moves the definitions to the end of the document in that order.
@@ -142,6 +147,11 @@ fn convert<'a>(node: &'a AstNode<'a>, line_offset: usize, options: &Options) -> 
 
 /// Byte ranges of `body` covered by code blocks, inline code and math, where `{{` must stay literal.
 pub fn code_ranges(body: &str) -> Vec<std::ops::Range<usize>> {
+    code_ranges_with(body, false)
+}
+
+/// Like `code_ranges`; math spans count only when `math` is set.
+pub fn code_ranges_with(body: &str, math: bool) -> Vec<std::ops::Range<usize>> {
     let mut line_starts = vec![0];
     line_starts.extend(body.match_indices('\n').map(|(i, _)| i + 1));
     let offset = |line: usize, column: usize| {
@@ -149,7 +159,7 @@ pub fn code_ranges(body: &str) -> Vec<std::ops::Range<usize>> {
         (start + column - 1).min(body.len())
     };
     let arena = Arena::new();
-    let root = comrak::parse_document(&arena, body, &options());
+    let root = comrak::parse_document(&arena, body, &options(math));
     root.descendants()
         .filter_map(|node| {
             let ast = node.data.borrow();
@@ -300,9 +310,24 @@ mod tests {
     }
 
     #[test]
+    fn dollars_are_text_when_math_off() {
+        assert_eq!(
+            crate::html::render(&parse("costs $5 and $10\n", 1)),
+            "<p>costs $5 and $10</p>\n"
+        );
+        assert_eq!(crate::html::render(&parse("\\$x\\$\n", 1)), "<p>$x$</p>\n");
+    }
+
+    #[test]
+    fn code_ranges_ignore_dollar_spans_when_math_off() {
+        let body = "a $x^{{2}}$ b\n";
+        assert!(code_ranges(body).is_empty());
+    }
+
+    #[test]
     fn math_nodes_parse() {
         let mut found = Vec::new();
-        math_nodes(&parse("$a$ and\n\n$$\nb\n$$\n", 1), &mut found);
+        math_nodes(&parse_with("$a$ and\n\n$$\nb\n$$\n", 1, true), &mut found);
         assert_eq!(
             found,
             vec![
@@ -343,7 +368,10 @@ mod tests {
     #[test]
     fn code_ranges_cover_whole_math_spans() {
         let body = "a $x^{{2}}$ b\n\n$$\nq {{n}}\n$$\n";
-        let slices: Vec<&str> = code_ranges(body).iter().map(|r| &body[r.clone()]).collect();
+        let slices: Vec<&str> = code_ranges_with(body, true)
+            .iter()
+            .map(|r| &body[r.clone()])
+            .collect();
         assert_eq!(slices, ["$x^{{2}}$", "$$\nq {{n}}\n$$"]);
     }
 }

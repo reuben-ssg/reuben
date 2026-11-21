@@ -8,7 +8,7 @@ use super::{Html, IncludeFiles, collection, with_current_link};
 use crate::doc::Origin;
 use crate::html::{escape_text, render};
 use crate::links::{parse_source_link, resolve_tree, source_links};
-use crate::markdown::parse;
+use crate::markdown::parse_with;
 use crate::math::render_math;
 
 type RhaiResult<T> = Result<T, Box<EvalAltResult>>;
@@ -47,11 +47,14 @@ pub fn register(engine: &mut Engine, site_root: &Path, include_files: &IncludeFi
         .register_fn(
             "markdown",
             move |ctx: NativeCallContext, s: &str| -> RhaiResult<Html> {
-                let mut doc = parse(s, 1);
-                render_math(&mut doc).map_err(|errors| {
-                    let (span, message) = &errors[0];
-                    format!("math at {}:{}: {message}", span.line, span.column)
-                })?;
+                let math = with_current_link(|ctx| ctx.is_some_and(|c| c.math));
+                let mut doc = parse_with(s, 1, math);
+                if math {
+                    render_math(&mut doc).map_err(|errors| {
+                        let (span, message) = &errors[0];
+                        format!("math at {}:{}: {message}", span.line, span.column)
+                    })?;
+                }
                 // Anchors aren't checked here: the output may land anywhere on the page.
                 let messages: Vec<String> = with_current_link(|ctx| match ctx {
                     Some(ctx) => resolve_tree(&mut doc, &ctx.page_rel, &ctx.index, &ctx.base_path)

@@ -5,8 +5,9 @@ use assert_fs::prelude::*;
 use reuben_core::ErrorKind;
 use reuben_core::site::{BuildOptions, Failure, Site};
 
-fn try_build(body: &str) -> (TempDir, Result<(), Failure>) {
+fn try_build_with(body: &str, config: &str) -> (TempDir, Result<(), Failure>) {
     let tmp = TempDir::new().unwrap();
+    tmp.child("reuben.toml").write_str(config).unwrap();
     tmp.child("content/index.md").write_str(body).unwrap();
     let site = Site::load(tmp.path()).unwrap();
     let result = site
@@ -17,6 +18,10 @@ fn try_build(body: &str) -> (TempDir, Result<(), Failure>) {
         })
         .map(|_| ());
     (tmp, result)
+}
+
+fn try_build(body: &str) -> (TempDir, Result<(), Failure>) {
+    try_build_with(body, "[markdown]\nmath = true\n")
 }
 
 fn build(body: &str) -> String {
@@ -89,4 +94,13 @@ fn blocks_outside_math_still_evaluate() {
     let html = build("---\ntitle: T\n---\n$x^{{2}}$\n\n{{ 1 + 1 }}\n");
     assert!(html.contains("<msup>"), "{html}");
     assert!(html.contains("<p>2</p>"), "{html}");
+}
+
+#[test]
+fn math_is_off_by_default() {
+    let (tmp, result) = try_build_with("---\ntitle: T\n---\n$x^2$\n", "");
+    result.unwrap();
+    let html = fs::read_to_string(tmp.path().join("dist/index.html")).unwrap();
+    assert!(html.contains("$x^2$"), "{html}");
+    assert!(!html.contains("<math"), "{html}");
 }

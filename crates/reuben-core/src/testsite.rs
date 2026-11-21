@@ -17,7 +17,10 @@ pub fn generate(dir: &Path, pages: usize) -> io::Result<()> {
         }
         fs::write(path, text)
     };
-    write("reuben.toml", "title = \"Generated\"\n")?;
+    write(
+        "reuben.toml",
+        "title = \"Generated\"\n\n[markdown]\nmath = true\n",
+    )?;
     write(
         "layouts/default.html",
         "<!doctype html>\n<html><body><main>{{ content }}</main></body></html>\n",

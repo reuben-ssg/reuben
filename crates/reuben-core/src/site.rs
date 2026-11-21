@@ -284,12 +284,14 @@ impl Site {
             _ => Vec::new(),
         };
 
+        let math = config.markdown.math;
         pages.par_iter_mut().for_each(|page| {
             (page.pre_block_toc, page.summary) = page::precompute(
                 page.kind,
                 page.front_matter.description.as_deref(),
                 &page.body,
                 page.body_line,
+                math,
             );
         });
 
@@ -656,6 +658,7 @@ impl Site {
             index: Arc::clone(index),
             page_rel: page.rel.clone(),
             base_path: check::base_path(&self.config.base_url),
+            math: self.config.markdown.math,
         }
     }
 

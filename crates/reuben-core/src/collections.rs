@@ -224,7 +224,7 @@ mod tests {
             front_matter_sources: Default::default(),
             draft_excluded: false,
             pre_block_toc: Vec::new(),
-            summary: crate::page::precompute(PageKind::Markdown, description, body, 1).1,
+            summary: crate::page::precompute(PageKind::Markdown, description, body, 1, false).1,
             rules: reuben_a11y::RuleSet::all(),
         }
     }

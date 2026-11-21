@@ -80,6 +80,8 @@ pub struct LinkContext {
     /// The page's path relative to `content/`.
     pub page_rel: PathBuf,
     pub base_path: String,
+    /// Whether `markdown()` reads `$...$` as math.
+    pub math: bool,
 }
 
 /// Runs `f` with `ctx` as this thread's link context, then restores the previous one.
