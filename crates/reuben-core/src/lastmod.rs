@@ -12,7 +12,7 @@ use jiff::tz::TimeZone;
 /// The UTC date of each source's last commit when the index tracks it, otherwise of its modification time.
 ///
 /// A tracked file edited since its last commit still gets the commit date, and one that was never committed gets its file time.
-/// Reuben never reads working-tree content through git (no `status`, no diff), so filters and other repository config can't run commands.
+/// Reuben never reads working-tree content through git (no `status`, no diff) and never fetches, so filters, remotes and other repository config can't run commands.
 /// A source with neither a commit nor a file time is absent. Git problems of any kind fall back to modification times.
 pub fn source_dates(root: &Path, sources: &[&Path]) -> HashMap<PathBuf, Date> {
     let git = GitState::read(root);
@@ -88,8 +88,14 @@ fn git(root: &Path, args: &[&str]) -> Option<Vec<u8>> {
             "core.fsmonitor=false",
             "-c",
             "core.untrackedCache=false",
+            "-c",
+            "diff.relative=false",
+            // A shipped `.git/` can claim to be a partial clone, and fetching a missing object runs its `core.sshCommand`.
+            "-c",
+            "protocol.allow=never",
         ])
         .args(args)
+        .env("GIT_NO_LAZY_FETCH", "1")
         .env("GIT_TERMINAL_PROMPT", "0")
         .env("GIT_OPTIONAL_LOCKS", "0")
         .stdin(Stdio::null())
@@ -303,6 +309,22 @@ mod tests {
     }
 
     #[test]
+    fn lastmod_site_in_repo_subfolder_ignores_diff_relative() {
+        if !git_available() {
+            return;
+        }
+        let tmp = TempDir::new().unwrap();
+        let site = tmp.path().join("docs/site");
+        let file = site.join("content/a.md");
+        fs::create_dir_all(file.parent().unwrap()).unwrap();
+        fs::write(&file, "x").unwrap();
+        run_git(tmp.path(), &["init", "-q"], None);
+        commit_all(tmp.path(), "2023-01-02T12:00:00Z");
+        run_git(tmp.path(), &["config", "diff.relative", "true"], None);
+        assert_eq!(one(&site, &file), Some(date(2023, 1, 2)));
+    }
+
+    #[test]
     fn lastmod_handles_unusual_file_names() {
         if !git_available() {
             return;
@@ -355,6 +377,61 @@ mod tests {
         );
         assert_eq!(one(&repo, &file), Some(date(2024, 3, 5)));
         assert!(!marker.exists(), "repository config ran a command");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn lastmod_never_lazy_fetches_missing_objects() {
+        use std::os::unix::fs::PermissionsExt;
+
+        if !git_available() {
+            return;
+        }
+        let tmp = TempDir::new().unwrap();
+        let repo = tmp.path().join("repo");
+        let file = repo.join("content/a.md");
+        fs::create_dir_all(file.parent().unwrap()).unwrap();
+        fs::write(&file, "x").unwrap();
+        run_git(&repo, &["init", "-q"], None);
+        commit_all(&repo, "2024-03-05T12:00:00Z");
+        let old_tree = git_output(&repo, &["rev-parse", "HEAD:content"]);
+        fs::write(&file, "y").unwrap();
+        commit_all(&repo, "2024-06-07T12:00:00Z");
+        let (dir, name) = old_tree.split_at(2);
+        fs::remove_file(repo.join(".git/objects").join(dir).join(name)).unwrap();
+
+        let marker = tmp.path().join("ran");
+        let script = tmp.path().join("ssh.sh");
+        fs::write(
+            &script,
+            format!("#!/bin/sh\ntouch '{}'\nexit 1\n", marker.display()),
+        )
+        .unwrap();
+        fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).unwrap();
+        for (key, value) in [
+            ("core.repositoryformatversion", "1"),
+            ("extensions.partialClone", "origin"),
+            ("remote.origin.url", "ssh://git@example.invalid/repo.git"),
+            ("remote.origin.promisor", "true"),
+            ("core.sshCommand", script.to_str().unwrap()),
+        ] {
+            run_git(&repo, &["config", key, value], None);
+        }
+        let _ = source_dates(&repo, &[file.as_path()]);
+        assert!(!marker.exists(), "a lazy fetch ran core.sshCommand");
+    }
+
+    fn git_output(dir: &Path, args: &[&str]) -> String {
+        let out = Command::new("git")
+            .arg("-C")
+            .arg(dir)
+            .args(args)
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "git {args:?}: {out:?}");
+        String::from_utf8(out.stdout).unwrap().trim().to_string()
     }
 
     #[test]
