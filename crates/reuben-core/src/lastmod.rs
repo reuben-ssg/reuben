@@ -95,6 +95,8 @@ fn git(root: &Path, args: &[&str]) -> Option<Vec<u8>> {
             "protocol.allow=never",
         ])
         .args(args)
+        // Empty allows no transport and outranks every config layer, unlike `protocol.allow`.
+        .env("GIT_ALLOW_PROTOCOL", "")
         .env("GIT_NO_LAZY_FETCH", "1")
         .env("GIT_TERMINAL_PROMPT", "0")
         .env("GIT_OPTIONAL_LOCKS", "0")
@@ -413,6 +415,8 @@ mod tests {
             ("extensions.partialClone", "origin"),
             ("remote.origin.url", "ssh://git@example.invalid/repo.git"),
             ("remote.origin.promisor", "true"),
+            // A per-protocol key outranks `protocol.allow`.
+            ("protocol.ssh.allow", "always"),
             ("core.sshCommand", script.to_str().unwrap()),
         ] {
             run_git(&repo, &["config", key, value], None);
