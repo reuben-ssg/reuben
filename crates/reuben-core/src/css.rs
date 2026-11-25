@@ -1,15 +1,21 @@
 //! CSS processing with Lightning CSS: bundling local imports, minifying and lowering for browser targets.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
+use std::convert::Infallible;
 use std::fmt::Display;
 use std::path::{Component, Path, PathBuf};
 use std::sync::Mutex;
 
 use elsa::sync::FrozenMap;
 use lightningcss::bundler::{BundleErrorKind, Bundler, ResolveResult, SourceProvider};
+use lightningcss::rules::CssRule;
 use lightningcss::stylesheet::{MinifyOptions, ParserOptions, PrinterOptions, StyleSheet};
 use lightningcss::targets::{Browsers, Targets};
+use lightningcss::values::url::Url;
+use lightningcss::visit_types;
+use lightningcss::visitor::{Visit, VisitTypes, Visitor};
 
+use crate::assets::AssetMap;
 use crate::config::CssConfig;
 use crate::doc::Span;
 use crate::error::{Error, ErrorKind};
@@ -44,6 +50,8 @@ pub(crate) struct CssTemplates {
 ///
 /// A file in `overrides` replaces the one at the same relative path under `imports_root`, the way a site's static
 /// file replaces its theme's. Imports may reach either folder but nothing outside them.
+///
+/// With `assets`, every local `url()` is rewritten to the URL its static file builds to.
 pub(crate) fn process_with(
     source_path: &Path,
     css: &str,
@@ -51,15 +59,16 @@ pub(crate) fn process_with(
     overrides: Option<&Path>,
     cfg: &CssConfig,
     templates: &CssTemplates,
-) -> Result<String, Error> {
+    assets: Option<AssetUrls<'_>>,
+) -> Result<String, Vec<Error>> {
     let fail = |message: String| {
-        Error::new(
+        vec![Error::new(
             source_path,
             ErrorKind::Css {
                 message,
                 location: None,
             },
-        )
+        )]
     };
     let targets = targets(&cfg.targets).map_err(|m| fail(format!("css.targets: {m}")))?;
     let entry = normalize(source_path);
@@ -82,7 +91,7 @@ pub(crate) fn process_with(
             Some(loc) => (source_path.to_path_buf(), loc),
             None => return fail(kind.to_string()),
         };
-        Error::new(
+        vec![Error::new(
             path,
             ErrorKind::Css {
                 message: kind.to_string(),
@@ -92,7 +101,7 @@ pub(crate) fn process_with(
                     column: location.column as usize,
                 }),
             },
-        )
+        )]
     };
 
     let mut sheet = match bundle_root {
@@ -116,13 +125,13 @@ pub(crate) fn process_with(
                 } else {
                     provider.spelled(&cycle.importer)
                 };
-                return Err(Error::new(
+                return Err(vec![Error::new(
                     path,
                     ErrorKind::Css {
                         message: format!("import cycle: {}", cycle.names),
                         location: cycle.location,
                     },
-                ));
+                )]);
             }
             sheet
         }
@@ -134,6 +143,52 @@ pub(crate) fn process_with(
             StyleSheet::parse(css, options).map_err(|e| locate(&e.kind, e.loc.as_ref()))?
         }
     };
+    // Rewritten before minifying, so a `url()` that minifying drops or duplicates is still checked exactly once.
+    if let Some(assets) = assets {
+        let dirs = sheet
+            .sources
+            .iter()
+            .enumerate()
+            .map(|(i, source)| {
+                let rel = if i == 0 {
+                    Some(assets.entry_rel)
+                } else {
+                    let source = Path::new(source);
+                    provider
+                        .bases()
+                        .into_iter()
+                        .find_map(|b| source.strip_prefix(&b.norm).ok())
+                };
+                rel.map(|r| r.parent().unwrap_or(Path::new("")).to_path_buf())
+            })
+            .collect();
+        let mut rewriter = UrlRewriter {
+            map: assets.map,
+            dirs,
+            source: 0,
+            misses: Vec::new(),
+        };
+        let Ok(()) = sheet.visit(&mut rewriter);
+        if !rewriter.misses.is_empty() {
+            return Err(rewriter
+                .misses
+                .into_iter()
+                .map(|miss| {
+                    let path = match sheet.sources.get(miss.source as usize) {
+                        Some(file) if miss.source > 0 => provider.spelled(Path::new(file)),
+                        _ => source_path.to_path_buf(),
+                    };
+                    Error::new(
+                        path,
+                        ErrorKind::Css {
+                            message: format!("`url({})` isn't a static file", miss.value),
+                            location: Some(miss.location),
+                        },
+                    )
+                })
+                .collect());
+        }
+    }
     sheet
         .minify(MinifyOptions {
             targets,
@@ -148,6 +203,134 @@ pub(crate) fn process_with(
         })
         .map_err(|e| locate(&e.kind, e.loc.as_ref()))?;
     Ok(printed.code)
+}
+
+/// How to rewrite a stylesheet's `url()`s.
+#[derive(Clone, Copy)]
+pub(crate) struct AssetUrls<'a> {
+    pub(crate) map: &'a AssetMap,
+    /// The stylesheet's path in the static tree, which its relative `url()`s resolve against.
+    pub(crate) entry_rel: &'a Path,
+}
+
+/// A `url()` that names no static file.
+struct UrlMiss {
+    source: u32,
+    location: Span,
+    value: String,
+}
+
+/// Rewrites each local `url()` to the URL its static file builds to, collecting the ones that name no file.
+struct UrlRewriter<'a> {
+    map: &'a AssetMap,
+    /// The folder in the static tree of each of the sheet's sources, by source index. `None` when a source lies
+    /// outside it.
+    dirs: Vec<Option<PathBuf>>,
+    /// The source of the rule being visited. A `url()` has a location but no source index, so it takes its rule's.
+    source: u32,
+    misses: Vec<UrlMiss>,
+}
+
+impl<'i> Visitor<'i> for UrlRewriter<'_> {
+    type Error = Infallible;
+
+    fn visit_types(&self) -> VisitTypes {
+        visit_types!(URLS | RULES)
+    }
+
+    fn visit_rule(&mut self, rule: &mut CssRule<'i>) -> Result<(), Infallible> {
+        let outer = self.source;
+        if let Some(source) = rule_source(rule) {
+            self.source = source;
+        }
+        let Ok(()) = rule.visit_children(self);
+        self.source = outer;
+        Ok(())
+    }
+
+    fn visit_url(&mut self, url: &mut Url<'i>) -> Result<(), Infallible> {
+        let value: &str = &url.url;
+        if is_external_url(value) {
+            return Ok(());
+        }
+        let dir = self
+            .dirs
+            .get(self.source as usize)
+            .and_then(Option::as_deref);
+        match static_spec(dir, value).and_then(|spec| self.map.url(&spec).ok()) {
+            Some(rewritten) => url.url = rewritten.into(),
+            None => self.misses.push(UrlMiss {
+                source: self.source,
+                // Unlike a rule's, a `url()`'s line already counts from 1.
+                location: Span {
+                    line: url.loc.line as usize,
+                    column: url.loc.column as usize,
+                },
+                value: value.to_string(),
+            }),
+        }
+        Ok(())
+    }
+}
+
+/// The source index of the file `rule` came from, for the rules that record one.
+fn rule_source(rule: &CssRule) -> Option<u32> {
+    let loc = match rule {
+        CssRule::Media(r) => r.loc,
+        CssRule::Import(r) => r.loc,
+        CssRule::Style(r) => r.loc,
+        CssRule::Keyframes(r) => r.loc,
+        CssRule::FontFace(r) => r.loc,
+        CssRule::FontPaletteValues(r) => r.loc,
+        CssRule::FontFeatureValues(r) => r.loc,
+        CssRule::Page(r) => r.loc,
+        CssRule::Supports(r) => r.loc,
+        CssRule::CounterStyle(r) => r.loc,
+        CssRule::Namespace(r) => r.loc,
+        CssRule::MozDocument(r) => r.loc,
+        CssRule::Nesting(r) => r.loc,
+        CssRule::NestedDeclarations(r) => r.loc,
+        CssRule::Viewport(r) => r.loc,
+        CssRule::CustomMedia(r) => r.loc,
+        CssRule::LayerStatement(r) => r.loc,
+        CssRule::LayerBlock(r) => r.loc,
+        CssRule::Property(r) => r.loc,
+        CssRule::Container(r) => r.loc,
+        CssRule::Scope(r) => r.loc,
+        CssRule::StartingStyle(r) => r.loc,
+        CssRule::ViewTransition(r) => r.loc,
+        CssRule::PositionTry(r) => r.loc,
+        CssRule::Unknown(r) => r.loc,
+        CssRule::Ignored | CssRule::Custom(_) => return None,
+    };
+    Some(loc.source_index)
+}
+
+/// Whether a `url()` value points somewhere other than a static file: a scheme (`https:`, `data:`), a
+/// protocol-relative `//host/...`, a `#fragment` alone, or nothing at all.
+fn is_external_url(value: &str) -> bool {
+    let has_scheme = value.split_once(':').is_some_and(|(scheme, _)| {
+        scheme.starts_with(|c: char| c.is_ascii_alphabetic())
+            && scheme
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || "+-.".contains(c))
+    });
+    value.is_empty() || value.starts_with('#') || value.starts_with("//") || has_scheme
+}
+
+/// `value` as a path in the static tree with its `?query` or `#fragment` kept, resolved from `dir`, or from the
+/// root when it starts with `/`. `None` when it leaves the tree.
+fn static_spec(dir: Option<&Path>, value: &str) -> Option<String> {
+    let split = value.find(['?', '#']).unwrap_or(value.len());
+    let (path, suffix) = value.split_at(split);
+    let joined = match path.strip_prefix('/') {
+        Some(from_root) => PathBuf::from(from_root),
+        None => dir?.join(path),
+    };
+    let rel = normalize(&joined);
+    let inside = rel.components().all(|c| matches!(c, Component::Normal(_)));
+    (inside && rel.components().next().is_some())
+        .then(|| format!("{}{suffix}", rel.to_string_lossy().replace('\\', "/")))
 }
 
 #[derive(Debug)]
@@ -429,44 +612,69 @@ pub(crate) struct CssJob {
 }
 
 impl CssJob {
-    pub(crate) fn run(&self, cfg: &CssConfig, templates: &CssTemplates) -> Result<String, Error> {
+    /// With `assets`, `url()`s are rewritten to the URLs their static files build to.
+    pub(crate) fn run(
+        &self,
+        cfg: &CssConfig,
+        templates: &CssTemplates,
+        assets: Option<&AssetMap>,
+    ) -> Result<String, Vec<Error>> {
         let text;
         let (css, is_template) = match &self.input {
             CssInput::Text(t) => (t.as_str(), true),
             CssInput::File => {
-                let bytes = std::fs::read(&self.path).map_err(|e| Error::new(&self.path, e))?;
+                let bytes =
+                    std::fs::read(&self.path).map_err(|e| vec![Error::new(&self.path, e)])?;
                 text = String::from_utf8(bytes)
-                    .map_err(|_| Error::new(&self.path, ErrorKind::NotUtf8))?;
+                    .map_err(|_| vec![Error::new(&self.path, ErrorKind::NotUtf8)])?;
                 (text.as_str(), false)
             }
         };
-        process_with(
+        let assets = assets.map(|map| AssetUrls {
+            map,
+            entry_rel: &self.rel,
+        });
+        let result = process_with(
             &self.path,
             css,
             Some(&self.root),
             self.overrides.as_deref(),
             cfg,
             templates,
-        )
-        .map_err(|mut e| {
-            // A template's line numbers describe its rendered text, not the file on disk, so the error drops
-            // them and quotes the offending rendered line instead.
-            let rendered = if is_template && e.path == self.path {
-                Some(css)
-            } else {
-                templates
-                    .rendered
-                    .get(&normalize(&e.path))
-                    .map(String::as_str)
-            };
-            if let (Some(rendered), ErrorKind::Css { message, location }) = (rendered, &mut e.kind)
-                && let Some(at) = location.take()
-                && let Some(line) = rendered.lines().nth(at.line.saturating_sub(1))
-            {
-                message.push_str(&format!(" (in the rendered output: `{}`)", line.trim()));
-            }
-            e
+            assets,
+        );
+        result.map_err(|errors| {
+            errors
+                .into_iter()
+                .map(|e| self.quote_rendered(e, css, is_template, templates))
+                .collect()
         })
+    }
+
+    fn quote_rendered(
+        &self,
+        mut e: Error,
+        css: &str,
+        is_template: bool,
+        templates: &CssTemplates,
+    ) -> Error {
+        // A template's line numbers describe its rendered text, not the file on disk, so the error drops them and
+        // quotes the offending rendered line instead.
+        let rendered = if is_template && e.path == self.path {
+            Some(css)
+        } else {
+            templates
+                .rendered
+                .get(&normalize(&e.path))
+                .map(String::as_str)
+        };
+        if let (Some(rendered), ErrorKind::Css { message, location }) = (rendered, &mut e.kind)
+            && let Some(at) = location.take()
+            && let Some(line) = rendered.lines().nth(at.line.saturating_sub(1))
+        {
+            message.push_str(&format!(" (in the rendered output: `{}`)", line.trim()));
+        }
+        e
     }
 }
 
@@ -490,7 +698,14 @@ mod tests {
             None,
             cfg,
             &CssTemplates::default(),
+            None,
         )
+        .map_err(one)
+    }
+
+    fn one(mut errors: Vec<Error>) -> Error {
+        assert_eq!(errors.len(), 1, "{errors:?}");
+        errors.remove(0)
     }
 
     fn run(tmp: &TempDir, rel: &str, css: &str) -> Result<String, Error> {
@@ -585,6 +800,7 @@ mod tests {
             None,
             &CssConfig::default(),
             &templates,
+            None,
         )
         .unwrap();
         assert!(out.contains("--w:2px") && !out.contains("{{"), "{out}");
@@ -668,7 +884,9 @@ mod tests {
                 Some(&site),
                 &CssConfig::default(),
                 &CssTemplates::default(),
+                None,
             )
+            .map_err(one)
         };
         let out = run("@import \"_v.css\";\n@import \"_w.css\";\n").unwrap();
         assert!(
@@ -696,6 +914,162 @@ mod tests {
         let err = run(&tmp, "main.css", "@import \"_bad.css\";\n").unwrap_err();
         assert!(err.path.ends_with("_bad.css"), "{err}");
         assert_eq!(css_error(&err).1.map(|l| l.0), Some(2), "{err}");
+    }
+
+    fn asset_map() -> AssetMap {
+        let mut map = AssetMap::new(true, "");
+        for (rel, out) in [
+            ("img/a.png", "img/a.1111aaaa.png"),
+            ("img/b.png", "img/b.2222bbbb.png"),
+            ("fonts/f.woff2", "fonts/f.3333cccc.woff2"),
+            ("fonts/My Font.woff2", "fonts/My Font.4444dddd.woff2"),
+            ("css/icons.svg", "css/icons.5555eeee.svg"),
+        ] {
+            map.insert(rel.into(), out.into());
+        }
+        map
+    }
+
+    /// Processes `css` as the static file `rel` with `url()`s rewritten through [`asset_map`].
+    fn run_hashed(tmp: &TempDir, rel: &str, css: &str) -> Result<String, Vec<Error>> {
+        let dir = tmp.path().join("static");
+        let map = asset_map();
+        process_with(
+            &dir.join(rel),
+            css,
+            Some(&dir),
+            None,
+            &CssConfig::default(),
+            &CssTemplates::default(),
+            Some(AssetUrls {
+                map: &map,
+                entry_rel: Path::new(rel),
+            }),
+        )
+    }
+
+    #[test]
+    fn rewrites_relative_and_root_urls() {
+        let tmp = TempDir::new().unwrap();
+        let css =
+            "a{background:url(../img/a.png)} @font-face{font-family:F;src:url(/fonts/f.woff2)}";
+        let out = run_hashed(&tmp, "css/x.css", css).unwrap();
+        assert!(out.contains("url(/img/a.1111aaaa.png)"), "{out}");
+        assert!(out.contains("url(/fonts/f.3333cccc.woff2)"), "{out}");
+    }
+
+    #[test]
+    fn leaves_remote_data_and_fragment_urls() {
+        let tmp = TempDir::new().unwrap();
+        let css = "a{background:url(https://cdn.example/a.png)}\
+                   b{background:url(//cdn.example/b.png)}\
+                   c{background:url(\"data:image/gif;base64,R0lGOD\")}\
+                   d{filter:url(#blur)}";
+        let out = run_hashed(&tmp, "css/x.css", css).unwrap();
+        for kept in [
+            "https://cdn.example/a.png",
+            "//cdn.example/b.png",
+            "data:image/gif;base64,R0lGOD",
+            "url(#blur)",
+        ] {
+            assert!(out.contains(kept), "{kept} in {out}");
+        }
+    }
+
+    #[test]
+    fn imported_file_urls_resolve_from_the_imported_file() {
+        let tmp = TempDir::new().unwrap();
+        tmp.child("static/parts/p.css")
+            .write_str("/* p */\nb{background:url(../img/b.png)}")
+            .unwrap();
+        let css = "@import \"../parts/p.css\";\na{background:url(../img/a.png)}";
+        let out = run_hashed(&tmp, "css/x.css", css).unwrap();
+        assert!(out.contains("url(/img/b.2222bbbb.png)"), "{out}");
+        assert!(out.contains("url(/img/a.1111aaaa.png)"), "{out}");
+    }
+
+    #[test]
+    fn site_override_import_urls_resolve_in_the_static_tree() {
+        let tmp = TempDir::new().unwrap();
+        let theme = tmp.path().join("t/static");
+        let site = tmp.path().join("s/static");
+        tmp.child("t/static/parts/p.css")
+            .write_str("b{background:url(nope.png)}")
+            .unwrap();
+        tmp.child("s/static/parts/p.css")
+            .write_str("b{background:url(../img/b.png)}")
+            .unwrap();
+        let map = asset_map();
+        let out = process_with(
+            &theme.join("css/x.css"),
+            "@import \"../parts/p.css\" screen;\na{background:url(../img/a.png)}",
+            Some(&theme),
+            Some(&site),
+            &CssConfig::default(),
+            &CssTemplates::default(),
+            Some(AssetUrls {
+                map: &map,
+                entry_rel: Path::new("css/x.css"),
+            }),
+        )
+        .unwrap();
+        assert!(out.contains("url(/img/b.2222bbbb.png)"), "{out}");
+        assert!(out.contains("url(/img/a.1111aaaa.png)"), "{out}");
+    }
+
+    #[test]
+    fn keeps_query_and_fragment() {
+        let tmp = TempDir::new().unwrap();
+        let out = run_hashed(&tmp, "css/x.css", "a{background:url(icons.svg#x)}").unwrap();
+        assert!(out.contains("/css/icons.5555eeee.svg#x"), "{out}");
+    }
+
+    #[test]
+    fn percent_encoded_url_rewrites() {
+        let tmp = TempDir::new().unwrap();
+        let css = "@font-face{font-family:F;src:url(\"../fonts/My%20Font.woff2\")}";
+        let out = run_hashed(&tmp, "css/x.css", css).unwrap();
+        assert!(out.contains("/fonts/My%20Font.4444dddd.woff2"), "{out}");
+    }
+
+    #[test]
+    fn every_missing_url_is_reported() {
+        let tmp = TempDir::new().unwrap();
+        tmp.child("static/parts/p.css")
+            .write_str("/* p */\n  b{background:url(nope.png)}")
+            .unwrap();
+        let css = "@import \"../parts/p.css\";\na{color:red}\nc{background:url(../../escape.png)}";
+        let errs = run_hashed(&tmp, "css/x.css", css).unwrap_err();
+        let found: Vec<_> = errs
+            .iter()
+            .map(|e| {
+                let (message, location) = css_error(e);
+                let file = e.path.file_name().unwrap().to_string_lossy().into_owned();
+                (file, message, location)
+            })
+            .collect();
+        assert_eq!(
+            found,
+            [
+                (
+                    String::from("p.css"),
+                    String::from("`url(nope.png)` isn't a static file"),
+                    Some((2, 16))
+                ),
+                (
+                    String::from("x.css"),
+                    String::from("`url(../../escape.png)` isn't a static file"),
+                    Some((3, 14))
+                ),
+            ]
+        );
+    }
+
+    #[test]
+    fn no_map_leaves_urls_alone() {
+        let tmp = TempDir::new().unwrap();
+        let out = run(&tmp, "css/x.css", "a{background:url(../img/nope.png)}").unwrap();
+        assert!(out.contains("url(../img/nope.png)"), "{out}");
     }
 
     #[test]

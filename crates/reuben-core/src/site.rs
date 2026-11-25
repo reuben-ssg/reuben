@@ -516,7 +516,7 @@ impl Site {
         let processed = in_pool(pool.as_ref(), || {
             css_jobs
                 .par_iter()
-                .map(|job| job.run(&self.config.css, &templates))
+                .map(|job| job.run(&self.config.css, &templates, None))
                 .collect::<Vec<_>>()
         });
         for (job, result) in css_jobs.into_iter().zip(processed) {
@@ -526,7 +526,7 @@ impl Site {
                         .files
                         .insert(job.rel, OutputFile::Bytes(css.into_bytes()));
                 }
-                Err(e) => errors.push(e),
+                Err(e) => errors.extend(e),
             }
         }
 
