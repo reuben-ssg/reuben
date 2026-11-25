@@ -67,10 +67,11 @@ fn every_rule_fires_once() {
              #### Skipped\n\n\
              <h2 id=\"start\">Again</h2>\n\n\
              [click here](/tree/)\n\n\
-             ![](a.png)\n\n\
+             ![](/a.png)\n\n\
              [Gone](/nope/)\n\n\
              |  |  |\n| - | - |\n| a | b |\n",
         ),
+        ("static/a.png", "png"),
     ]);
     let all = findings(&tmp);
     for rule in Rule::ALL {
@@ -255,6 +256,30 @@ fn broken_link_and_draft_target() {
 }
 
 #[test]
+fn missing_stylesheet_and_image_are_reported() {
+    let tmp = site(&[
+        (
+            "layouts/default.html",
+            "<!doctype html><html lang=\"en\"><head><title>T</title><link rel=\"stylesheet\" href=\"/css/gone.css\"></head><body><main>{{ content }}<img src=\"/img/gone.png\" alt=\"\"></main></body></html>\n",
+        ),
+        ("content/index.md", "---\ntitle: Home\n---\n# Home\n"),
+    ]);
+    let all = findings(&tmp);
+    let mut messages: Vec<_> = with_rule(&all, Rule::LinkTarget)
+        .iter()
+        .map(|f| f.message.clone())
+        .collect();
+    messages.sort();
+    assert_eq!(
+        messages,
+        [
+            "references `/css/gone.css`, which isn't built",
+            "references `/img/gone.png`, which isn't built"
+        ]
+    );
+}
+
+#[test]
 fn base_url_path_links() {
     let tmp = site(&[
         ("reuben.toml", "base_url = \"https://e.x/blog/\"\n"),
@@ -359,8 +384,9 @@ fn findings_are_identical_across_jobs() {
 
 #[test]
 fn rule_switches_accumulate_per_layer() {
-    let page = "---\ntitle: T\na11y:\n  disable: [img-alt]\n---\n# T\n\n[click here](/quiet/a/) ![](a.png)\n";
+    let page = "---\ntitle: T\na11y:\n  disable: [img-alt]\n---\n# T\n\n[click here](/quiet/a/) ![](/a.png)\n";
     let tmp = site(&[
+        ("static/a.png", "png"),
         (
             "content/quiet/_dir.toml",
             "[a11y]\ndisable = [\"link-text\"]\n",

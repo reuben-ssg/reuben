@@ -1,5 +1,43 @@
 # Changelog
 
+## Unreleased
+
+### Added
+
+An `[assets]` table with `hash`, `headers` and `keep`, and an `asset()` template helper.
+Unknown keys in the table are config errors.
+`[assets]` is off by default: `hash` and `headers` default to `false` and `keep` to an empty list, so existing sites build as before.
+
+```toml
+[assets]
+hash = true
+headers = true
+```
+
+`hash = true` renames each static file to `<stem>.<8-hex>.<ext>`, where the hex is a hash of the file's content, so a changed file gets a new URL.
+Root-level static files and everything under `.well-known/` keep their names.
+`keep` is a list of globs for other files that should keep their names too.
+`hash` needs `[css] bundle = true`, and `headers` needs `hash`; without them the config is an error.
+`headers = true` writes a `_headers` file that gives hashed files `Cache-Control: public, max-age=31536000, immutable`.
+When every output under a folder is hashed, one `/<dir>/*` rule covers the folder; otherwise each file gets its own rule, up to 100 rules.
+The rules go after the ones in your own `_headers`, if you have one.
+`asset("css/site.css")` returns the file's root-relative URL, including the path of `base_url`, and the hashed name when hashing is on:
+
+```html
+<link rel="stylesheet" href="{{ asset("css/site.css") }}">
+```
+
+A path that matches no static file is a build error naming the file and line of the call, and the build reports every such error at once.
+With hashing on, each `url()` in your CSS points at the hashed name, including those inside `image-set()`, and a `url()` to a missing file is an error.
+A stylesheet can't name another stylesheet, with `asset()` or `url()`, while hashing is on.
+
+### Changed checks
+
+The `link-target` check now also checks `<link href>`, and `src` and `srcset` on `img`, `source`, `script`, `video` and `audio`.
+This applies to every site, whether or not it uses `[assets]`.
+A site with a broken `src`, `srcset` or `<link href>` will start failing checks after you upgrade.
+To fix it, correct the path, or turn the check off with `[a11y] disable = ["link-target"]`.
+
 ## 0.2.0 (2026-11-21)
 
 ### Changed defaults

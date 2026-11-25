@@ -6,7 +6,9 @@ use std::collections::{HashMap, HashSet};
 use std::ops::Range;
 use std::path::{Path, PathBuf};
 
-use reuben_a11y::{Item, LocalLink, Rule, RuleSet, check_page, check_tree, fragment_items};
+use reuben_a11y::{
+    Item, LinkKind, LocalLink, Rule, RuleSet, check_page, check_tree, fragment_items,
+};
 
 use crate::doc::{Document, Fill, Node, NodeKind, Origin, Span};
 use crate::html;
@@ -198,7 +200,10 @@ pub fn unbuilt_links(
             path: source.to_path_buf(),
             location: None,
             rule: Rule::LinkTarget,
-            message: format!("links to `{}`, which isn't built", link.href),
+            message: match link.kind {
+                LinkKind::Anchor => format!("links to `{}`, which isn't built", link.href),
+                LinkKind::Resource => format!("references `{}`, which isn't built", link.href),
+            },
             include: None,
             built: Some((built.to_path_buf(), link.line)),
         })

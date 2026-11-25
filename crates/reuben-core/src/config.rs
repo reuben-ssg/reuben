@@ -19,6 +19,7 @@ pub struct Config {
     pub sitemap: bool,
     pub css: CssConfig,
     pub markdown: MarkdownConfig,
+    pub assets: AssetsConfig,
     /// The accessibility rules that are on for every page, before a page's own switches.
     pub a11y: RuleSet,
     pub sources: BTreeMap<String, PathBuf>,
@@ -72,6 +73,27 @@ impl Default for CssConfig {
     }
 }
 
+/// The `[assets]` table: opt-in content-hashed names for static files.
+#[derive(Debug, Clone, PartialEq, Eq, Default, serde::Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct AssetsConfig {
+    pub hash: bool,
+    /// Emit a `_headers` file with long-lived caching for hashed files; needs `hash`.
+    pub headers: bool,
+    /// Globs of files that keep their original names.
+    pub keep: Vec<String>,
+}
+
+impl AssetsConfig {
+    /// The `keep` globs that parse; `load` reports the ones that don't.
+    pub fn keep_patterns(&self) -> Vec<glob::Pattern> {
+        self.keep
+            .iter()
+            .filter_map(|g| glob::Pattern::new(g).ok())
+            .collect()
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Default, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct CollectionConfig {
@@ -95,6 +117,8 @@ struct Raw {
     css: CssConfig,
     #[serde(default)]
     markdown: MarkdownConfig,
+    #[serde(default)]
+    assets: AssetsConfig,
     #[serde(default)]
     a11y: A11yConfig,
 }
@@ -171,6 +195,27 @@ pub fn load(root: &Path, env: Option<&str>) -> Result<Config, Error> {
             .join("; ");
         return Err(Error::new(blamed, ErrorKind::Config(message)));
     }
+    let mut problems = Vec::new();
+    if raw.assets.headers && !raw.assets.hash {
+        problems.push("assets: `headers = true` needs `hash = true`".to_string());
+    }
+    if raw.assets.hash && !raw.css.bundle {
+        problems.push("assets: `hash = true` needs `[css] bundle = true`".to_string());
+    }
+    for g in &raw.assets.keep {
+        if let Err(e) = glob::Pattern::new(g) {
+            problems.push(format!("assets.keep: invalid glob `{g}`: {e}"));
+        }
+    }
+    if !problems.is_empty() {
+        let blamed = layered
+            .sources
+            .get("assets.keep")
+            .or_else(|| layered.sources.get("assets.headers"))
+            .or_else(|| layered.sources.get("assets.hash"))
+            .unwrap_or(&path);
+        return Err(Error::new(blamed, ErrorKind::Config(problems.join("; "))));
+    }
     Ok(Config {
         title: raw.title.unwrap_or_default(),
         base_url: raw.base_url.unwrap_or_else(|| "/".into()),
@@ -180,6 +225,7 @@ pub fn load(root: &Path, env: Option<&str>) -> Result<Config, Error> {
         sitemap: raw.sitemap.unwrap_or(false),
         css: raw.css,
         markdown: raw.markdown,
+        assets: raw.assets,
         a11y,
         sources: layered.sources,
     })
@@ -500,6 +546,81 @@ mod tests {
         write(&tmp, "config/1.toml", "[markdown]\nmaths = true\n");
         let err = load(tmp.path(), None).unwrap_err();
         assert!(err.path.ends_with("config/1.toml"), "{err}");
+    }
+
+    #[test]
+    fn assets_defaults_off() {
+        let tmp = TempDir::new().unwrap();
+        let c = load(tmp.path(), None).unwrap();
+        assert!(!c.assets.hash && !c.assets.headers && c.assets.keep.is_empty());
+        assert!(c.assets.keep_patterns().is_empty());
+    }
+
+    #[test]
+    fn assets_table_parses() {
+        let tmp = TempDir::new().unwrap();
+        write(
+            &tmp,
+            "reuben.toml",
+            "[assets]\nhash = true\nheaders = true\nkeep = [\"favicon.*\"]\n",
+        );
+        let c = load(tmp.path(), None).unwrap();
+        assert!(c.assets.hash && c.assets.headers);
+        assert_eq!(c.assets.keep_patterns().len(), 1);
+        assert!(c.assets.keep_patterns()[0].matches("favicon.ico"));
+    }
+
+    #[test]
+    fn assets_headers_without_hash_is_an_error() {
+        let tmp = TempDir::new().unwrap();
+        write(&tmp, "reuben.toml", "[assets]\nheaders = true\n");
+        let err = load(tmp.path(), None).unwrap_err();
+        assert!(matches!(err.kind, ErrorKind::Config(_)), "{err}");
+        assert!(
+            err.to_string()
+                .contains("`headers = true` needs `hash = true`"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn assets_hash_needs_css_bundle() {
+        let tmp = TempDir::new().unwrap();
+        write(
+            &tmp,
+            "reuben.toml",
+            "[css]\nbundle = false\n[assets]\nhash = true\n",
+        );
+        let err = load(tmp.path(), None).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("`hash = true` needs `[css] bundle = true`"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn assets_bad_keep_glob_is_an_error() {
+        let tmp = TempDir::new().unwrap();
+        write(&tmp, "reuben.toml", "[assets]\nkeep = [\"[x\"]\n");
+        let err = load(tmp.path(), None).unwrap_err();
+        assert!(err.to_string().contains("[x"), "{err}");
+    }
+
+    #[test]
+    fn assets_errors_are_all_reported() {
+        let tmp = TempDir::new().unwrap();
+        write(
+            &tmp,
+            "reuben.toml",
+            "[assets]\nheaders = true\nkeep = [\"[x\"]\n",
+        );
+        let text = load(tmp.path(), None).unwrap_err().to_string();
+        assert!(
+            text.contains("`headers = true` needs `hash = true`"),
+            "{text}"
+        );
+        assert!(text.contains("[x"), "{text}");
     }
 
     #[test]

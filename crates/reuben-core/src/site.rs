@@ -2,7 +2,7 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fs;
-use std::io::Read;
+use std::io::{self, Read};
 use std::path::{Path, PathBuf};
 
 use rayon::prelude::*;
@@ -12,6 +12,7 @@ use std::sync::Arc;
 
 use reuben_a11y::{LocalLink, RuleSet};
 
+use crate::assets::{self, AssetMap};
 use crate::check::{self, Finding, TreeReport};
 use crate::collections;
 use crate::config::{self, Config};
@@ -27,7 +28,7 @@ use crate::output::{self, Output, OutputFile, check_out_dir, finish_atomic, prep
 use crate::page::Failed;
 use crate::route::{Route, route_for_page, route_for_template};
 use crate::script::helpers::url_for;
-use crate::script::{Html, LinkContext, ScriptEngine, with_link_context};
+use crate::script::{Html, LinkContext, ScriptEngine, take_asset_misses, with_link_context};
 use crate::sitemap;
 use crate::template::{self, Escape};
 use crate::theme::{PageShell, builtin_page};
@@ -173,6 +174,68 @@ impl Rendered {
             ids: HashSet::new(),
             anchors: Vec::new(),
         }
+    }
+}
+
+/// What a build has gathered so far, added to in page order so nothing depends on which thread finished first.
+struct Merged<'a> {
+    output: Output,
+    errors: Vec<Error>,
+    /// Each stylesheet to process, and whether it gets a hashed name.
+    css_jobs: Vec<(CssJob, bool)>,
+    templates: CssTemplates,
+    partial_pages: usize,
+    findings: Vec<Finding>,
+    page_links: Vec<(&'a Page, Vec<LocalLink>)>,
+    /// Only Markdown pages are anchor targets, keyed by their path under `content/`.
+    page_ids: HashMap<&'a Path, HashSet<String>>,
+    page_anchors: Vec<(&'a Page, Vec<AnchorRequest>)>,
+    /// HTML pages were written to staging as they rendered.
+    staged: bool,
+    /// The `keep` globs when hashing is on.
+    keep: Option<Vec<glob::Pattern>>,
+}
+
+impl<'a> Merged<'a> {
+    fn new(site: &Site, errors: Vec<Error>, drafts: &[&Page], staged: bool) -> Self {
+        Self {
+            output: Output::default(),
+            errors,
+            css_jobs: Vec::new(),
+            // CSS templates are imported as their rendered text. One that failed to load or render is imported as
+            // empty, since its own error is already reported and importers would only add noise.
+            templates: CssTemplates {
+                rendered: site
+                    .load_errors
+                    .iter()
+                    .filter(|e| is_css(&e.path))
+                    .map(|e| (css::normalize(&e.path), String::new()))
+                    .collect(),
+                unrendered: drafts
+                    .iter()
+                    .filter(|p| is_css(&p.route.file))
+                    .map(|p| css::normalize(&p.source))
+                    .collect(),
+            },
+            partial_pages: 0,
+            findings: Vec::new(),
+            page_links: Vec::new(),
+            page_ids: HashMap::new(),
+            page_anchors: Vec::new(),
+            staged,
+            keep: site
+                .config
+                .assets
+                .hash
+                .then(|| site.config.assets.keep_patterns()),
+        }
+    }
+
+    /// Whether the output at `rel` gets a hashed name.
+    fn hashable(&self, rel: &Path) -> bool {
+        self.keep
+            .as_ref()
+            .is_some_and(|keep| assets::is_hashable(rel, keep))
     }
 }
 
@@ -378,7 +441,6 @@ impl Site {
         let (collections, mut collection_errors) = collections::build(&pages, &self.config);
         errors.append(&mut collection_errors);
 
-        let mut output = Output::default();
         let index = Arc::new(self.page_index(opts.drafts));
         let scopes = page::SiteScopes {
             site: &self.site_map,
@@ -386,8 +448,8 @@ impl Site {
             collections: &collections,
             pages: &index,
         };
-        let render_one = |page: &&Page| -> Result<Rendered, Failed> {
-            let (html, tree, anchors) = self.render_page(page, &scopes)?;
+        let render_one = |page: &&Page, assets: &Arc<AssetMap>| -> Result<Rendered, Failed> {
+            let (html, tree, anchors) = self.render_page(page, &scopes, assets)?;
             splice::ensure_no_placeholders(&page.source, &html)
                 .map_err(|e| Failed::from(vec![e]))?;
             let mut done = check_html(page, html, tree, anchors);
@@ -418,115 +480,168 @@ impl Site {
                 },
             );
         // Skipped pages count as failed with nothing to add, so templated partials still import as empty.
-        let rendered: Vec<Result<Rendered, Failed>> = if self.includes_broken {
-            pages.iter().map(|_| Err(Failed::default())).collect()
-        } else {
-            in_pool(pool.as_ref(), || pages.par_iter().map(render_one).collect())
-        };
-        let mut css_jobs: Vec<CssJob> = Vec::new();
-        // CSS templates are imported as their rendered text. One that failed to load or render is imported as
-        // empty, since its own error is already reported and importers would only add noise.
-        let mut templates = CssTemplates {
-            rendered: self
-                .load_errors
-                .iter()
-                .filter(|e| is_css(&e.path))
-                .map(|e| (css::normalize(&e.path), String::new()))
-                .collect(),
-            unrendered: drafts
-                .iter()
-                .filter(|p| is_css(&p.route.file))
-                .map(|p| css::normalize(&p.source))
-                .collect(),
-        };
-        let mut partial_pages = 0;
-        let mut findings: Vec<Finding> = Vec::new();
-        let mut page_links: Vec<(&Page, Vec<LocalLink>)> = Vec::new();
-        // Only Markdown pages are anchor targets, keyed by their path under `content/`.
-        let mut page_ids: HashMap<&Path, HashSet<String>> = HashMap::new();
-        let mut page_anchors: Vec<(&Page, Vec<AnchorRequest>)> = Vec::new();
-        // Merged in page order so neither output, errors nor findings depend on which thread finished first.
-        for (page, result) in pages.iter().zip(rendered) {
-            let is_partial = is_partial_css(&page.route.file);
-            partial_pages += usize::from(is_partial);
-            let result = match result {
-                Err(_) if self.in_broken_dir(page) => Err(Failed::default()),
-                other => other,
+        let render_all =
+            |batch: &[&Page], assets: &Arc<AssetMap>| -> Vec<Result<Rendered, Failed>> {
+                if self.includes_broken {
+                    batch.iter().map(|_| Err(Failed::default())).collect()
+                } else {
+                    in_pool(pool.as_ref(), || {
+                        batch.par_iter().map(|p| render_one(p, assets)).collect()
+                    })
+                }
             };
-            if is_css(&page.route.file) {
-                let text = result
-                    .as_ref()
-                    .map_or_else(|_| String::new(), |r| r.html.clone());
-                templates
-                    .rendered
-                    .insert(css::normalize(&page.source), text);
-            }
-            match result {
-                Ok(_) if is_partial => {}
-                Ok(done) if is_css(&page.route.file) => {
-                    css_jobs.push(self.css_job(
-                        &page.route.file,
-                        &page.source,
-                        page.from_static,
-                        CssInput::Text(done.html),
-                    ));
-                }
-                Ok(done) => {
-                    findings.extend(done.findings);
-                    page_links.push((page, done.links));
-                    if page.kind == PageKind::Markdown {
-                        page_ids.insert(page.rel.as_path(), done.ids);
-                    }
-                    page_anchors.push((page, done.anchors));
-                    let file = if stage.is_some() {
-                        OutputFile::Staged
-                    } else {
-                        OutputFile::Bytes(done.html.into_bytes())
-                    };
-                    output.files.insert(page.route.file.clone(), file);
-                }
-                Err(mut failed) => {
-                    errors.append(&mut failed.errors);
-                    page_anchors.push((page, failed.anchors));
-                }
-            }
-        }
+        let run_css =
+            |jobs: &[(CssJob, bool)], templates: &CssTemplates, assets: Option<&AssetMap>| {
+                in_pool(pool.as_ref(), || {
+                    jobs.par_iter()
+                        .map(|(job, _)| job.run(&self.config.css, templates, assets))
+                        .collect::<Vec<_>>()
+                })
+            };
+        let mut m = Merged::new(self, errors, &drafts, stage.is_some());
         let statics = self.static_sources(opts.drafts);
         let mut static_copied = 0;
-        for (rel, src) in &statics {
-            if is_partial_css(rel) {
-                continue;
-            }
-            // Opened read-only now so unreadable sources are reported with the page errors, not at write time.
-            if let Err(e) = fs::File::open(src) {
-                errors.push(Error::new(src, e));
-                continue;
-            }
-            if is_css(rel) {
-                css_jobs.push(self.css_job(rel, src, false, CssInput::File));
-            } else {
-                static_copied += 1;
-                output
-                    .files
-                    .insert(rel.clone(), OutputFile::Copy(src.clone()));
-            }
-        }
-        let processed = in_pool(pool.as_ref(), || {
-            css_jobs
-                .par_iter()
-                .map(|job| job.run(&self.config.css, &templates))
-                .collect::<Vec<_>>()
-        });
-        for (job, result) in css_jobs.into_iter().zip(processed) {
-            match result {
-                Ok(css) => {
-                    output
-                        .files
-                        .insert(job.rel, OutputFile::Bytes(css.into_bytes()));
+        // The output names that carry a content hash.
+        let mut hashed: HashSet<PathBuf> = HashSet::new();
+        if self.config.assets.hash {
+            // Each step's output names are known before the next step refers to them: non-CSS files, then
+            // stylesheets (which may name those files), then HTML pages (which may name either).
+            let content_dir = self.root.join("content");
+            let mut map = AssetMap::new(true, &check::base_path(&self.config.base_url));
+            let mut copies = Vec::new();
+            for (rel, src) in &statics {
+                if is_partial_css(rel) {
+                    continue;
                 }
-                Err(e) => errors.push(e),
+                // Page-bundle assets under `content/` keep their names.
+                let hashable = !src.starts_with(&content_dir) && m.hashable(rel);
+                if !is_css(rel) {
+                    copies.push((rel, src, hashable));
+                } else if let Err(e) = fs::File::open(src) {
+                    unreadable(&mut m.errors, &mut map, rel, src, e);
+                } else {
+                    let job = self.css_job(rel, src, false, CssInput::File);
+                    m.css_jobs.push((job, hashable));
+                }
+            }
+            let names = in_pool(pool.as_ref(), || {
+                copies
+                    .par_iter()
+                    .map(|&(rel, src, hashable)| match hashable {
+                        true => assets::hashed_file_name(rel, src),
+                        // Opened read-only now so unreadable sources are reported with the page errors.
+                        false => fs::File::open(src).map(|_| rel.clone()),
+                    })
+                    .collect::<Vec<_>>()
+            });
+            for ((rel, src, hashable), name) in copies.into_iter().zip(names) {
+                match name {
+                    Ok(name) => {
+                        static_copied += 1;
+                        if hashable {
+                            hashed.insert(name.clone());
+                        }
+                        map.insert(rel.clone(), name.clone());
+                        m.output.files.insert(name, OutputFile::Copy(src.clone()));
+                    }
+                    Err(e) => unreadable(&mut m.errors, &mut map, rel, src, e),
+                }
+            }
+
+            let (css_pages, html_pages): (Vec<&Page>, Vec<&Page>) =
+                pages.iter().partition(|p| is_css(&p.route.file));
+            // Stylesheets get their names only after this step, so naming one from a stylesheet says why it can't.
+            let stylesheets = m.css_jobs.iter().map(|(job, _)| job.rel.clone()).chain(
+                css_pages
+                    .iter()
+                    .filter(|p| !is_partial_css(&p.route.file))
+                    .map(|p| p.route.file.clone()),
+            );
+            for rel in stylesheets {
+                map.add_pending(rel);
+            }
+            let assets = Arc::new(map);
+            let rendered = render_all(&css_pages, &assets);
+            self.merge_rendered(&mut m, &css_pages, rendered);
+
+            let mut map = Arc::unwrap_or_clone(assets);
+            let jobs = std::mem::take(&mut m.css_jobs);
+            let processed = run_css(&jobs, &m.templates, Some(&map));
+            for ((job, hashable), result) in jobs.into_iter().zip(processed) {
+                match result {
+                    Ok(css) => {
+                        let name = match hashable {
+                            true => assets::hashed_name(&job.rel, css.as_bytes()),
+                            false => job.rel.clone(),
+                        };
+                        map.insert(job.rel, name.clone());
+                        if hashable {
+                            hashed.insert(name.clone());
+                        }
+                        m.output
+                            .files
+                            .insert(name, OutputFile::Bytes(css.into_bytes()));
+                    }
+                    Err(e) => {
+                        m.errors.extend(e);
+                        map.insert(job.rel.clone(), job.rel);
+                    }
+                }
+            }
+            // A stylesheet that failed to render is already reported, so `asset()` on it isn't a second error.
+            for page in &css_pages {
+                if !is_partial_css(&page.route.file) && !map.knows(&page.route.file) {
+                    map.insert(page.route.file.clone(), page.route.file.clone());
+                }
+            }
+
+            let rendered = render_all(&html_pages, &Arc::new(map));
+            self.merge_rendered(&mut m, &html_pages, rendered);
+        } else {
+            let rendered = render_all(&pages, &self.asset_map(opts.drafts));
+            self.merge_rendered(&mut m, &pages, rendered);
+            for (rel, src) in &statics {
+                if is_partial_css(rel) {
+                    continue;
+                }
+                // Opened read-only now so unreadable sources are reported with the page errors, not at write time.
+                if let Err(e) = fs::File::open(src) {
+                    m.errors.push(Error::new(src, e));
+                    continue;
+                }
+                if is_css(rel) {
+                    let job = self.css_job(rel, src, false, CssInput::File);
+                    m.css_jobs.push((job, false));
+                } else {
+                    static_copied += 1;
+                    m.output
+                        .files
+                        .insert(rel.clone(), OutputFile::Copy(src.clone()));
+                }
+            }
+            let jobs = std::mem::take(&mut m.css_jobs);
+            let processed = run_css(&jobs, &m.templates, None);
+            for ((job, _), result) in jobs.into_iter().zip(processed) {
+                match result {
+                    Ok(css) => {
+                        m.output
+                            .files
+                            .insert(job.rel, OutputFile::Bytes(css.into_bytes()));
+                    }
+                    Err(e) => m.errors.extend(e),
+                }
             }
         }
+        let Merged {
+            mut output,
+            mut errors,
+            partial_pages,
+            mut findings,
+            page_links,
+            page_ids,
+            page_anchors,
+            ..
+        } = m;
 
         let mut warnings = Vec::new();
         if self.config.sitemap && !self.user_provides_sitemap(&pages, &statics) {
@@ -568,6 +683,36 @@ impl Site {
             }
         }
 
+        if self.config.assets.headers {
+            let existing = statics
+                .iter()
+                .find(|(rel, _)| rel == Path::new("_headers"))
+                .map(|(_, src)| (src, fs::read_to_string(src)));
+            let existing = match existing {
+                Some((_, Ok(text))) => Some(text),
+                Some((src, Err(e))) => {
+                    errors.push(Error::new(src, e));
+                    None
+                }
+                None => None,
+            };
+            let files: Vec<(PathBuf, bool)> = output
+                .files
+                .keys()
+                .map(|name| (name.clone(), hashed.contains(name)))
+                .collect();
+            let base = check::base_path(&self.config.base_url);
+            match assets::headers_file(&base, &files, existing.as_deref()) {
+                Ok(text) if !text.is_empty() => {
+                    output.files.insert(
+                        PathBuf::from("_headers"),
+                        OutputFile::Bytes(text.into_bytes()),
+                    );
+                }
+                Ok(_) => {}
+                Err(msg) => errors.push(Error::new("reuben.toml", ErrorKind::Config(msg))),
+            }
+        }
         // Unlike `link-target`, this runs on a failed build too: a target that didn't render is skipped, not blamed.
         for (page, anchors) in &page_anchors {
             for anchor in anchors {
@@ -617,6 +762,62 @@ impl Site {
             findings,
         };
         Ok((output, report))
+    }
+
+    /// Adds the rendered `batch` to `m`: HTML pages to the output, stylesheets to the CSS jobs.
+    fn merge_rendered<'a>(
+        &self,
+        m: &mut Merged<'a>,
+        batch: &[&'a Page],
+        rendered: Vec<Result<Rendered, Failed>>,
+    ) {
+        for (&page, result) in batch.iter().zip(rendered) {
+            let is_partial = is_partial_css(&page.route.file);
+            m.partial_pages += usize::from(is_partial);
+            let result = match result {
+                Err(_) if self.in_broken_dir(page) => Err(Failed::default()),
+                other => other,
+            };
+            if is_css(&page.route.file) {
+                let text = result
+                    .as_ref()
+                    .map_or_else(|_| String::new(), |r| r.html.clone());
+                m.templates
+                    .rendered
+                    .insert(css::normalize(&page.source), text);
+            }
+            match result {
+                Ok(_) if is_partial => {}
+                Ok(done) if is_css(&page.route.file) => {
+                    let job = self.css_job(
+                        &page.route.file,
+                        &page.source,
+                        page.from_static,
+                        CssInput::Text(done.html),
+                    );
+                    let hashable = m.hashable(&page.route.file);
+                    m.css_jobs.push((job, hashable));
+                }
+                Ok(done) => {
+                    m.findings.extend(done.findings);
+                    m.page_links.push((page, done.links));
+                    if page.kind == PageKind::Markdown {
+                        m.page_ids.insert(page.rel.as_path(), done.ids);
+                    }
+                    m.page_anchors.push((page, done.anchors));
+                    let file = if m.staged {
+                        OutputFile::Staged
+                    } else {
+                        OutputFile::Bytes(done.html.into_bytes())
+                    };
+                    m.output.files.insert(page.route.file.clone(), file);
+                }
+                Err(mut failed) => {
+                    m.errors.append(&mut failed.errors);
+                    m.page_anchors.push((page, failed.anchors));
+                }
+            }
+        }
     }
 
     /// Renders the site and swaps it into `opts.out`. A failed build leaves the previous output untouched.
@@ -704,19 +905,82 @@ impl Site {
         &self,
         page: &Page,
         scopes: &page::SiteScopes<'_>,
+        assets: &Arc<AssetMap>,
     ) -> Result<(String, Option<TreeReport>, Vec<AnchorRequest>), Failed> {
-        with_link_context(self.link_context(page, scopes.pages), || {
+        // Rayon reuses threads, so misses left by an earlier page must not leak into this one.
+        take_asset_misses();
+        let result = with_link_context(self.link_context(page, scopes.pages, assets), || {
             self.render_page_in_context(page, scopes)
-        })
+        });
+        // A miss in a layout or include is reported there, once per call site however many pages use it: `Error::sort`
+        // drops the repeats other pages add.
+        let mut seen = HashSet::new();
+        let misses: Vec<Error> = take_asset_misses()
+            .into_iter()
+            .filter(|m| seen.insert((m.file.clone(), m.location, m.miss.spec.clone())))
+            .map(|m| {
+                let path = if m.file.as_os_str().is_empty() {
+                    page.source.clone()
+                } else {
+                    m.file
+                };
+                let kind = ErrorKind::Asset {
+                    spec: m.miss.spec,
+                    location: m.location,
+                    stylesheet: m.miss.stylesheet,
+                };
+                Error::new(path, kind)
+            })
+            .collect();
+        if misses.is_empty() {
+            return result;
+        }
+        // A page that rendered still hands over its anchors, so its broken anchors are reported in the same run.
+        let mut failed = match result {
+            Ok((_, _, anchors)) => Failed {
+                errors: Vec::new(),
+                anchors,
+            },
+            Err(failed) => failed,
+        };
+        failed.errors.extend(misses);
+        Err(failed)
+    }
+
+    /// A map for `asset()` that names every static file and template stylesheet by its source path. A hashing build
+    /// makes its own as it goes.
+    pub(crate) fn asset_map(&self, drafts: bool) -> Arc<AssetMap> {
+        let mut map = AssetMap::new(
+            self.config.assets.hash,
+            &check::base_path(&self.config.base_url),
+        );
+        let stylesheets = self
+            .pages
+            .iter()
+            .filter(|p| (drafts || !p.draft_excluded) && is_css(&p.route.file))
+            .map(|p| p.route.file.clone());
+        let statics = self.static_sources(drafts).into_iter().map(|(rel, _)| rel);
+        for rel in statics.chain(stylesheets) {
+            if !is_partial_css(&rel) {
+                map.insert(rel.clone(), rel);
+            }
+        }
+        Arc::new(map)
     }
 
     /// What `url_for` and `markdown()` resolve source links against while `page` is being evaluated.
-    pub(crate) fn link_context(&self, page: &Page, index: &Arc<PageIndex>) -> LinkContext {
+    pub(crate) fn link_context(
+        &self,
+        page: &Page,
+        index: &Arc<PageIndex>,
+        assets: &Arc<AssetMap>,
+    ) -> LinkContext {
         LinkContext {
             index: Arc::clone(index),
             page_rel: page.rel.clone(),
             base_path: check::base_path(&self.config.base_url),
             markdown: self.config.markdown.clone(),
+            assets: Arc::clone(assets),
         }
     }
 
@@ -925,6 +1189,12 @@ pub(crate) fn include_dirs(root: &Path, config: &Config) -> Vec<PathBuf> {
         .chain([root.join("includes")])
         .filter(|d| d.is_dir())
         .collect()
+}
+
+/// Reports an unreadable static file and maps it to its own name, so `asset()` on it isn't a second error.
+fn unreadable(errors: &mut Vec<Error>, map: &mut AssetMap, rel: &Path, src: &Path, e: io::Error) {
+    errors.push(Error::new(src, e));
+    map.insert(rel.to_path_buf(), rel.to_path_buf());
 }
 
 fn in_pool<R: Send>(pool: Option<&rayon::ThreadPool>, f: impl FnOnce() -> R + Send) -> R {

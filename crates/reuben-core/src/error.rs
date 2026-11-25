@@ -37,6 +37,16 @@ pub enum ErrorKind {
         message: String,
         location: Option<Span>,
     },
+    /// `stylesheet` is set when `spec` names a stylesheet that exists but can't be named from another stylesheet.
+    #[error(
+        "asset `{spec}` {}",
+        if *stylesheet { crate::assets::STYLESHEET_MISS } else { "isn't a static file" }
+    )]
+    Asset {
+        spec: String,
+        location: Option<Span>,
+        stylesheet: bool,
+    },
     #[error("config: {0}")]
     Config(String),
     #[error("data: {0}")]
@@ -86,6 +96,15 @@ impl Clone for ErrorKind {
                 message: message.clone(),
                 location: *location,
             },
+            Self::Asset {
+                spec,
+                location,
+                stylesheet,
+            } => Self::Asset {
+                spec: spec.clone(),
+                location: *location,
+                stylesheet: *stylesheet,
+            },
             Self::Config(s) => Self::Config(s.clone()),
             Self::Data(s) => Self::Data(s.clone()),
             Self::UnknownRule(s) => Self::UnknownRule(s.clone()),
@@ -111,7 +130,7 @@ impl Error {
             ErrorKind::Script(e) => e.location,
             ErrorKind::Block(e) => Some(e.span),
             ErrorKind::Math { location, .. } | ErrorKind::Link { location, .. } => Some(*location),
-            ErrorKind::Css { location, .. } => *location,
+            ErrorKind::Css { location, .. } | ErrorKind::Asset { location, .. } => *location,
             _ => None,
         }
     }

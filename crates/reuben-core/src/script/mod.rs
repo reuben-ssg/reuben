@@ -9,6 +9,7 @@ pub(crate) use includes::list_rhai;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use crate::assets::{AssetMap, AssetMiss};
 use crate::blocks::{Block, BlockKind};
 use crate::config::MarkdownConfig;
 use crate::doc::{Origin, Span};
@@ -71,7 +72,19 @@ impl std::fmt::Debug for ScriptEngine {
 
 thread_local! {
     static CURRENT_FILE: std::cell::RefCell<String> = const { std::cell::RefCell::new(String::new()) };
+    /// Where the code being evaluated starts in `CURRENT_FILE`, so a position within it maps to a file position.
+    static CURRENT_START: std::cell::Cell<Span> = const { std::cell::Cell::new(Span { line: 1, column: 1 }) };
     static LINK_CONTEXT: std::cell::RefCell<Option<LinkContext>> = const { std::cell::RefCell::new(None) };
+    static ASSET_MISSES: std::cell::RefCell<Vec<RecordedMiss>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// An `asset()` call that named no file, with the file and position of the call.
+#[derive(Debug, PartialEq, Eq)]
+pub struct RecordedMiss {
+    pub miss: AssetMiss,
+    /// Empty when the call site isn't known.
+    pub file: PathBuf,
+    pub location: Option<Span>,
 }
 
 /// The page being rendered, which `url_for` and `markdown()` resolve source links against.
@@ -83,6 +96,43 @@ pub struct LinkContext {
     pub base_path: String,
     /// What `markdown()` reads and writes: math, code highlighting, footnote back-links.
     pub markdown: MarkdownConfig,
+    /// What `asset()` resolves static file paths against.
+    pub assets: Arc<AssetMap>,
+}
+
+/// Records `miss` against the call site: the include file and line when `ctx` is in an include, otherwise the file
+/// being evaluated, with the call's position mapped into it.
+fn record_asset_miss(ctx: &rhai::NativeCallContext, includes: &IncludeFiles, miss: AssetMiss) {
+    let pos = ctx.call_position();
+    let in_include = ctx
+        .call_source()
+        .filter(|source| includes.read().is_ok_and(|f| f.contains(*source)));
+    let (file, location) = match in_include {
+        Some(source) => (PathBuf::from(source), file_span(pos)),
+        None => {
+            let start = CURRENT_START.with(std::cell::Cell::get);
+            let location = pos.line().map(|line| Span {
+                line: start.line + line - 1,
+                column: match (line, pos.position().unwrap_or(1)) {
+                    (1, col) => start.column + col - 1,
+                    (_, col) => col,
+                },
+            });
+            (CURRENT_FILE.with(|f| PathBuf::from(&*f.borrow())), location)
+        }
+    };
+    ASSET_MISSES.with(|m| {
+        m.borrow_mut().push(RecordedMiss {
+            miss,
+            file,
+            location,
+        });
+    });
+}
+
+/// The `asset()` misses since the last call, in call order. Drains this thread's list.
+pub fn take_asset_misses() -> Vec<RecordedMiss> {
+    ASSET_MISSES.with(|m| std::mem::take(&mut *m.borrow_mut()))
 }
 
 /// Runs `f` with `ctx` as this thread's link context, then restores the previous one.
@@ -157,6 +207,7 @@ impl ScriptEngine {
     ) -> Result<Output, ScriptError> {
         let file_str = file.display().to_string();
         CURRENT_FILE.with(|f| f.borrow_mut().clone_from(&file_str));
+        CURRENT_START.with(|s| s.set(block.span));
         let map_pos = |pos: rhai::Position| {
             let (line, col) = (pos.line()?, pos.position().unwrap_or(1));
             Some(Span {
@@ -225,6 +276,7 @@ impl ScriptEngine {
     fn compile_file(&self, path: &Path) -> Result<rhai::AST, ScriptError> {
         let path_str = path.display().to_string();
         CURRENT_FILE.with(|f| f.borrow_mut().clone_from(&path_str));
+        CURRENT_START.with(|s| s.set(Span { line: 1, column: 1 }));
         let plain = |message: String, pos: rhai::Position| ScriptError {
             message,
             location: file_span(pos),

@@ -24,6 +24,7 @@ rhai.workspace = true
 walkdir.workspace = true
 rayon.workspace = true
 glob.workspace = true
+xxhash-rust.workspace = true
 jiff.workspace = true
 lightningcss.workspace = true
 elsa.workspace = true
