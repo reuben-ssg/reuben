@@ -438,3 +438,55 @@ fn hash_off_changes_no_names() {
     );
     assert!(dist(&tmp, "index.html").contains("href=\"/css/theme.css\""));
 }
+
+const LONG_CACHE: &str = "  Cache-Control: public, max-age=31536000, immutable";
+
+#[test]
+fn headers_written_only_when_on() {
+    let site = |headers: bool| {
+        site_of(&[
+            (
+                "reuben.toml",
+                &format!("base_url = \"/\"\n[assets]\nhash = true\nheaders = {headers}\n"),
+            ),
+            INDEX,
+            ("static/css/a.css", "a{}"),
+            ("static/img/a.png", "x"),
+            ("static/img/keep.png", "y"),
+            ("static/_headers", "/*\n  X-Frame-Options: DENY\n"),
+        ])
+    };
+    let on = site(true);
+    on.child("reuben.toml")
+        .write_str(
+            "base_url = \"/\"\n[assets]\nhash = true\nheaders = true\nkeep = [\"img/keep.*\"]\n",
+        )
+        .unwrap();
+    build(&on).unwrap();
+    let img = hashed(&on, "img/a.png");
+    assert_eq!(
+        dist(&on, "_headers"),
+        format!("/*\n  X-Frame-Options: DENY\n\n/css/*\n{LONG_CACHE}\n/{img}\n{LONG_CACHE}\n")
+    );
+
+    let off = site(false);
+    build(&off).unwrap();
+    assert_eq!(dist(&off, "_headers"), "/*\n  X-Frame-Options: DENY\n");
+}
+
+#[test]
+fn too_many_header_rules_is_a_config_error() {
+    let tmp = site_of(&[
+        (
+            "reuben.toml",
+            "base_url = \"/\"\n[assets]\nhash = true\nheaders = true\n",
+        ),
+        INDEX,
+        ("static/_headers", &"/x\n  A: b\n".repeat(101)),
+    ]);
+    let failure = build(&tmp).unwrap_err();
+    assert!(failure.errors.iter().any(|e| matches!(
+        &e.kind,
+        ErrorKind::Config(m) if m == "`_headers` would need 101 rules; Cloudflare allows 100"
+    )));
+}

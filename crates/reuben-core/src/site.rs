@@ -501,6 +501,8 @@ impl Site {
         let mut m = Merged::new(self, errors, &drafts, stage.is_some());
         let statics = self.static_sources(opts.drafts);
         let mut static_copied = 0;
+        // Every static file and stylesheet in the output, and whether its name is hashed.
+        let mut built: Vec<(PathBuf, bool)> = Vec::new();
         if self.config.assets.hash {
             // Each step's output names are known before the next step refers to them: non-CSS files, then
             // stylesheets (which may name those files), then HTML pages (which may name either).
@@ -532,10 +534,11 @@ impl Site {
                     })
                     .collect::<Vec<_>>()
             });
-            for ((rel, src, _), name) in copies.into_iter().zip(names) {
+            for ((rel, src, hashable), name) in copies.into_iter().zip(names) {
                 match name {
                     Ok(name) => {
                         static_copied += 1;
+                        built.push((name.clone(), hashable));
                         map.insert(rel.clone(), name.clone());
                         m.output.files.insert(name, OutputFile::Copy(src.clone()));
                     }
@@ -560,6 +563,7 @@ impl Site {
                             false => job.rel.clone(),
                         };
                         map.insert(job.rel, name.clone());
+                        built.push((name.clone(), hashable));
                         m.output
                             .files
                             .insert(name, OutputFile::Bytes(css.into_bytes()));
@@ -612,6 +616,33 @@ impl Site {
                     }
                     Err(e) => m.errors.extend(e),
                 }
+            }
+        }
+        if self.config.assets.headers {
+            let existing = statics
+                .iter()
+                .find(|(rel, _)| rel == Path::new("_headers"))
+                .map(|(_, src)| (src, fs::read_to_string(src)));
+            let existing = match existing {
+                Some((_, Ok(text))) => Some(text),
+                Some((src, Err(e))) => {
+                    m.errors.push(Error::new(src, e));
+                    None
+                }
+                None => None,
+            };
+            let base = check::base_path(&self.config.base_url);
+            match assets::headers_file(&base, &built, existing.as_deref()) {
+                Ok(text) if !text.is_empty() => {
+                    m.output.files.insert(
+                        PathBuf::from("_headers"),
+                        OutputFile::Bytes(text.into_bytes()),
+                    );
+                }
+                Ok(_) => {}
+                Err(msg) => m
+                    .errors
+                    .push(Error::new("reuben.toml", ErrorKind::Config(msg))),
             }
         }
         let Merged {

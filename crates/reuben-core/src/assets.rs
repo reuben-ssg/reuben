@@ -1,6 +1,6 @@
 //! Content-hashed names for static files, and the map from source paths to the names they build to.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs::File;
 use std::io::{self, Read};
 use std::path::{Path, PathBuf};
@@ -117,6 +117,61 @@ impl AssetMap {
         let out = self.files.get(&rel).ok_or_else(miss)?;
         Ok(format!("{}{suffix}", self.site_url(&rel, out)))
     }
+}
+
+const IMMUTABLE: &str = "  Cache-Control: public, max-age=31536000, immutable";
+
+/// The `_headers` text: `existing` first, then a long-cache rule for the hashed files in `files` (output path and
+/// whether it is hashed). A folder whose files, and those of every folder under it, are all hashed gets one `/*` rule,
+/// because `*` also matches across `/`; otherwise each hashed file in it gets its own rule.
+pub(crate) fn headers_file(
+    base_path: &str,
+    files: &[(PathBuf, bool)],
+    existing: Option<&str>,
+) -> Result<String, String> {
+    let base = base_path.trim_end_matches('/');
+    let url = |p: &Path| percent_encode(&p.to_string_lossy().replace('\\', "/"));
+    // Whether every file under each folder (itself or any folder below) is hashed.
+    let mut all: BTreeMap<PathBuf, bool> = BTreeMap::new();
+    for (file, hashed) in files {
+        for dir in file.ancestors().skip(1) {
+            let e = all.entry(dir.to_path_buf()).or_insert(true);
+            *e &= hashed;
+        }
+    }
+    let mut rules: BTreeMap<String, ()> = BTreeMap::new();
+    let mut covered: Vec<&Path> = Vec::new();
+    for (dir, &whole) in &all {
+        if dir.as_os_str().is_empty() || covered.iter().any(|c| dir.starts_with(c)) {
+            continue;
+        }
+        if whole {
+            rules.insert(format!("{base}/{}/*", url(dir)), ());
+            covered.push(dir);
+        }
+    }
+    for (file, hashed) in files {
+        if *hashed && !covered.iter().any(|c| file.starts_with(c)) {
+            rules.insert(format!("{base}/{}", url(file)), ());
+        }
+    }
+    let existing = existing.map(str::trim_end).filter(|t| !t.is_empty());
+    let total =
+        rules.len() + existing.map_or(0, |t| t.lines().filter(|l| l.starts_with('/')).count());
+    if total > 100 {
+        return Err(format!(
+            "`_headers` would need {total} rules; Cloudflare allows 100"
+        ));
+    }
+    let mut out = String::new();
+    if let Some(text) = existing {
+        out.push_str(text);
+        out.push_str("\n\n");
+    }
+    for rule in rules.keys() {
+        out.push_str(&format!("{rule}\n{IMMUTABLE}\n"));
+    }
+    Ok(out)
 }
 
 /// Encodes everything but ASCII alphanumerics and `-._~/`, so a path with spaces or non-ASCII is a valid URL.
@@ -314,5 +369,83 @@ mod tests {
             hashed_name(Path::new("css/a.css"), b"a{}"),
             PathBuf::from("css/a.b83bfb2b.css")
         );
+    }
+
+    fn files(list: &[(&str, bool)]) -> Vec<(PathBuf, bool)> {
+        list.iter().map(|(p, h)| (PathBuf::from(p), *h)).collect()
+    }
+
+    const RULE: &str = "  Cache-Control: public, max-age=31536000, immutable";
+
+    #[test]
+    fn whole_directories_get_one_rule() {
+        let f = files(&[
+            ("css/a.1.css", true),
+            ("css/b.2.css", true),
+            ("robots.txt", false),
+        ]);
+        assert_eq!(
+            headers_file("", &f, None).unwrap(),
+            format!("/css/*\n{RULE}\n")
+        );
+    }
+
+    #[test]
+    fn mixed_directory_gets_per_file_rules() {
+        let f = files(&[("img/a.1.png", true), ("img/keep.png", false)]);
+        assert_eq!(
+            headers_file("", &f, None).unwrap(),
+            format!("/img/a.1.png\n{RULE}\n")
+        );
+    }
+
+    #[test]
+    fn nested_unhashed_file_blocks_the_parent_rule() {
+        let f = files(&[
+            ("a/x.1.js", true),
+            ("a/b/keep.js", false),
+            ("a/c/y.2.js", true),
+        ]);
+        assert_eq!(
+            headers_file("", &f, None).unwrap(),
+            format!("/a/c/*\n{RULE}\n/a/x.1.js\n{RULE}\n")
+        );
+    }
+
+    #[test]
+    fn base_path_prefixes_rules() {
+        let f = files(&[
+            ("css/a.1.css", true),
+            ("img/a.1.png", true),
+            ("img/k.png", false),
+        ]);
+        assert_eq!(
+            headers_file("/docs/", &f, None).unwrap(),
+            format!("/docs/css/*\n{RULE}\n/docs/img/a.1.png\n{RULE}\n")
+        );
+    }
+
+    #[test]
+    fn existing_headers_are_kept_first() {
+        let f = files(&[("css/a.1.css", true)]);
+        assert_eq!(
+            headers_file("", &f, Some("/*\n  X-Frame-Options: DENY\n")).unwrap(),
+            format!("/*\n  X-Frame-Options: DENY\n\n/css/*\n{RULE}\n")
+        );
+    }
+
+    #[test]
+    fn over_100_rules_is_an_error() {
+        let many: Vec<(String, bool)> = (0..101).map(|i| (format!("d/f{i}.1.js"), true)).collect();
+        let mut f: Vec<(PathBuf, bool)> =
+            many.iter().map(|(p, h)| (PathBuf::from(p), *h)).collect();
+        f.push((PathBuf::from("d/keep.js"), false));
+        assert_eq!(
+            headers_file("", &f, None),
+            Err("`_headers` would need 101 rules; Cloudflare allows 100".to_string())
+        );
+        let existing = "/x\n  A: b\n".repeat(100);
+        let f = files(&[("css/a.1.css", true)]);
+        assert!(headers_file("", &f, Some(&existing)).is_err());
     }
 }
