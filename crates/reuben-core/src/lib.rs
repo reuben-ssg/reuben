@@ -2,6 +2,7 @@
 
 #![forbid(unsafe_code)]
 
+pub(crate) mod assets;
 pub mod blocks;
 pub mod check;
 pub mod collections;
