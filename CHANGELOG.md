@@ -6,6 +6,7 @@
 
 An `[assets]` table with `hash`, `headers` and `keep`, and an `asset()` template helper.
 Unknown keys in the table are config errors.
+`[assets]` is off by default: `hash` and `headers` default to `false` and `keep` to an empty list, so existing sites build as before.
 
 ```toml
 [assets]
@@ -26,8 +27,9 @@ The rules go after the ones in your own `_headers`, if you have one.
 <link rel="stylesheet" href="{{ asset("css/site.css") }}">
 ```
 
-A path that matches no static file is a build error, and the build reports every such error at once.
-With hashing on, each `url()` in your CSS points at the hashed name, and a `url()` to a missing file is an error.
+A path that matches no static file is a build error naming the file and line of the call, and the build reports every such error at once.
+With hashing on, each `url()` in your CSS points at the hashed name, including those inside `image-set()`, and a `url()` to a missing file is an error.
+A stylesheet can't name another stylesheet, with `asset()` or `url()`, while hashing is on.
 
 ### Changed checks
 
