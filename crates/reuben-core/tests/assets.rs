@@ -490,3 +490,30 @@ fn too_many_header_rules_is_a_config_error() {
         ErrorKind::Config(m) if m == "`_headers` would need 101 rules; Cloudflare allows 100"
     )));
 }
+
+#[test]
+fn headers_glob_skips_dirs_holding_pages_and_generated_files() {
+    let tmp = site_of(&[
+        (
+            "reuben.toml",
+            "base_url = \"/\"\n[assets]\nhash = true\nheaders = true\n",
+        ),
+        INDEX,
+        ("content/guide/x/index.md", "---\ntitle: X\n---\nx"),
+        ("content/guide/feed.xml.html", "<x/>"),
+        ("static/guide/img.png", "p"),
+        ("static/solo/a.png", "q"),
+    ]);
+    build(&tmp).unwrap();
+    let headers = dist(&tmp, "_headers");
+    let img = hashed(&tmp, "guide/img.png");
+    let solo_rule = format!("/solo/*\n{LONG_CACHE}\n");
+    assert_eq!(
+        headers,
+        format!(
+            "/guide/{}\n{LONG_CACHE}\n{solo_rule}",
+            img.strip_prefix("guide/").unwrap()
+        )
+    );
+    assert!(!headers.contains("/guide/*"));
+}

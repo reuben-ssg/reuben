@@ -501,8 +501,8 @@ impl Site {
         let mut m = Merged::new(self, errors, &drafts, stage.is_some());
         let statics = self.static_sources(opts.drafts);
         let mut static_copied = 0;
-        // Every static file and stylesheet in the output, and whether its name is hashed.
-        let mut built: Vec<(PathBuf, bool)> = Vec::new();
+        // The output names that carry a content hash.
+        let mut hashed: HashSet<PathBuf> = HashSet::new();
         if self.config.assets.hash {
             // Each step's output names are known before the next step refers to them: non-CSS files, then
             // stylesheets (which may name those files), then HTML pages (which may name either).
@@ -538,7 +538,9 @@ impl Site {
                 match name {
                     Ok(name) => {
                         static_copied += 1;
-                        built.push((name.clone(), hashable));
+                        if hashable {
+                            hashed.insert(name.clone());
+                        }
                         map.insert(rel.clone(), name.clone());
                         m.output.files.insert(name, OutputFile::Copy(src.clone()));
                     }
@@ -563,7 +565,9 @@ impl Site {
                             false => job.rel.clone(),
                         };
                         map.insert(job.rel, name.clone());
-                        built.push((name.clone(), hashable));
+                        if hashable {
+                            hashed.insert(name.clone());
+                        }
                         m.output
                             .files
                             .insert(name, OutputFile::Bytes(css.into_bytes()));
@@ -618,33 +622,6 @@ impl Site {
                 }
             }
         }
-        if self.config.assets.headers {
-            let existing = statics
-                .iter()
-                .find(|(rel, _)| rel == Path::new("_headers"))
-                .map(|(_, src)| (src, fs::read_to_string(src)));
-            let existing = match existing {
-                Some((_, Ok(text))) => Some(text),
-                Some((src, Err(e))) => {
-                    m.errors.push(Error::new(src, e));
-                    None
-                }
-                None => None,
-            };
-            let base = check::base_path(&self.config.base_url);
-            match assets::headers_file(&base, &built, existing.as_deref()) {
-                Ok(text) if !text.is_empty() => {
-                    m.output.files.insert(
-                        PathBuf::from("_headers"),
-                        OutputFile::Bytes(text.into_bytes()),
-                    );
-                }
-                Ok(_) => {}
-                Err(msg) => m
-                    .errors
-                    .push(Error::new("reuben.toml", ErrorKind::Config(msg))),
-            }
-        }
         let Merged {
             mut output,
             mut errors,
@@ -696,6 +673,36 @@ impl Site {
             }
         }
 
+        if self.config.assets.headers {
+            let existing = statics
+                .iter()
+                .find(|(rel, _)| rel == Path::new("_headers"))
+                .map(|(_, src)| (src, fs::read_to_string(src)));
+            let existing = match existing {
+                Some((_, Ok(text))) => Some(text),
+                Some((src, Err(e))) => {
+                    errors.push(Error::new(src, e));
+                    None
+                }
+                None => None,
+            };
+            let files: Vec<(PathBuf, bool)> = output
+                .files
+                .keys()
+                .map(|name| (name.clone(), hashed.contains(name)))
+                .collect();
+            let base = check::base_path(&self.config.base_url);
+            match assets::headers_file(&base, &files, existing.as_deref()) {
+                Ok(text) if !text.is_empty() => {
+                    output.files.insert(
+                        PathBuf::from("_headers"),
+                        OutputFile::Bytes(text.into_bytes()),
+                    );
+                }
+                Ok(_) => {}
+                Err(msg) => errors.push(Error::new("reuben.toml", ErrorKind::Config(msg))),
+            }
+        }
         // Unlike `link-target`, this runs on a failed build too: a target that didn't render is skipped, not blamed.
         for (page, anchors) in &page_anchors {
             for anchor in anchors {
