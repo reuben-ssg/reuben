@@ -1,14 +1,35 @@
 //! Content-hashed names for static files, and the map from source paths to the names they build to.
-#![allow(dead_code)] // later tasks use these items
 
 use std::collections::HashMap;
+use std::fs::File;
+use std::io::{self, Read};
 use std::path::{Path, PathBuf};
 
-use xxhash_rust::xxh3::xxh3_64;
+use xxhash_rust::xxh3::{Xxh3Default, xxh3_64};
 
 /// `rel` with an 8-hex-digit content hash inserted before the final extension.
 pub(crate) fn hashed_name(rel: &Path, bytes: &[u8]) -> PathBuf {
-    let hash = &format!("{:016x}", xxh3_64(bytes))[..8];
+    name_with_hash(rel, xxh3_64(bytes))
+}
+
+/// [`hashed_name`] for the file at `src`, read in chunks rather than all at once.
+pub(crate) fn hashed_file_name(rel: &Path, src: &Path) -> io::Result<PathBuf> {
+    let mut file = File::open(src)?;
+    let mut hasher = Xxh3Default::new();
+    let mut buf = vec![0; 64 * 1024];
+    loop {
+        match file.read(&mut buf) {
+            Ok(0) => break,
+            Ok(n) => hasher.update(&buf[..n]),
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(name_with_hash(rel, hasher.digest()))
+}
+
+fn name_with_hash(rel: &Path, digest: u64) -> PathBuf {
+    let hash = &format!("{digest:016x}")[..8];
     let stem = rel.file_stem().and_then(|s| s.to_str()).unwrap_or("");
     let name = match rel.extension().and_then(|e| e.to_str()) {
         Some(ext) => format!("{stem}.{hash}.{ext}"),
@@ -35,7 +56,7 @@ pub struct AssetMiss {
 }
 
 /// Source path to output path for every static file.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct AssetMap {
     enabled: bool,
     base_path: String,
@@ -243,6 +264,19 @@ mod tests {
         m.insert("a%+f.css".into(), "a%+f.1.css".into());
         assert_eq!(m.url("a%zz.css"), Ok("/a%25zz.1.css".to_string()));
         assert_eq!(m.url("a%+f.css"), Ok("/a%25%2Bf.1.css".to_string()));
+    }
+
+    #[test]
+    fn hashed_file_name_matches_hashed_name() {
+        let tmp = assert_fs::TempDir::new().unwrap();
+        let src = tmp.path().join("big.bin");
+        // Longer than one read chunk, so the streaming path joins chunks.
+        let bytes: Vec<u8> = (0..200_000u32).map(|i| (i % 251) as u8).collect();
+        std::fs::write(&src, &bytes).unwrap();
+        assert_eq!(
+            hashed_file_name(Path::new("a/big.bin"), &src).unwrap(),
+            hashed_name(Path::new("a/big.bin"), &bytes)
+        );
     }
 
     #[test]
