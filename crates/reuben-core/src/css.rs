@@ -11,6 +11,7 @@ use lightningcss::bundler::{BundleErrorKind, Bundler, ResolveResult, SourceProvi
 use lightningcss::rules::CssRule;
 use lightningcss::stylesheet::{MinifyOptions, ParserOptions, PrinterOptions, StyleSheet};
 use lightningcss::targets::{Browsers, Targets};
+use lightningcss::values::image::Image;
 use lightningcss::values::url::Url;
 use lightningcss::visit_types;
 use lightningcss::visitor::{Visit, VisitTypes, Visitor};
@@ -178,10 +179,15 @@ pub(crate) fn process_with(
                         Some(file) if miss.source > 0 => provider.spelled(Path::new(file)),
                         _ => source_path.to_path_buf(),
                     };
+                    let message = if miss.stylesheet {
+                        format!("`url({})`: {}", miss.value, crate::assets::STYLESHEET_MISS)
+                    } else {
+                        format!("`url({})` isn't a static file", miss.value)
+                    };
                     Error::new(
                         path,
                         ErrorKind::Css {
-                            message: format!("`url({})` isn't a static file", miss.value),
+                            message,
                             location: Some(miss.location),
                         },
                     )
@@ -218,6 +224,8 @@ struct UrlMiss {
     source: u32,
     location: Span,
     value: String,
+    /// The value names another stylesheet, whose hashed name isn't known yet.
+    stylesheet: bool,
 }
 
 /// Rewrites each local `url()` to the URL its static file builds to, collecting the ones that name no file.
@@ -235,7 +243,20 @@ impl<'i> Visitor<'i> for UrlRewriter<'_> {
     type Error = Infallible;
 
     fn visit_types(&self) -> VisitTypes {
-        visit_types!(URLS | RULES)
+        visit_types!(URLS | IMAGES | RULES)
+    }
+
+    // Lightning CSS doesn't visit the images inside `image-set()`, so this walks them itself.
+    fn visit_image(&mut self, image: &mut Image<'i>) -> Result<(), Infallible> {
+        match image {
+            Image::ImageSet(set) => {
+                for option in &mut set.options {
+                    self.visit_image(&mut option.image)?;
+                }
+                Ok(())
+            }
+            other => other.visit_children(self),
+        }
     }
 
     fn visit_rule(&mut self, rule: &mut CssRule<'i>) -> Result<(), Infallible> {
@@ -258,18 +279,24 @@ impl<'i> Visitor<'i> for UrlRewriter<'_> {
             .dirs
             .get(self.source as usize)
             .and_then(Option::as_deref);
-        match static_spec(dir, value).and_then(|spec| self.map.url(&spec).ok()) {
-            Some(rewritten) => url.url = rewritten.into(),
-            None => self.misses.push(UrlMiss {
-                source: self.source,
-                // Unlike a rule's, a `url()`'s line already counts from 1.
-                location: Span {
-                    line: url.loc.line as usize,
-                    column: url.loc.column as usize,
-                },
-                value: value.to_string(),
-            }),
-        }
+        let stylesheet = match static_spec(dir, value).map(|spec| self.map.url(&spec)) {
+            Some(Ok(rewritten)) => {
+                url.url = rewritten.into();
+                return Ok(());
+            }
+            Some(Err(miss)) => miss.stylesheet,
+            None => false,
+        };
+        self.misses.push(UrlMiss {
+            source: self.source,
+            // Unlike a rule's, a `url()`'s line already counts from 1.
+            location: Span {
+                line: url.loc.line as usize,
+                column: url.loc.column as usize,
+            },
+            value: value.to_string(),
+            stylesheet,
+        });
         Ok(())
     }
 }
@@ -1063,6 +1090,68 @@ mod tests {
                     Some((3, 14))
                 ),
             ]
+        );
+    }
+
+    #[test]
+    fn rewrites_image_set_urls_and_strings() {
+        let tmp = TempDir::new().unwrap();
+        let css = "a{background-image:image-set(url(../img/b.png) 1x, \"../img/a.png\" 2x)}\
+                   b{background-image:-webkit-image-set(url(../img/a.png) 1x, \"/img/b.png\" 2x)}";
+        let out = run_hashed(&tmp, "css/x.css", css).unwrap();
+        assert!(!out.contains("../img/"), "{out}");
+        assert!(
+            !out.contains("/img/b.png") && !out.contains("/img/a.png"),
+            "{out}"
+        );
+        assert!(
+            out.contains("image-set(\"/img/b.2222bbbb.png\" 1x,\"/img/a.1111aaaa.png\" 2x)"),
+            "{out}"
+        );
+        assert!(
+            out.contains("b{background-image:-webkit-image-set(url(/img/a.1111aaaa.png) 1x,url(/img/b.2222bbbb.png) 2x)}"),
+            "{out}"
+        );
+    }
+
+    #[test]
+    fn image_set_miss_is_reported() {
+        let tmp = TempDir::new().unwrap();
+        let css =
+            "a{color:red}\nb{background-image:image-set(url(../img/a.png) 1x, \"nope.png\" 2x)}";
+        let errs = run_hashed(&tmp, "css/x.css", css).unwrap_err();
+        let found: Vec<_> = errs.iter().map(css_error).collect();
+        assert_eq!(
+            found,
+            [(
+                String::from("`url(nope.png)` isn't a static file"),
+                Some((2, 52))
+            )]
+        );
+    }
+
+    #[test]
+    fn url_naming_a_pending_stylesheet_says_why() {
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path().join("static");
+        let mut map = asset_map();
+        map.add_pending("css/other.css".into());
+        let errs = process_with(
+            &dir.join("css/x.css"),
+            "a{background:url(other.css)}",
+            Some(&dir),
+            None,
+            &CssConfig::default(),
+            &CssTemplates::default(),
+            Some(AssetUrls {
+                map: &map,
+                entry_rel: Path::new("css/x.css"),
+            }),
+        )
+        .unwrap_err();
+        assert_eq!(
+            css_error(&one(errs)).0,
+            format!("`url(other.css)`: {}", crate::assets::STYLESHEET_MISS)
         );
     }
 

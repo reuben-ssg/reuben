@@ -49,10 +49,16 @@ pub(crate) fn is_hashable(rel: &Path, keep: &[glob::Pattern]) -> bool {
     !keep.iter().any(|p| p.matches(&text))
 }
 
+/// Why a stylesheet can't name another stylesheet while hashing.
+pub(crate) const STYLESHEET_MISS: &str =
+    "stylesheets can't reference other stylesheets' hashed names when [assets] hash is on";
+
 /// A reference to a static file that does not exist.
 #[derive(Debug, PartialEq, Eq)]
 pub struct AssetMiss {
     pub spec: String,
+    /// The file is a stylesheet whose output name isn't known yet, so it exists but can't be named.
+    pub stylesheet: bool,
 }
 
 /// Source path to output path for every static file.
@@ -61,8 +67,10 @@ pub struct AssetMap {
     enabled: bool,
     base_path: String,
     files: HashMap<PathBuf, PathBuf>,
-    /// The URL of every entry in `files`, as [`AssetMap::url`] returns it without a suffix.
+    /// The URL of every entry in `files`, as [`AssetMap::url`] returns it without a suffix. Only kept when enabled.
     urls: HashSet<String>,
+    /// Stylesheets that will be in the map once they're processed.
+    pending: HashSet<PathBuf>,
 }
 
 impl AssetMap {
@@ -73,10 +81,16 @@ impl AssetMap {
             base_path: base_path.trim_end_matches('/').to_string(),
             files: HashMap::new(),
             urls: HashSet::new(),
+            pending: HashSet::new(),
         }
     }
 
     pub fn insert(&mut self, rel: PathBuf, out: PathBuf) {
+        self.pending.remove(&rel);
+        if !self.enabled {
+            self.files.insert(rel, out);
+            return;
+        }
         let url = self.site_url(&rel, &out);
         if let Some(old) = self.files.insert(rel.clone(), out) {
             let old = self.site_url(&rel, &old);
@@ -85,8 +99,13 @@ impl AssetMap {
         self.urls.insert(url);
     }
 
+    /// Marks `rel` as a stylesheet not yet processed, so a reference to it is a miss that says why.
+    pub(crate) fn add_pending(&mut self, rel: PathBuf) {
+        self.pending.insert(rel);
+    }
+
     /// Whether `value` is already the URL of a file in the map (as `asset()` returns it), ignoring any `?query` or
-    /// `#fragment`.
+    /// `#fragment`. Always `false` when the map isn't enabled.
     pub fn is_url(&self, value: &str) -> bool {
         let split = value.find(['?', '#']).unwrap_or(value.len());
         self.urls.contains(&value[..split])
@@ -113,6 +132,7 @@ impl AssetMap {
         let rel = PathBuf::from(percent_decode(path.trim_start_matches('/')));
         let miss = || AssetMiss {
             spec: spec.to_string(),
+            stylesheet: self.pending.contains(&rel),
         };
         let out = self.files.get(&rel).ok_or_else(miss)?;
         Ok(format!("{}{suffix}", self.site_url(&rel, out)))
@@ -307,9 +327,33 @@ mod tests {
         assert_eq!(
             map(true, "").url("css/nope.css"),
             Err(AssetMiss {
-                spec: "css/nope.css".into()
+                spec: "css/nope.css".into(),
+                stylesheet: false,
             })
         );
+    }
+
+    #[test]
+    fn pending_stylesheet_is_a_stylesheet_miss_until_inserted() {
+        let mut m = map(true, "");
+        m.add_pending("css/b.css".into());
+        assert_eq!(
+            m.url("/css/b.css"),
+            Err(AssetMiss {
+                spec: "/css/b.css".into(),
+                stylesheet: true,
+            })
+        );
+        m.insert("css/b.css".into(), "css/b.1.css".into());
+        assert_eq!(m.url("css/b.css"), Ok("/css/b.1.css".to_string()));
+    }
+
+    #[test]
+    fn disabled_map_keeps_no_urls() {
+        let m = map(false, "");
+        assert!(m.urls.is_empty());
+        assert!(!m.is_url("/css/a.css"));
+        assert_eq!(m.url("css/a.css"), Ok("/css/a.css".to_string()));
     }
 
     #[test]
