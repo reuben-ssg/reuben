@@ -30,13 +30,13 @@ pub(crate) fn is_hashable(rel: &Path, keep: &[glob::Pattern]) -> bool {
 
 /// A reference to a static file that does not exist.
 #[derive(Debug, PartialEq, Eq)]
-pub(crate) struct AssetMiss {
+pub struct AssetMiss {
     pub spec: String,
 }
 
 /// Source path to output path for every static file.
 #[derive(Debug)]
-pub(crate) struct AssetMap {
+pub struct AssetMap {
     enabled: bool,
     base_path: String,
     files: HashMap<PathBuf, PathBuf>,
@@ -75,8 +75,25 @@ impl AssetMap {
         let out = self.files.get(&rel).ok_or_else(miss)?;
         let out = if self.enabled { out } else { &rel };
         let out = out.to_string_lossy().replace('\\', "/");
-        Ok(format!("{}/{out}{suffix}", self.base_path))
+        Ok(format!(
+            "{}/{}{suffix}",
+            self.base_path,
+            percent_encode(&out)
+        ))
     }
+}
+
+/// Encodes everything but ASCII alphanumerics and `-._~/`, so a path with spaces or non-ASCII is a valid URL.
+fn percent_encode(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for b in s.bytes() {
+        if b.is_ascii_alphanumeric() || b"-._~/".contains(&b) {
+            out.push(char::from(b));
+        } else {
+            out.push_str(&format!("%{b:02X}"));
+        }
+    }
+    out
 }
 
 fn percent_decode(s: &str) -> String {
@@ -87,6 +104,7 @@ fn percent_decode(s: &str) -> String {
         if bytes[i] == b'%'
             && let Some(v) = s
                 .get(i + 1..i + 3)
+                .filter(|h| h.bytes().all(|b| b.is_ascii_hexdigit()))
                 .and_then(|h| u8::from_str_radix(h, 16).ok())
         {
             out.push(v);
@@ -201,7 +219,37 @@ mod tests {
     fn url_decodes_percent_escapes() {
         assert_eq!(
             map(true, "").url("fonts/My%20Font.woff2"),
-            Ok("/fonts/My Font.1234abcd.woff2".to_string())
+            Ok("/fonts/My%20Font.1234abcd.woff2".to_string())
+        );
+    }
+
+    #[test]
+    fn url_keeps_query_and_fragment_suffix_as_given() {
+        assert_eq!(
+            map(true, "").url("css/a.css?a#b"),
+            Ok("/css/a.1234abcd.css?a#b".to_string())
+        );
+    }
+
+    #[test]
+    fn url_fragment_only_is_a_miss() {
+        assert!(map(true, "").url("#x").is_err());
+    }
+
+    #[test]
+    fn url_malformed_escapes_stay_literal() {
+        let mut m = map(true, "");
+        m.insert("a%zz.css".into(), "a%zz.1.css".into());
+        m.insert("a%+f.css".into(), "a%+f.1.css".into());
+        assert_eq!(m.url("a%zz.css"), Ok("/a%25zz.1.css".to_string()));
+        assert_eq!(m.url("a%+f.css"), Ok("/a%25%2Bf.1.css".to_string()));
+    }
+
+    #[test]
+    fn hashed_name_known_answer() {
+        assert_eq!(
+            hashed_name(Path::new("css/a.css"), b"a{}"),
+            PathBuf::from("css/a.b83bfb2b.css")
         );
     }
 }

@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 
 use rhai::{Array, Dynamic, Engine, EvalAltResult, NativeCallContext};
 
-use super::{Html, IncludeFiles, collection, with_current_link};
+use super::{Html, IncludeFiles, collection, record_asset_miss, with_current_link};
 use crate::config::MarkdownConfig;
 use crate::doc::Origin;
 use crate::html::{HtmlOptions, escape_text, render_opts};
@@ -25,7 +25,7 @@ fn origin_of(ctx: &NativeCallContext, files: &IncludeFiles) -> Option<Origin> {
 }
 
 /// The helper functions `register` and `register_url_for` add, for `reuben explain`.
-pub const NAMES: [&str; 7] = [
+pub const NAMES: [&str; 8] = [
     "raw",
     "escape",
     "markdown",
@@ -33,6 +33,7 @@ pub const NAMES: [&str; 7] = [
     "load_data",
     "url_for",
     "format_date",
+    "asset",
 ];
 
 pub fn register(engine: &mut Engine, site_root: &Path, include_files: &IncludeFiles) {
@@ -51,6 +52,22 @@ pub fn register(engine: &mut Engine, site_root: &Path, include_files: &IncludeFi
         .register_fn("load_data", move |path: &str| load_data(&root, path));
     register_markdown(engine, include_files, MarkdownConfig::default());
     register_url_for(engine, "/");
+    register_asset(engine);
+}
+
+/// `asset(path)`: the URL a static file is served at, hashed when `[assets] hash` is on.
+/// An unknown path comes back unchanged and is recorded, so the page reports every miss.
+fn register_asset(engine: &mut Engine) {
+    engine.register_fn("asset", |path: &str| -> RhaiResult<String> {
+        let url = with_current_link(|ctx| {
+            ctx.map(|c| c.assets.url(path))
+                .ok_or_else(|| "asset() only works while a page renders".to_string())
+        })?;
+        Ok(url.unwrap_or_else(|miss| {
+            record_asset_miss(miss.spec);
+            path.to_string()
+        }))
+    });
 }
 
 /// Registering again replaces the earlier `markdown`, so this is also how the site's `[markdown]` is applied.
@@ -311,5 +328,49 @@ mod tests {
         let engine = ScriptEngine::new(Path::new("."));
         let err = run(&engine, "format_date(\"soon\", \"%Y\")").unwrap_err();
         assert!(err.to_string().contains("soon"), "{err}");
+    }
+
+    fn with_assets<R>(f: impl FnOnce() -> R) -> R {
+        use crate::assets::AssetMap;
+        use crate::config::MarkdownConfig;
+        use crate::links::PageIndex;
+        use crate::script::{LinkContext, with_link_context};
+        let mut map = AssetMap::new(true, "/");
+        map.insert("css/a.css".into(), "css/a.1234abcd.css".into());
+        let ctx = LinkContext {
+            index: std::sync::Arc::new(PageIndex::default()),
+            page_rel: "p.md".into(),
+            base_path: "/".into(),
+            markdown: MarkdownConfig::default(),
+            assets: std::sync::Arc::new(map),
+        };
+        with_link_context(ctx, f)
+    }
+
+    #[test]
+    fn asset_returns_the_mapped_url() {
+        let engine = ScriptEngine::new(Path::new("."));
+        let v = with_assets(|| run(&engine, "asset(\"css/a.css\")")).unwrap();
+        assert_eq!(v.into_string().unwrap(), "/css/a.1234abcd.css");
+    }
+
+    #[test]
+    fn asset_records_every_miss() {
+        let engine = ScriptEngine::new(Path::new("."));
+        crate::script::take_asset_misses();
+        let v = with_assets(|| run(&engine, "asset(\"x.css\") + asset(\"y.png\")")).unwrap();
+        assert_eq!(v.into_string().unwrap(), "x.cssy.png");
+        assert_eq!(crate::script::take_asset_misses(), ["x.css", "y.png"]);
+    }
+
+    #[test]
+    fn asset_outside_a_page_render_is_an_error() {
+        let engine = ScriptEngine::new(Path::new("."));
+        let err = run(&engine, "asset(\"css/a.css\")").unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("asset() only works while a page renders"),
+            "{err}"
+        );
     }
 }

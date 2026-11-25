@@ -12,6 +12,7 @@ use std::sync::Arc;
 
 use reuben_a11y::{LocalLink, RuleSet};
 
+use crate::assets::AssetMap;
 use crate::check::{self, Finding, TreeReport};
 use crate::collections;
 use crate::config::{self, Config};
@@ -27,7 +28,7 @@ use crate::output::{self, Output, OutputFile, check_out_dir, finish_atomic, prep
 use crate::page::Failed;
 use crate::route::{Route, route_for_page, route_for_template};
 use crate::script::helpers::url_for;
-use crate::script::{Html, LinkContext, ScriptEngine, with_link_context};
+use crate::script::{Html, LinkContext, ScriptEngine, take_asset_misses, with_link_context};
 use crate::sitemap;
 use crate::template::{self, Escape};
 use crate::theme::{PageShell, builtin_page};
@@ -386,8 +387,9 @@ impl Site {
             collections: &collections,
             pages: &index,
         };
+        let assets = self.asset_map(opts.drafts);
         let render_one = |page: &&Page| -> Result<Rendered, Failed> {
-            let (html, tree, anchors) = self.render_page(page, &scopes)?;
+            let (html, tree, anchors) = self.render_page(page, &scopes, &assets)?;
             splice::ensure_no_placeholders(&page.source, &html)
                 .map_err(|e| Failed::from(vec![e]))?;
             let mut done = check_html(page, html, tree, anchors);
@@ -704,19 +706,54 @@ impl Site {
         &self,
         page: &Page,
         scopes: &page::SiteScopes<'_>,
+        assets: &Arc<AssetMap>,
     ) -> Result<(String, Option<TreeReport>, Vec<AnchorRequest>), Failed> {
-        with_link_context(self.link_context(page, scopes.pages), || {
+        // Rayon reuses threads, so misses left by an earlier page must not leak into this one.
+        take_asset_misses();
+        let result = with_link_context(self.link_context(page, scopes.pages, assets), || {
             self.render_page_in_context(page, scopes)
-        })
+        });
+        let mut seen = HashSet::new();
+        let misses: Vec<Error> = take_asset_misses()
+            .into_iter()
+            .filter(|spec| seen.insert(spec.clone()))
+            .map(|spec| Error::new(&page.source, ErrorKind::Asset { spec }))
+            .collect();
+        if misses.is_empty() {
+            return result;
+        }
+        let mut failed = result.err().unwrap_or_default();
+        failed.errors.extend(misses);
+        Err(failed)
+    }
+
+    /// The map `asset()` reads. Its output names are the source paths until hashing lands.
+    pub(crate) fn asset_map(&self, drafts: bool) -> Arc<AssetMap> {
+        let mut map = AssetMap::new(
+            self.config.assets.hash,
+            &check::base_path(&self.config.base_url),
+        );
+        for (rel, _) in self.static_sources(drafts) {
+            if !is_partial_css(&rel) {
+                map.insert(rel.clone(), rel);
+            }
+        }
+        Arc::new(map)
     }
 
     /// What `url_for` and `markdown()` resolve source links against while `page` is being evaluated.
-    pub(crate) fn link_context(&self, page: &Page, index: &Arc<PageIndex>) -> LinkContext {
+    pub(crate) fn link_context(
+        &self,
+        page: &Page,
+        index: &Arc<PageIndex>,
+        assets: &Arc<AssetMap>,
+    ) -> LinkContext {
         LinkContext {
             index: Arc::clone(index),
             page_rel: page.rel.clone(),
             base_path: check::base_path(&self.config.base_url),
             markdown: self.config.markdown.clone(),
+            assets: Arc::clone(assets),
         }
     }
 

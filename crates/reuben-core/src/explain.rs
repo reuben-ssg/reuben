@@ -96,14 +96,15 @@ impl Site {
                 collections: &collections,
                 pages: &index,
             };
-            let built = with_link_context(self.link_context(found, &index), || {
+            let assets = self.asset_map(true);
+            let built = with_link_context(self.link_context(found, &index, &assets), || {
                 page::build_scope(found, &self.engine, &self.config, &scopes)
             });
             match built {
                 // A sidecar that fails fails the render too, with the same error, so only a good one goes on.
                 Ok(scope) => {
                     self.sidecar_entries(found, &scope, &mut texts, &mut entries);
-                    if let Err(e) = self.render_page(found, &scopes)
+                    if let Err(e) = self.render_page(found, &scopes, &assets)
                         && !self.in_broken_dir(found)
                     {
                         errors.extend(e.errors);

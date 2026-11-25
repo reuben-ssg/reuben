@@ -9,6 +9,7 @@ pub(crate) use includes::list_rhai;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use crate::assets::AssetMap;
 use crate::blocks::{Block, BlockKind};
 use crate::config::MarkdownConfig;
 use crate::doc::{Origin, Span};
@@ -72,6 +73,7 @@ impl std::fmt::Debug for ScriptEngine {
 thread_local! {
     static CURRENT_FILE: std::cell::RefCell<String> = const { std::cell::RefCell::new(String::new()) };
     static LINK_CONTEXT: std::cell::RefCell<Option<LinkContext>> = const { std::cell::RefCell::new(None) };
+    static ASSET_MISSES: std::cell::RefCell<Vec<String>> = const { std::cell::RefCell::new(Vec::new()) };
 }
 
 /// The page being rendered, which `url_for` and `markdown()` resolve source links against.
@@ -83,6 +85,17 @@ pub struct LinkContext {
     pub base_path: String,
     /// What `markdown()` reads and writes: math, code highlighting, footnote back-links.
     pub markdown: MarkdownConfig,
+    /// What `asset()` resolves static file paths against.
+    pub assets: Arc<AssetMap>,
+}
+
+fn record_asset_miss(spec: String) {
+    ASSET_MISSES.with(|m| m.borrow_mut().push(spec));
+}
+
+/// The `asset()` misses since the last call, in call order. Drains this thread's list.
+pub fn take_asset_misses() -> Vec<String> {
+    ASSET_MISSES.with(|m| std::mem::take(&mut *m.borrow_mut()))
 }
 
 /// Runs `f` with `ctx` as this thread's link context, then restores the previous one.

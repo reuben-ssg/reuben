@@ -37,6 +37,8 @@ pub enum ErrorKind {
         message: String,
         location: Option<Span>,
     },
+    #[error("asset `{spec}` isn't a static file")]
+    Asset { spec: String },
     #[error("config: {0}")]
     Config(String),
     #[error("data: {0}")]
@@ -86,6 +88,7 @@ impl Clone for ErrorKind {
                 message: message.clone(),
                 location: *location,
             },
+            Self::Asset { spec } => Self::Asset { spec: spec.clone() },
             Self::Config(s) => Self::Config(s.clone()),
             Self::Data(s) => Self::Data(s.clone()),
             Self::UnknownRule(s) => Self::UnknownRule(s.clone()),
