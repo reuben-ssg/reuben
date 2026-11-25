@@ -52,22 +52,26 @@ pub fn register(engine: &mut Engine, site_root: &Path, include_files: &IncludeFi
         .register_fn("load_data", move |path: &str| load_data(&root, path));
     register_markdown(engine, include_files, MarkdownConfig::default());
     register_url_for(engine, "/");
-    register_asset(engine);
+    register_asset(engine, include_files);
 }
 
 /// `asset(path)`: the URL a static file is served at, hashed when `[assets] hash` is on.
-/// An unknown path comes back unchanged and is recorded, so the page reports every miss.
-fn register_asset(engine: &mut Engine) {
-    engine.register_fn("asset", |path: &str| -> RhaiResult<String> {
-        let url = with_current_link(|ctx| {
-            ctx.map(|c| c.assets.url(path))
-                .ok_or_else(|| "asset() only works while a page renders".to_string())
-        })?;
-        Ok(url.unwrap_or_else(|miss| {
-            record_asset_miss(miss.spec);
-            path.to_string()
-        }))
-    });
+/// An unknown path comes back unchanged and is recorded with its call site, so the build reports every miss.
+fn register_asset(engine: &mut Engine, include_files: &IncludeFiles) {
+    let files = include_files.clone();
+    engine.register_fn(
+        "asset",
+        move |ctx: NativeCallContext, path: &str| -> RhaiResult<String> {
+            let url = with_current_link(|link| {
+                link.map(|c| c.assets.url(path))
+                    .ok_or_else(|| "asset() only works while a page renders".to_string())
+            })?;
+            Ok(url.unwrap_or_else(|miss| {
+                record_asset_miss(&ctx, &files, miss);
+                path.to_string()
+            }))
+        },
+    );
 }
 
 /// Registering again replaces the earlier `markdown`, so this is also how the site's `[markdown]` is applied.
@@ -360,7 +364,11 @@ mod tests {
         crate::script::take_asset_misses();
         let v = with_assets(|| run(&engine, "asset(\"x.css\") + asset(\"y.png\")")).unwrap();
         assert_eq!(v.into_string().unwrap(), "x.cssy.png");
-        assert_eq!(crate::script::take_asset_misses(), ["x.css", "y.png"]);
+        let specs: Vec<_> = crate::script::take_asset_misses()
+            .into_iter()
+            .map(|m| m.miss.spec)
+            .collect();
+        assert_eq!(specs, ["x.css", "y.png"]);
     }
 
     #[test]

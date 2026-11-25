@@ -3,7 +3,7 @@
 //! Every later stage (Rhai blocks, accessibility checks, HTML output) walks this tree, never the parser's own AST.
 
 /// A 1-based position in the original file, counting front matter lines.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 pub struct Span {
     pub line: usize,
     pub column: usize,

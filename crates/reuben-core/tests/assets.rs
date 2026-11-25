@@ -5,6 +5,7 @@ use std::path::Path;
 use assert_fs::TempDir;
 use assert_fs::prelude::*;
 use reuben_core::error::ErrorKind;
+use reuben_core::links::LinkProblem;
 use reuben_core::output::OutputFile;
 use reuben_core::site::{BuildOptions, Failure, OUTPUT_MARKER, RenderOptions, Site};
 
@@ -112,7 +113,7 @@ fn asset_misses_on_two_pages_are_all_reported() {
     let errors = &failure.errors;
     let misses: Vec<_> = errors
         .iter()
-        .filter(|e| matches!(&e.kind, ErrorKind::Asset { spec } if spec == "nope.css"))
+        .filter(|e| matches!(&e.kind, ErrorKind::Asset { spec, .. } if spec == "nope.css"))
         .collect();
     assert_eq!(misses.len(), 2, "{errors:?}");
 }
@@ -300,7 +301,7 @@ fn asset_on_a_stylesheet_from_a_stylesheet_is_a_miss() {
     assert!(
         errors
             .iter()
-            .any(|e| matches!(&e.kind, ErrorKind::Asset { spec } if spec == "css/site.css")),
+            .any(|e| matches!(&e.kind, ErrorKind::Asset { spec, .. } if spec == "css/site.css")),
         "{errors:?}"
     );
 }
@@ -364,7 +365,7 @@ fn asset_and_url_misses_reported_in_one_build() {
     assert!(
         errors
             .iter()
-            .any(|e| matches!(&e.kind, ErrorKind::Asset { spec } if spec == "img/nope.png")),
+            .any(|e| matches!(&e.kind, ErrorKind::Asset { spec, .. } if spec == "img/nope.png")),
         "{errors:?}"
     );
     assert!(
@@ -516,4 +517,170 @@ fn headers_glob_skips_dirs_holding_pages_and_generated_files() {
         )
     );
     assert!(!headers.contains("/guide/*"));
+}
+
+/// Each error as (path relative to the site, line, message), sorted the way the build reports them.
+fn reported(tmp: &TempDir, failure: &Failure) -> Vec<(String, Option<usize>, String)> {
+    failure
+        .errors
+        .iter()
+        .map(|e| {
+            let path = e.path.strip_prefix(tmp.path()).unwrap_or(&e.path);
+            (
+                path.to_string_lossy().replace('\\', "/"),
+                e.location().map(|l| l.line),
+                e.kind.to_string(),
+            )
+        })
+        .collect()
+}
+
+#[test]
+fn asset_miss_keeps_the_pages_broken_anchor_errors() {
+    let tmp = site_of(&[
+        (
+            "content/a.md",
+            "---\ntitle: A\n---\n{{ asset(\"css/nope.css\") }}\n\n[x](b.md#nope)\n",
+        ),
+        ("content/b.md", "---\ntitle: B\n---\n# B\n"),
+    ]);
+    let failure = build(&tmp).unwrap_err();
+    let errors = &failure.errors;
+    assert!(
+        errors.iter().any(|e| e.path.ends_with("a.md")
+            && matches!(&e.kind, ErrorKind::Asset { spec, .. } if spec == "css/nope.css")),
+        "{errors:?}"
+    );
+    assert!(
+        errors.iter().any(|e| e.path.ends_with("a.md")
+            && matches!(&e.kind, ErrorKind::Link { problem: LinkProblem::NoAnchor { fragment, .. }, .. } if fragment == "nope")),
+        "{errors:?}"
+    );
+}
+
+#[test]
+fn layout_asset_miss_is_reported_once_at_the_layout() {
+    let tmp = site_of(&[
+        (
+            "layouts/default.html",
+            "<html>\n<link href=\"{{ asset(\"css/nope.css\") }}\">{{ content }}\n",
+        ),
+        ("content/a.md", "---\ntitle: A\n---\na"),
+        ("content/b.md", "---\ntitle: B\n---\nb"),
+        ("content/c.md", "---\ntitle: C\n---\nc"),
+    ]);
+    let failure = build(&tmp).unwrap_err();
+    assert_eq!(
+        reported(&tmp, &failure),
+        [(
+            "layouts/default.html".to_string(),
+            Some(2),
+            "asset `css/nope.css` isn't a static file".to_string()
+        )]
+    );
+}
+
+#[test]
+fn include_asset_miss_is_reported_at_the_include() {
+    let tmp = site_of(&[
+        (
+            "includes/logo.rhai",
+            "// logo\nfn logo() {\n    asset(\"img/nope.png\")\n}\n",
+        ),
+        ("content/a.md", "---\ntitle: A\n---\n{{ logo() }}"),
+        ("content/b.md", "---\ntitle: B\n---\n{{ logo() }}"),
+    ]);
+    let failure = build(&tmp).unwrap_err();
+    assert_eq!(
+        reported(&tmp, &failure),
+        [(
+            "includes/logo.rhai".to_string(),
+            Some(3),
+            "asset `img/nope.png` isn't a static file".to_string()
+        )]
+    );
+}
+
+#[test]
+fn page_asset_miss_names_the_page_and_line() {
+    let tmp = site_of(&[
+        (
+            "layouts/default.html",
+            "<link href=\"{{ asset(\"css/nope.css\") }}\">{{ content }}\n",
+        ),
+        (
+            "content/a.md",
+            "---\ntitle: A\n---\n\ntext {{ asset(\"img/nope.png\") }}\n",
+        ),
+    ]);
+    let failure = build(&tmp).unwrap_err();
+    assert_eq!(
+        reported(&tmp, &failure),
+        [
+            (
+                "content/a.md".to_string(),
+                Some(5),
+                "asset `img/nope.png` isn't a static file".to_string()
+            ),
+            (
+                "layouts/default.html".to_string(),
+                Some(1),
+                "asset `css/nope.css` isn't a static file".to_string()
+            ),
+        ]
+    );
+}
+
+#[test]
+fn asset_miss_inside_url_in_a_template_stylesheet_is_one_error() {
+    let tmp = site_of(&[
+        HASH_ON,
+        INDEX,
+        (
+            "content/css/theme.css",
+            "---\n---\nb { background: url(\"{{ asset(\"img/nope.png\") }}\"); }\n",
+        ),
+    ]);
+    let failure = build(&tmp).unwrap_err();
+    assert_eq!(
+        reported(&tmp, &failure),
+        [(
+            "content/css/theme.css".to_string(),
+            Some(3),
+            "asset `img/nope.png` isn't a static file".to_string()
+        )]
+    );
+}
+
+const STYLESHEET_MISS: &str =
+    "stylesheets can't reference other stylesheets' hashed names when [assets] hash is on";
+
+#[test]
+fn naming_a_stylesheet_from_a_stylesheet_says_why() {
+    let tmp = site_of(&[
+        HASH_ON,
+        INDEX,
+        ("static/css/site.css", "a { color: red; }\n"),
+        ("static/css/other.css", "a { background: url(site.css); }\n"),
+        (
+            "content/css/theme.css",
+            "---\n---\nb { --x: \"{{ asset(\"css/site.css\") }}\"; }\n",
+        ),
+    ]);
+    let failure = build(&tmp).unwrap_err();
+    assert_eq!(
+        reported(&tmp, &failure),
+        [
+            (
+                "content/css/theme.css".to_string(),
+                Some(3),
+                format!("asset `css/site.css` {STYLESHEET_MISS}")
+            ),
+            (
+                "static/css/other.css".to_string(),
+                Some(1),
+                format!("css: `url(site.css)`: {STYLESHEET_MISS}")
+            ),
+        ]
+    );
 }

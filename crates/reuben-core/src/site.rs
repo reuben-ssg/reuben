@@ -550,6 +550,16 @@ impl Site {
 
             let (css_pages, html_pages): (Vec<&Page>, Vec<&Page>) =
                 pages.iter().partition(|p| is_css(&p.route.file));
+            // Stylesheets get their names only after this step, so naming one from a stylesheet says why it can't.
+            let stylesheets = m.css_jobs.iter().map(|(job, _)| job.rel.clone()).chain(
+                css_pages
+                    .iter()
+                    .filter(|p| !is_partial_css(&p.route.file))
+                    .map(|p| p.route.file.clone()),
+            );
+            for rel in stylesheets {
+                map.add_pending(rel);
+            }
             let assets = Arc::new(map);
             let rendered = render_all(&css_pages, &assets);
             self.merge_rendered(&mut m, &css_pages, rendered);
@@ -902,16 +912,37 @@ impl Site {
         let result = with_link_context(self.link_context(page, scopes.pages, assets), || {
             self.render_page_in_context(page, scopes)
         });
+        // A miss in a layout or include is reported there, once per call site however many pages use it: `Error::sort`
+        // drops the repeats other pages add.
         let mut seen = HashSet::new();
         let misses: Vec<Error> = take_asset_misses()
             .into_iter()
-            .filter(|spec| seen.insert(spec.clone()))
-            .map(|spec| Error::new(&page.source, ErrorKind::Asset { spec }))
+            .filter(|m| seen.insert((m.file.clone(), m.location, m.miss.spec.clone())))
+            .map(|m| {
+                let path = if m.file.as_os_str().is_empty() {
+                    page.source.clone()
+                } else {
+                    m.file
+                };
+                let kind = ErrorKind::Asset {
+                    spec: m.miss.spec,
+                    location: m.location,
+                    stylesheet: m.miss.stylesheet,
+                };
+                Error::new(path, kind)
+            })
             .collect();
         if misses.is_empty() {
             return result;
         }
-        let mut failed = result.err().unwrap_or_default();
+        // A page that rendered still hands over its anchors, so its broken anchors are reported in the same run.
+        let mut failed = match result {
+            Ok((_, _, anchors)) => Failed {
+                errors: Vec::new(),
+                anchors,
+            },
+            Err(failed) => failed,
+        };
         failed.errors.extend(misses);
         Err(failed)
     }
