@@ -18,6 +18,14 @@ pub struct HtmlFinding {
 pub struct LocalLink {
     pub href: String,
     pub line: usize,
+    pub kind: LinkKind,
+}
+
+/// Whether a link came from an `<a href>` or from a resource reference such as `src`, `srcset` or `<link href>`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LinkKind {
+    Anchor,
+    Resource,
 }
 
 #[derive(Debug, Default)]
@@ -81,6 +89,7 @@ pub fn check_page(html: &str, rules: &RuleSet, reported_ids: &HashSet<String>) -
                             report.links.push(LocalLink {
                                 href: href.to_string(),
                                 line: tag.line,
+                                kind: LinkKind::Anchor,
                             });
                         }
                     }
@@ -105,6 +114,34 @@ pub fn check_page(html: &str, rules: &RuleSet, reported_ids: &HashSet<String>) -
                         }
                     }
                     _ => {}
+                }
+                if rules.is_on(Rule::LinkTarget) {
+                    let sources: &[&str] = match tag.name.as_str() {
+                        "link" => &["href"],
+                        "img" => &["src", "srcset"],
+                        "source" => &["src", "srcset"],
+                        "script" | "video" | "audio" => &["src"],
+                        _ => &[],
+                    };
+                    for attr in sources {
+                        let Some(value) = tag.attr(attr) else {
+                            continue;
+                        };
+                        let urls: Vec<&str> = if *attr == "srcset" {
+                            srcset_urls(value)
+                        } else {
+                            vec![crate::links::trim_href(value)]
+                        };
+                        for url in urls {
+                            if !url.is_empty() && !is_external(url) {
+                                report.links.push(LocalLink {
+                                    href: url.to_string(),
+                                    line: tag.line,
+                                    kind: LinkKind::Resource,
+                                });
+                            }
+                        }
+                    }
                 }
                 if tag.attr("role").is_some_and(|r| {
                     r.split_ascii_whitespace()
@@ -201,6 +238,27 @@ fn page_wide(report: &mut PageReport, rules: &RuleSet, rule: Rule, message: &str
 
 fn non_blank(tag: &StartTag<()>, attr: &str) -> bool {
     tag.attr(attr).is_some_and(|v| !v.trim().is_empty())
+}
+
+/// The URL of each `srcset` candidate. A `data:` URL holds a comma of its own, so the piece after it belongs to it.
+fn srcset_urls(value: &str) -> Vec<&str> {
+    let mut urls = Vec::new();
+    let mut pieces = value.split(',');
+    while let Some(piece) = pieces.next() {
+        let mut words = piece.split_ascii_whitespace();
+        let Some(url) = words.next() else {
+            continue;
+        };
+        if url
+            .get(..5)
+            .is_some_and(|s| s.eq_ignore_ascii_case("data:"))
+            && words.next().is_none()
+        {
+            pieces.next();
+        }
+        urls.push(url);
+    }
+    urls
 }
 
 fn is_external(href: &str) -> bool {
@@ -326,7 +384,8 @@ mod tests {
             report.links,
             [LocalLink {
                 href: "/a/".into(),
-                line: 1
+                line: 1,
+                kind: LinkKind::Anchor,
             }]
         );
     }
@@ -341,14 +400,82 @@ mod tests {
             [
                 LocalLink {
                     href: "/a/".into(),
-                    line: 1
+                    line: 1,
+                    kind: LinkKind::Anchor,
                 },
                 LocalLink {
                     href: "b/".into(),
-                    line: 2
+                    line: 2,
+                    kind: LinkKind::Anchor,
                 },
             ]
         );
+    }
+
+    fn resources(body: &str) -> Vec<(String, LinkKind)> {
+        with_body(body)
+            .links
+            .into_iter()
+            .map(|l| (l.href, l.kind))
+            .collect()
+    }
+
+    #[test]
+    fn collects_resource_references() {
+        let report = check(
+            &GOOD.replace(
+                "<head>",
+                "<head><link rel=\"stylesheet\" href=\"/c.css\">",
+            )
+            .replace(
+                "<p id=\"a\">x</p>",
+                "<img src=\"/i.png\" alt=\"\"><script src=\"/s.js\"></script><video src=\"/v.mp4\"></video><audio src=\"/a.mp3\"></audio><picture><source src=\"/p.webp\"></picture>",
+            ),
+        );
+        let got: Vec<_> = report
+            .links
+            .iter()
+            .map(|l| (l.href.as_str(), l.kind))
+            .collect();
+        assert_eq!(
+            got,
+            [
+                ("/c.css", LinkKind::Resource),
+                ("/i.png", LinkKind::Resource),
+                ("/s.js", LinkKind::Resource),
+                ("/v.mp4", LinkKind::Resource),
+                ("/a.mp3", LinkKind::Resource),
+                ("/p.webp", LinkKind::Resource),
+            ]
+        );
+    }
+
+    #[test]
+    fn srcset_candidates_are_each_collected() {
+        let got = resources(
+            "<img srcset=\"a.png 1x, b.png 2x,, /c.png\" alt=\"\"><picture><source srcset=\"/d.webp 480w\"></picture>",
+        );
+        let hrefs: Vec<_> = got.iter().map(|(h, _)| h.as_str()).collect();
+        assert_eq!(hrefs, ["a.png", "b.png", "/c.png", "/d.webp"]);
+        assert!(got.iter().all(|(_, k)| *k == LinkKind::Resource));
+    }
+
+    #[test]
+    fn external_and_data_resources_are_skipped() {
+        assert!(
+            resources(
+                "<img src=\"https://x.y/i.png\" alt=\"\"><img src=\"//cdn.x/i.png\" alt=\"\"><img src=\"data:image/png;base64,AAAA\" alt=\"\"><img src=\"blob:https://x/1\" alt=\"\"><img srcset=\"https://x.y/a.png 1x, data:image/png;base64,AA 2x\" alt=\"\">"
+            )
+            .is_empty()
+        );
+    }
+
+    #[test]
+    fn resources_are_not_collected_when_link_target_is_off() {
+        let mut rules = RuleSet::all();
+        rules.disable(Rule::LinkTarget);
+        let html = GOOD.replace("<p id=\"a\">x</p>", "<img src=\"/i.png\" alt=\"\">");
+        assert!(check_page(&html, &rules, &HashSet::new()).links.is_empty());
     }
 
     #[test]

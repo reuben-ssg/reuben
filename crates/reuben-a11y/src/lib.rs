@@ -12,6 +12,6 @@ mod tree;
 
 pub use fragment::fragment_items;
 pub use links::{LinkKeys, link_keys};
-pub use page::{HtmlFinding, LocalLink, PageReport, check_page};
+pub use page::{HtmlFinding, LinkKind, LocalLink, PageReport, check_page};
 pub use rules::{Rule, RuleSet};
 pub use tree::{Finding, Item, check_tree};
