@@ -1,6 +1,6 @@
 //! Content-hashed names for static files, and the map from source paths to the names they build to.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs::File;
 use std::io::{self, Read};
 use std::path::{Path, PathBuf};
@@ -61,6 +61,8 @@ pub struct AssetMap {
     enabled: bool,
     base_path: String,
     files: HashMap<PathBuf, PathBuf>,
+    /// The URL of every entry in `files`, as [`AssetMap::url`] returns it without a suffix.
+    urls: HashSet<String>,
 }
 
 impl AssetMap {
@@ -70,11 +72,30 @@ impl AssetMap {
             enabled,
             base_path: base_path.trim_end_matches('/').to_string(),
             files: HashMap::new(),
+            urls: HashSet::new(),
         }
     }
 
     pub fn insert(&mut self, rel: PathBuf, out: PathBuf) {
-        self.files.insert(rel, out);
+        let url = self.site_url(&rel, &out);
+        if let Some(old) = self.files.insert(rel.clone(), out) {
+            let old = self.site_url(&rel, &old);
+            self.urls.remove(&old);
+        }
+        self.urls.insert(url);
+    }
+
+    /// Whether `value` is already the URL of a file in the map (as `asset()` returns it), ignoring any `?query` or
+    /// `#fragment`.
+    pub fn is_url(&self, value: &str) -> bool {
+        let split = value.find(['?', '#']).unwrap_or(value.len());
+        self.urls.contains(&value[..split])
+    }
+
+    fn site_url(&self, rel: &Path, out: &Path) -> String {
+        let out = if self.enabled { out } else { rel };
+        let out = out.to_string_lossy().replace('\\', "/");
+        format!("{}/{}", self.base_path, percent_encode(&out))
     }
 
     pub fn knows(&self, rel: &Path) -> bool {
@@ -94,13 +115,7 @@ impl AssetMap {
             spec: spec.to_string(),
         };
         let out = self.files.get(&rel).ok_or_else(miss)?;
-        let out = if self.enabled { out } else { &rel };
-        let out = out.to_string_lossy().replace('\\', "/");
-        Ok(format!(
-            "{}/{}{suffix}",
-            self.base_path,
-            percent_encode(&out)
-        ))
+        Ok(format!("{}{suffix}", self.site_url(&rel, out)))
     }
 }
 
@@ -216,6 +231,20 @@ mod tests {
             map(true, "/docs/").url("css/a.css"),
             Ok("/docs/css/a.1234abcd.css".to_string())
         );
+    }
+
+    #[test]
+    fn is_url_knows_output_urls_only() {
+        let mut m = map(true, "/docs");
+        assert!(m.is_url("/docs/css/a.1234abcd.css"));
+        assert!(m.is_url("/docs/css/a.1234abcd.css?v=1#x"));
+        assert!(m.is_url("/docs/fonts/My%20Font.1234abcd.woff2"));
+        assert!(!m.is_url("/css/a.1234abcd.css"));
+        assert!(!m.is_url("/docs/css/a.css"));
+        // A replaced entry's old URL is forgotten.
+        m.insert("css/a.css".into(), "css/a.ffffffff.css".into());
+        assert!(!m.is_url("/docs/css/a.1234abcd.css"));
+        assert!(m.is_url("/docs/css/a.ffffffff.css"));
     }
 
     #[test]

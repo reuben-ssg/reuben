@@ -254,6 +254,34 @@ fn template_stylesheet_is_hashed() {
     assert!(html.contains(&format!("href=\"/{css}\"")), "{html}");
 }
 
+/// `asset()` inside `url()` in a template stylesheet, built under `base_url`.
+fn asset_in_url(base_url: &str, prefix: &str) {
+    let config = format!("base_url = \"{base_url}\"\n[assets]\nhash = true\n");
+    let tmp = site_of(&[
+        ("reuben.toml", &config),
+        INDEX,
+        ("static/img/logo.png", "logo"),
+        (
+            "content/css/theme.css",
+            "---\n---\nb { background: url(\"{{ asset(\"img/logo.png\") }}?v=1#x\"); }\n",
+        ),
+    ]);
+    build(&tmp).unwrap();
+    let logo = hashed(&tmp, "img/logo.png");
+    let text = dist(&tmp, &hashed(&tmp, "css/theme.css"));
+    assert!(text.contains(&format!("{prefix}/{logo}?v=1#x")), "{text}");
+}
+
+#[test]
+fn asset_inside_url_in_a_template_stylesheet() {
+    asset_in_url("https://x.test/", "");
+}
+
+#[test]
+fn asset_inside_url_in_a_template_stylesheet_under_a_base_path() {
+    asset_in_url("https://x.test/docs/", "/docs");
+}
+
 #[test]
 fn asset_on_a_stylesheet_from_a_stylesheet_is_a_miss() {
     let tmp = site_of(&[

@@ -250,7 +250,8 @@ impl<'i> Visitor<'i> for UrlRewriter<'_> {
 
     fn visit_url(&mut self, url: &mut Url<'i>) -> Result<(), Infallible> {
         let value: &str = &url.url;
-        if is_external_url(value) {
+        // A value already naming a built file came from `asset()` in a template stylesheet.
+        if is_external_url(value) || self.map.is_url(value) {
             return Ok(());
         }
         let dir = self
