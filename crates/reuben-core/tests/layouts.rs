@@ -192,3 +192,67 @@ fn mistyped_theme_is_an_error() {
     assert!(msg.contains("themes/plian"), "{msg}");
     assert!(msg.contains("reuben.toml"), "{msg}");
 }
+
+#[test]
+fn each_page_gets_its_own_layout_and_its_own_missing_layout_error() {
+    let tmp = site_with(&[
+        ("theme/layouts/default.html", "THEME {{ content }}"),
+        ("theme/layouts/x.html", "THEME-X {{ content }}"),
+        ("layouts/x.html", "SITE-X {{ content }}"),
+        ("layouts/y.html", "SITE-Y {{ content }}"),
+        ("reuben.toml", "theme = \"theme\"\n"),
+        ("content/a.md", "---\ntitle: A\nlayout: x\n---\nA\n"),
+        ("content/b.md", "---\ntitle: B\nlayout: y.html\n---\nB\n"),
+        ("content/c.md", "---\ntitle: C\n---\nC\n"),
+        ("content/d.md", "---\ntitle: D\nlayout: x.html\n---\nD\n"),
+    ]);
+    build(tmp.path()).unwrap();
+    let read = |rel: &str| fs::read_to_string(tmp.path().join("dist").join(rel)).unwrap();
+    assert!(read("a/index.html").starts_with("SITE-X <p>A</p>"));
+    assert!(read("b/index.html").starts_with("SITE-Y <p>B</p>"));
+    assert!(read("c/index.html").starts_with("THEME <p>C</p>"));
+    assert!(read("d/index.html").starts_with("SITE-X <p>D</p>"));
+
+    let tmp = site_with(&[
+        ("content/a.md", "---\ntitle: A\nlayout: nope\n---\nA\n"),
+        ("content/b.md", "---\ntitle: B\nlayout: nope\n---\nB\n"),
+    ]);
+    let errors = build(tmp.path()).unwrap_err();
+    let paths: Vec<_> = errors.iter().map(|e| e.path.clone()).collect();
+    assert_eq!(
+        paths,
+        [
+            tmp.path().join("content/a.md"),
+            tmp.path().join("content/b.md")
+        ]
+    );
+    assert!(
+        errors
+            .iter()
+            .all(|e| matches!(&e.kind, ErrorKind::LayoutNotFound(n) if n == "nope"))
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn an_unreadable_layout_is_reported_once_for_every_page() {
+    use std::os::unix::fs::PermissionsExt;
+    let tmp = site_with(&[
+        ("layouts/default.html", "{{ content }}"),
+        ("content/a.md", "---\ntitle: A\n---\nA\n"),
+        ("content/b.md", "---\ntitle: B\n---\nB\n"),
+    ]);
+    let layout = tmp.path().join("layouts/default.html");
+    fs::set_permissions(&layout, fs::Permissions::from_mode(0o000)).unwrap();
+    if fs::read(&layout).is_ok() {
+        // Running as root, which reads it anyway.
+        return;
+    }
+    let errors = build(tmp.path()).unwrap_err();
+    fs::set_permissions(&layout, fs::Permissions::from_mode(0o644)).unwrap();
+    assert_eq!(errors.len(), 1, "{errors:?}");
+    assert_eq!(errors[0].path, layout);
+    assert!(
+        matches!(&errors[0].kind, ErrorKind::Io(e) if e.kind() == std::io::ErrorKind::PermissionDenied)
+    );
+}

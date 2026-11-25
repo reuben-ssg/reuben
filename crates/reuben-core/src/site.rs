@@ -23,8 +23,9 @@ use crate::error::{Error, ErrorKind};
 use crate::frontmatter::{self, FrontMatter};
 use crate::headings::TocEntry;
 use crate::lastmod;
+use crate::layout::Layouts;
 use crate::links::{AnchorRequest, LinkProblem, PageIndex, Target};
-use crate::output::{self, Output, OutputFile, check_out_dir, finish_atomic, prepare_staging};
+use crate::output::{Output, OutputFile, Stage, check_out_dir, finish_atomic, prepare_staging};
 use crate::page::Failed;
 use crate::route::{Route, route_for_page, route_for_template};
 use crate::script::helpers::url_for;
@@ -275,7 +276,8 @@ impl Site {
         errors.append(&mut dir_errors);
         let mut asset_rels = Vec::new();
         let mut failed_markdown = Vec::new();
-        let to_load: Vec<(PathBuf, PathBuf)> = walk(&content, &mut errors)
+        let (walked, listing) = walk(&content, &mut errors);
+        let to_load: Vec<(PathBuf, PathBuf)> = walked
             .into_iter()
             .filter(|(path, rel)| {
                 let is_markdown = path.extension().is_some_and(|e| e == "md");
@@ -300,9 +302,10 @@ impl Site {
             .par_iter()
             .map(|(path, rel)| {
                 if path.extension().is_some_and(|e| e == "md") {
-                    load_page(path, rel, Some(&dirs), PageKind::Markdown, config.a11y).map(Some)
+                    let kind = PageKind::Markdown;
+                    load_page(path, rel, Some(&dirs), &listing, kind, config.a11y).map(Some)
                 } else {
-                    load_template(path, rel, Some(&dirs), config.a11y)
+                    load_template(path, rel, Some(&dirs), &listing, config.a11y)
                 }
             })
             .collect();
@@ -336,13 +339,14 @@ impl Site {
         let static_dir = root.join("static");
         let mut static_files = Vec::new();
         if static_dir.exists() {
-            let to_load: Vec<(PathBuf, PathBuf)> = walk(&static_dir, &mut errors)
+            let (walked, listing) = walk(&static_dir, &mut errors);
+            let to_load: Vec<(PathBuf, PathBuf)> = walked
                 .into_iter()
                 .filter(|(_, rel)| !is_junk(rel))
                 .collect();
             let loaded_all: Vec<_> = to_load
                 .par_iter()
-                .map(|(path, rel)| load_template(path, rel, None, config.a11y))
+                .map(|(path, rel)| load_template(path, rel, None, &listing, config.a11y))
                 .collect();
             for ((_, rel), loaded) in to_load.into_iter().zip(loaded_all) {
                 match loaded {
@@ -359,6 +363,7 @@ impl Site {
         let theme_static_files = match config.theme.as_ref() {
             Some(theme) if theme.join("static").exists() => {
                 walk(&theme.join("static"), &mut errors)
+                    .0
                     .into_iter()
                     .map(|(_, rel)| rel)
                     .filter(|rel| !is_junk(rel))
@@ -453,16 +458,17 @@ impl Site {
             collections: &collections,
             pages: &index,
         };
+        let stager = stage.map(|dir| Stage::new(dir.to_path_buf()));
+        let layouts = Layouts::new(&self.root, self.config.theme.as_deref());
         let render_one = |page: &&Page, assets: &Arc<AssetMap>| -> Result<Rendered, Failed> {
-            let (html, tree, anchors) = self.render_page(page, &scopes, assets)?;
+            let (html, tree, anchors) = self.render_page(page, &scopes, assets, &layouts)?;
             splice::ensure_no_placeholders(&page.source, &html)
                 .map_err(|e| Failed::from(vec![e]))?;
             let ids_now = !colliding.is_empty()
                 && colliding.contains(&page.route.file.to_string_lossy().to_lowercase());
             let mut done = check_html(page, html, tree, anchors, ids_now);
-            if let Some(stage) = stage.filter(|_| !is_css(&page.route.file)) {
-                if let Err(e) = output::write_staged(stage, &page.route.file, done.html.as_bytes())
-                {
+            if let Some(stage) = stager.as_ref().filter(|_| !is_css(&page.route.file)) {
+                if let Err(e) = stage.write(&page.route.file, done.html.as_bytes()) {
                     return Err(Failed {
                         errors: vec![e],
                         anchors: done.anchors,
@@ -935,17 +941,18 @@ impl Site {
     }
 
     /// Renders one page or template to its final output text, layout included. A Markdown page also returns what the
-    /// tree pass found in its final body tree.
+    /// tree pass found in its final body tree. `layouts` is shared by every page of one render.
     pub(crate) fn render_page(
         &self,
         page: &Page,
         scopes: &page::SiteScopes<'_>,
         assets: &Arc<AssetMap>,
+        layouts: &Layouts,
     ) -> Result<(String, Option<TreeReport>, Vec<AnchorRequest>), Failed> {
         // Rayon reuses threads, so misses left by an earlier page must not leak into this one.
         take_asset_misses();
         let result = with_link_context(self.link_context(page, scopes.pages, assets), || {
-            self.render_page_in_context(page, scopes)
+            self.render_page_in_context(page, scopes, layouts)
         });
         // A miss in a layout or include is reported there, once per call site however many pages use it: `Error::sort`
         // drops the repeats other pages add.
@@ -1023,6 +1030,7 @@ impl Site {
         &self,
         page: &Page,
         scopes: &page::SiteScopes<'_>,
+        layouts: &Layouts,
     ) -> Result<(String, Option<TreeReport>, Vec<AnchorRequest>), Failed> {
         let (body, mut scope, layout_name, tree, anchors) = match page.kind {
             PageKind::Markdown => {
@@ -1063,14 +1071,13 @@ impl Site {
             errors,
             anchors: anchors.clone(),
         };
-        let layout = layout::find_layout(layout_name, &self.root, self.config.theme.as_deref())
-            .map_err(|mut e| {
-                e.path.clone_from(&page.source);
-                failed(vec![e])
-            })?;
+        let layout = layouts.find(layout_name).map_err(|mut e| {
+            e.path.clone_from(&page.source);
+            failed(vec![e])
+        })?;
         let html = match (layout, page.kind) {
             (Some(path), _) => {
-                layout::render_layout(&path, &self.engine, &mut scope, Html::new(body))
+                layout::render_layout(&path, layouts, &self.engine, &mut scope, Html::new(body))
                     .map_err(failed)?
             }
             (None, PageKind::Markdown) => builtin_page(&PageShell {
@@ -1272,27 +1279,91 @@ fn in_pool<R: Send>(pool: Option<&rayon::ThreadPool>, f: impl FnOnce() -> R + Se
     }
 }
 
-/// Every file under `dir`, sorted, as (full path, path relative to `dir`).
-fn walk(dir: &Path, errors: &mut Vec<Error>) -> Vec<(PathBuf, PathBuf)> {
+/// Every sidecar path the filesystem was asked about, for tests that count them.
+#[cfg(test)]
+static SIDECAR_PROBES: std::sync::Mutex<Vec<PathBuf>> = std::sync::Mutex::new(Vec::new());
+
+/// What a walk saw, so a page's sidecar can be found without asking the filesystem about every page.
+///
+/// A sidecar the walk listed under its exact name is a file. Otherwise the filesystem may still resolve one: through
+/// a symlink, or, on a case- or normalization-insensitive filesystem, under another spelling (`x.RHAI` for `x.md`).
+/// Only those cases are asked about, so the answer is always the one `is_file()` would give.
+#[derive(Default)]
+struct Listing {
+    /// Every regular file.
+    files: HashSet<PathBuf>,
+    /// Every regular file with an ASCII name and a `rhai` extension in any case, with its name lowercased.
+    rhai_lower: HashSet<PathBuf>,
+    /// Folders the walk can't vouch for: they hold a symlink, a file with a non-ASCII name, or something unreadable.
+    ask: HashSet<PathBuf>,
+}
+
+impl Listing {
+    /// The sibling `<stem>.rhai` of `path`, if it is a file.
+    fn sidecar(&self, path: &Path) -> Option<PathBuf> {
+        let candidate = path.with_extension("rhai");
+        if self.files.contains(&candidate) {
+            return Some(candidate);
+        }
+        let (Some(dir), Some(name)) = (candidate.parent(), candidate.file_name()) else {
+            return None;
+        };
+        let ask = self.ask.contains(dir)
+            || !name.is_ascii()
+            || self
+                .rhai_lower
+                .contains(&dir.join(name.to_ascii_lowercase()));
+        #[cfg(test)]
+        if ask {
+            SIDECAR_PROBES.lock().unwrap().push(candidate.clone());
+        }
+        (ask && candidate.is_file()).then_some(candidate)
+    }
+}
+
+/// Every file under `dir`, sorted, as (full path, path relative to `dir`), and the listing of what was seen.
+fn walk(dir: &Path, errors: &mut Vec<Error>) -> (Vec<(PathBuf, PathBuf)>, Listing) {
     let mut files = Vec::new();
+    let mut listing = Listing::default();
     for entry in WalkDir::new(dir).sort_by_file_name() {
         match entry {
             Ok(entry) if entry.file_type().is_file() => {
                 let path = entry.into_path();
+                if let (Some(parent), Some(name)) = (path.parent(), path.file_name()) {
+                    if !name.is_ascii() {
+                        listing.ask.insert(parent.to_path_buf());
+                    } else if path
+                        .extension()
+                        .is_some_and(|e| e.eq_ignore_ascii_case("rhai"))
+                    {
+                        listing
+                            .rhai_lower
+                            .insert(parent.join(name.to_ascii_lowercase()));
+                    }
+                }
+                listing.files.insert(path.clone());
                 let rel = path
                     .strip_prefix(dir)
                     .expect("walkdir yields paths under its root")
                     .to_path_buf();
                 files.push((path, rel));
             }
+            Ok(entry) if entry.file_type().is_symlink() => {
+                if let Some(parent) = entry.path().parent() {
+                    listing.ask.insert(parent.to_path_buf());
+                }
+            }
             Ok(_) => {}
             Err(e) => {
                 let path = e.path().unwrap_or(dir).to_path_buf();
+                // What the walk couldn't see may hold a sidecar.
+                listing.ask.extend(path.parent().map(Path::to_path_buf));
+                listing.ask.insert(path.clone());
                 errors.push(Error::new(path, std::io::Error::from(e)));
             }
         }
     }
-    files
+    (files, listing)
 }
 
 /// Why a page didn't load. `from_defaults` are failures in the merged front matter, which a broken `_dir.toml` can
@@ -1317,6 +1388,7 @@ fn load_template(
     path: &Path,
     rel: &Path,
     dirs: Option<&DirDefaults>,
+    listing: &Listing,
     rules: RuleSet,
 ) -> Result<Option<Page>, LoadFailure> {
     let io = |e: std::io::Error| Error::new(path, e);
@@ -1324,39 +1396,43 @@ fn load_template(
     let mut file = fs::File::open(path).map_err(io)?;
     let mut head = [0u8; 8];
     let n = file.read(&mut head).map_err(io)?;
-    let head = head[..n]
+    let start = head[..n]
         .strip_prefix(b"\xef\xbb\xbf")
         .unwrap_or(&head[..n]);
-    if !(head.starts_with(b"---") || head.starts_with(b"+++")) {
+    if !(start.starts_with(b"---") || start.starts_with(b"+++")) {
         return Ok(None);
     }
-    let bytes = fs::read(path).map_err(io)?;
+    let mut bytes = head[..n].to_vec();
+    file.read_to_end(&mut bytes).map_err(io)?;
     if !template::starts_with_front_matter(&bytes) {
         return Ok(None);
     }
     let kind = PageKind::Template {
         escape: template::escape_for(rel),
     };
-    load_page_from(path, rel, bytes, dirs, kind, rules).map(Some)
+    load_page_from(path, rel, bytes, dirs, listing, kind, rules).map(Some)
 }
 
 fn load_page(
     path: &Path,
     rel: &Path,
     dirs: Option<&DirDefaults>,
+    listing: &Listing,
     kind: PageKind,
     rules: RuleSet,
 ) -> Result<Page, LoadFailure> {
     let bytes = fs::read(path).map_err(|e| Error::new(path, e))?;
-    load_page_from(path, rel, bytes, dirs, kind, rules)
+    load_page_from(path, rel, bytes, dirs, listing, kind, rules)
 }
 
 /// `rules` are the accessibility rules the config leaves on; the page's merged `a11y.disable` switches more off.
+/// `listing` is the walk that found `path`, for finding its sidecar.
 fn load_page_from(
     path: &Path,
     rel: &Path,
     bytes: Vec<u8>,
     dirs: Option<&DirDefaults>,
+    listing: &Listing,
     kind: PageKind,
     rules: RuleSet,
 ) -> Result<Page, LoadFailure> {
@@ -1393,7 +1469,7 @@ fn load_page_from(
             });
         }
     };
-    let sidecar = Some(path.with_extension("rhai")).filter(|p| p.is_file());
+    let sidecar = listing.sidecar(path);
     let route = match kind {
         PageKind::Markdown => route_for_page(rel),
         PageKind::Template { .. } => route_for_template(rel),
@@ -1744,6 +1820,91 @@ mod tests {
             assert_eq!(rules, [rule], "{}", rule.id());
             assert_eq!(html_scans(tmp.path()), 1, "{}", rule.id());
         }
+    }
+
+    fn sidecar_probes(dir: &Path) -> usize {
+        SIDECAR_PROBES
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|p| p.starts_with(dir))
+            .count()
+    }
+
+    fn sidecar_of<'a>(site: &'a Site, rel: &str) -> Option<&'a Path> {
+        site.pages
+            .iter()
+            .find(|p| p.rel == Path::new(rel))
+            .unwrap_or_else(|| panic!("no page {rel}"))
+            .sidecar
+            .as_deref()
+    }
+
+    #[test]
+    fn sidecars_are_found_from_the_walk_without_probing() {
+        let page = "---\ntitle: T\n---\nx\n";
+        let tmp = site_dir(&[
+            ("content/plain.md", page),
+            ("content/with.md", page),
+            ("content/with.rhai", "let a = 1;"),
+            ("content/sub/deep.md", page),
+            ("content/sub/deep.rhai", "let a = 1;"),
+            ("static/t.css", "---\ntitle: T\n---\nb {}\n"),
+            ("static/t.rhai", "let a = 1;"),
+            ("static/u.css", "---\ntitle: U\n---\nb {}\n"),
+        ]);
+        let site = Site::load(tmp.path()).unwrap();
+        assert_eq!(sidecar_of(&site, "plain.md"), None);
+        let content = tmp.path().join("content");
+        assert_eq!(
+            sidecar_of(&site, "with.md"),
+            Some(content.join("with.rhai").as_path())
+        );
+        assert_eq!(
+            sidecar_of(&site, "sub/deep.md"),
+            Some(content.join("sub/deep.rhai").as_path())
+        );
+        assert_eq!(
+            sidecar_of(&site, "t.css"),
+            Some(tmp.path().join("static/t.rhai").as_path())
+        );
+        assert_eq!(sidecar_of(&site, "u.css"), None);
+        assert_eq!(sidecar_probes(tmp.path()), 0);
+    }
+
+    #[test]
+    fn a_sidecar_the_walk_cant_vouch_for_is_probed() {
+        let page = "---\ntitle: T\n---\nx\n";
+        let tmp = site_dir(&[
+            ("content/case.md", page),
+            ("content/case.RHAI", "let a = 1;"),
+            ("content/other.md", page),
+            ("content/intl/café.md", page),
+        ]);
+        let content = tmp.path().join("content");
+        #[cfg(unix)]
+        {
+            fs::create_dir_all(content.join("linked")).unwrap();
+            fs::write(content.join("linked/l.md"), page).unwrap();
+            fs::write(tmp.path().join("real.rhai"), "let a = 1;").unwrap();
+            std::os::unix::fs::symlink(tmp.path().join("real.rhai"), content.join("linked/l.rhai"))
+                .unwrap();
+        }
+        let site = Site::load(tmp.path()).unwrap();
+        // Whatever the filesystem says, as before: found on a case-insensitive one.
+        let case = content.join("case.rhai");
+        let expected = case.is_file().then_some(case.as_path());
+        assert_eq!(sidecar_of(&site, "case.md"), expected);
+        assert_eq!(sidecar_of(&site, "other.md"), None);
+        #[cfg(unix)]
+        assert_eq!(
+            sidecar_of(&site, "linked/l.md"),
+            Some(content.join("linked/l.rhai").as_path())
+        );
+        assert_eq!(sidecar_of(&site, "intl/café.md"), None);
+        // `case.md`, `café.md` and the page beside the link are asked about; `other.md` isn't.
+        let probed = if cfg!(unix) { 3 } else { 2 };
+        assert_eq!(sidecar_probes(tmp.path()), probed);
     }
 
     #[test]

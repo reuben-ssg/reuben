@@ -12,6 +12,7 @@ use rhai::{Array, Dynamic, Map};
 use crate::collections;
 use crate::data;
 use crate::error::{Error, ErrorKind};
+use crate::layout::Layouts;
 use crate::locate::{self, Format};
 use crate::page::{self, SiteScopes};
 use crate::script::collection::Collection;
@@ -104,7 +105,8 @@ impl Site {
                 // A sidecar that fails fails the render too, with the same error, so only a good one goes on.
                 Ok(scope) => {
                     self.sidecar_entries(found, &scope, &mut texts, &mut entries);
-                    if let Err(e) = self.render_page(found, &scopes, &assets)
+                    let layouts = Layouts::new(&self.root, self.config.theme.as_deref());
+                    if let Err(e) = self.render_page(found, &scopes, &assets, &layouts)
                         && !self.in_broken_dir(found)
                     {
                         errors.extend(e.errors);
