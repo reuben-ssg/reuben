@@ -140,6 +140,8 @@ pub fn html_pass(
     rules: &RuleSet,
     reported_ids: &HashSet<String>,
 ) -> HtmlReport {
+    #[cfg(test)]
+    HTML_SCANS.lock().unwrap().push(source.to_path_buf());
     let report = check_page(html, rules, reported_ids);
     let findings = report
         .findings
@@ -159,6 +161,19 @@ pub fn html_pass(
         ids: report.ids,
     }
 }
+
+/// Every id in the finished page of `source`, for a page whose HTML pass was skipped but whose anchors are linked.
+pub fn page_ids(source: &Path, html: &str) -> HashSet<String> {
+    #[cfg(test)]
+    HTML_SCANS.lock().unwrap().push(source.to_path_buf());
+    #[cfg(not(test))]
+    let _ = source;
+    reuben_a11y::page_ids(html)
+}
+
+/// The source of every page whose finished HTML was tokenized, for tests that check the HTML pass is skipped.
+#[cfg(test)]
+pub(crate) static HTML_SCANS: std::sync::Mutex<Vec<PathBuf>> = std::sync::Mutex::new(Vec::new());
 
 /// The path part of `base_url`, with a leading and a trailing slash.
 pub fn base_path(base_url: &str) -> String {

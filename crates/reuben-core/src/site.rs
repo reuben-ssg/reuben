@@ -159,8 +159,9 @@ struct Rendered {
     findings: Vec<Finding>,
     /// Local links of the page, to be checked once every output file is known.
     links: Vec<LocalLink>,
-    /// Every id in the page, for the anchors other pages link to.
-    ids: HashSet<String>,
+    /// Every id in the page, for the anchors other pages link to. `None` when the HTML pass was skipped: the ids are
+    /// then collected only if a link asks for one of them.
+    ids: Option<HashSet<String>>,
     /// The `#anchor`s this page's source links ask for, to be checked against their target's ids.
     anchors: Vec<AnchorRequest>,
 }
@@ -171,7 +172,7 @@ impl Rendered {
             html,
             findings: Vec::new(),
             links: Vec::new(),
-            ids: HashSet::new(),
+            ids: None,
             anchors: Vec::new(),
         }
     }
@@ -189,6 +190,8 @@ struct Merged<'a> {
     page_links: Vec<(&'a Page, Vec<LocalLink>)>,
     /// Only Markdown pages are anchor targets, keyed by their path under `content/`.
     page_ids: HashMap<&'a Path, HashSet<String>>,
+    /// Markdown pages whose ids weren't collected as they rendered, keyed like `page_ids`.
+    unscanned: HashMap<&'a Path, &'a Page>,
     page_anchors: Vec<(&'a Page, Vec<AnchorRequest>)>,
     /// HTML pages were written to staging as they rendered.
     staged: bool,
@@ -221,6 +224,7 @@ impl<'a> Merged<'a> {
             findings: Vec::new(),
             page_links: Vec::new(),
             page_ids: HashMap::new(),
+            unscanned: HashMap::new(),
             page_anchors: Vec::new(),
             staged,
             keep: site
@@ -437,7 +441,8 @@ impl Site {
 
         // Everything below adds to one list, sorted once at the end, so no stage hides another's errors.
         let mut errors = self.load_errors.clone();
-        errors.append(&mut self.check_collisions(&pages, opts.drafts));
+        let (mut collision_errors, colliding) = self.check_collisions(&pages, opts.drafts);
+        errors.append(&mut collision_errors);
         let (collections, mut collection_errors) = collections::build(&pages, &self.config);
         errors.append(&mut collection_errors);
 
@@ -452,7 +457,9 @@ impl Site {
             let (html, tree, anchors) = self.render_page(page, &scopes, assets)?;
             splice::ensure_no_placeholders(&page.source, &html)
                 .map_err(|e| Failed::from(vec![e]))?;
-            let mut done = check_html(page, html, tree, anchors);
+            let ids_now = !colliding.is_empty()
+                && colliding.contains(&page.route.file.to_string_lossy().to_lowercase());
+            let mut done = check_html(page, html, tree, anchors, ids_now);
             if let Some(stage) = stage.filter(|_| !is_css(&page.route.file)) {
                 if let Err(e) = output::write_staged(stage, &page.route.file, done.html.as_bytes())
                 {
@@ -638,7 +645,8 @@ impl Site {
             partial_pages,
             mut findings,
             page_links,
-            page_ids,
+            mut page_ids,
+            unscanned,
             page_anchors,
             ..
         } = m;
@@ -711,6 +719,26 @@ impl Site {
                 }
                 Ok(_) => {}
                 Err(msg) => errors.push(Error::new("reuben.toml", ErrorKind::Config(msg))),
+            }
+        }
+        // The ids of a page whose HTML pass was skipped are collected now, and only if a link asks for one.
+        let wanted: BTreeSet<&Path> = page_anchors
+            .iter()
+            .flat_map(|(_, anchors)| anchors.iter().map(|a| a.target.as_path()))
+            .filter(|target| unscanned.contains_key(target))
+            .collect();
+        for target in wanted {
+            let page = unscanned[target];
+            match built_html(&output, stage, page) {
+                Some(Ok(html)) => {
+                    page_ids.insert(page.rel.as_path(), check::page_ids(&page.source, &html));
+                }
+                Some(Err(e)) => errors.push(e),
+                None => debug_assert!(
+                    false,
+                    "{} rendered but isn't in the output",
+                    page.rel.display()
+                ),
             }
         }
         // Unlike `link-target`, this runs on a failed build too: a target that didn't render is skipped, not blamed.
@@ -802,7 +830,14 @@ impl Site {
                     m.findings.extend(done.findings);
                     m.page_links.push((page, done.links));
                     if page.kind == PageKind::Markdown {
-                        m.page_ids.insert(page.rel.as_path(), done.ids);
+                        match done.ids {
+                            Some(ids) => {
+                                m.page_ids.insert(page.rel.as_path(), ids);
+                            }
+                            None => {
+                                m.unscanned.insert(page.rel.as_path(), page);
+                            }
+                        }
                     }
                     m.page_anchors.push((page, done.anchors));
                     let file = if m.staged {
@@ -1107,8 +1142,9 @@ impl Site {
         theme.chain(site).chain(assets).collect()
     }
 
-    /// Fails if two sources (pages or static files) would write the same output file.
-    fn check_collisions(&self, pages: &[&Page], drafts: bool) -> Vec<Error> {
+    /// Fails if two sources (pages or static files) would write the same output file. Also returns the colliding
+    /// output paths, lowercased.
+    fn check_collisions(&self, pages: &[&Page], drafts: bool) -> (Vec<Error>, HashSet<String>) {
         let sources = pages
             .iter()
             .map(|p| (p.route.file.clone(), p.source.clone()))
@@ -1118,6 +1154,7 @@ impl Site {
         // that relies on the difference can't be deployed portably anyway.
         let mut seen: HashMap<String, PathBuf> = HashMap::new();
         let mut errors = Vec::new();
+        let mut colliding = HashSet::new();
         for (file, source) in sources {
             if file
                 .components()
@@ -1138,21 +1175,27 @@ impl Site {
                         file: file.clone(),
                     },
                 ));
+                colliding.insert(key);
             } else {
                 seen.insert(key, source);
             }
         }
-        errors
+        (errors, colliding)
     }
 }
 
 /// Runs the HTML pass on a page's finished text, with the tree pass's findings. Only HTML pages are checked:
 /// Markdown pages and `.html` templates. Other templates are CSS, XML and the like.
+///
+/// With every HTML-pass rule off the pass has nothing to find, so it is skipped and the page's ids are left to be
+/// collected later, only if a link asks for one. `ids_now` collects them anyway, for a page whose output another
+/// file may replace before then.
 fn check_html(
     page: &Page,
     html: String,
     tree: Option<TreeReport>,
     anchors: Vec<AnchorRequest>,
+    ids_now: bool,
 ) -> Rendered {
     let is_html = match page.kind {
         PageKind::Markdown => true,
@@ -1163,6 +1206,16 @@ fn check_html(
     }
     let (mut findings, reported_ids) =
         tree.map_or_else(Default::default, |t| (t.findings, t.reported_ids));
+    if !page.rules.any_html_rule() {
+        let ids = ids_now.then(|| check::page_ids(&page.source, &html));
+        return Rendered {
+            html,
+            findings,
+            links: Vec::new(),
+            ids,
+            anchors,
+        };
+    }
     let report = check::html_pass(
         &page.source,
         &page.route.file,
@@ -1175,8 +1228,23 @@ fn check_html(
         html,
         findings,
         links: report.links,
-        ids: report.ids,
+        ids: Some(report.ids),
         anchors,
+    }
+}
+
+/// The finished HTML of a rendered page: from `output`, or read back from `stage` if it was streamed there. Its
+/// output path must be its own, which a page whose path collides doesn't have. `None` if the page isn't in `output`.
+fn built_html(output: &Output, stage: Option<&Path>, page: &Page) -> Option<Result<String, Error>> {
+    match (output.files.get(&page.route.file), stage) {
+        (Some(OutputFile::Bytes(bytes)), _) => {
+            Some(Ok(String::from_utf8_lossy(bytes).into_owned()))
+        }
+        (Some(OutputFile::Staged), Some(stage)) => {
+            let path = stage.join(&page.route.file);
+            Some(fs::read_to_string(&path).map_err(|e| Error::new(path, e)))
+        }
+        _ => None,
     }
 }
 
@@ -1487,6 +1555,195 @@ mod tests {
         assert!(!is_static_sidecar(&pages, dir, Path::new("other.rhai")));
         let none = [static_template(None)];
         assert!(!is_static_sidecar(&none, dir, Path::new("side.rhai")));
+    }
+
+    const ALL_RULES_OFF: &str = "[a11y]\ndisable = [\"heading-order\",\"link-text\",\"img-alt\",\"heading-id-unique\",\"table-header\",\"html-lang\",\"page-title\",\"single-h1\",\"main-landmark\",\"id-unique\",\"form-label\",\"link-target\"]\n";
+
+    fn site_dir(files: &[(&str, &str)]) -> assert_fs::TempDir {
+        use assert_fs::prelude::*;
+        let tmp = assert_fs::TempDir::new().unwrap();
+        for (path, text) in files {
+            tmp.child(path).write_str(text).unwrap();
+        }
+        tmp
+    }
+
+    /// How many pages under `dir` had their finished HTML tokenized.
+    fn html_scans(dir: &Path) -> usize {
+        check::HTML_SCANS
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|p| p.starts_with(dir))
+            .count()
+    }
+
+    fn render_site(dir: &Path) -> Result<(Output, BuildReport), Failure> {
+        Site::load(dir)
+            .map_err(Failure::from)?
+            .render(&RenderOptions {
+                drafts: false,
+                jobs: None,
+            })
+    }
+
+    fn no_anchor_fragments(failure: &Failure) -> Vec<String> {
+        failure
+            .errors
+            .iter()
+            .filter_map(|e| match &e.kind {
+                ErrorKind::Link {
+                    problem: LinkProblem::NoAnchor { fragment, .. },
+                    ..
+                } => Some(fragment.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn html_pass_is_skipped_when_no_rule_or_anchor_needs_it() {
+        let tmp = site_dir(&[
+            ("reuben.toml", ALL_RULES_OFF),
+            (
+                "content/index.md",
+                "---\ntitle: Home\n---\n# Home\n\n[b](@/b.md)\n",
+            ),
+            (
+                "content/b.md",
+                "---\ntitle: B\n---\n# B\n\n<p id=\"x\"></p><p id=\"x\"></p>\n",
+            ),
+            (
+                "content/raw.html",
+                "---\ntitle: Raw\n---\n<p id=\"y\"></p><p id=\"y\"></p><input>\n",
+            ),
+        ]);
+        let (output, report) = render_site(tmp.path()).unwrap();
+        assert_eq!(html_scans(tmp.path()), 0);
+        assert_eq!(report.findings, []);
+        let html = |rel: &str| match output.files.get(Path::new(rel)) {
+            Some(OutputFile::Bytes(b)) => String::from_utf8(b.clone()).unwrap(),
+            other => panic!("{rel}: {other:?}"),
+        };
+        assert!(html("index.html").contains("href=\"/b/\""));
+        assert!(html("b/index.html").contains(">B</h1>"));
+        assert!(html("raw/index.html").contains("<input>"));
+    }
+
+    #[test]
+    fn skipped_html_pass_reports_what_the_full_pass_would() {
+        let mut rules = RuleSet::all();
+        for rule in reuben_a11y::Rule::ALL {
+            rules.disable(rule);
+        }
+        let mut page = static_template(None);
+        page.kind = PageKind::Markdown;
+        page.rules = rules;
+        let html = "<html><body><p id=a></p><p id=a></p><input><a href=\"/x/\">x</a></body></html>";
+        let full = check::html_pass(
+            &page.source,
+            &page.route.file,
+            html,
+            &rules,
+            &HashSet::new(),
+        );
+        let skipped = check_html(&page, html.to_string(), None, Vec::new(), false);
+        assert_eq!(skipped.findings, full.findings);
+        assert_eq!(skipped.links, full.links);
+        assert_eq!(skipped.ids, None);
+        assert_eq!(check::page_ids(&page.source, html), full.ids);
+    }
+
+    #[test]
+    fn broken_anchors_are_reported_with_every_rule_off() {
+        let files = [
+            ("reuben.toml", ALL_RULES_OFF),
+            (
+                "content/a.md",
+                "---\ntitle: A\n---\n# A\n\n[ok](@/b.md#there) [bad](@/b.md#nope)\n",
+            ),
+            (
+                "content/b.md",
+                "---\ntitle: B\n---\n# B\n\n## There\n\n<span id=\"raw\"></span>\n",
+            ),
+            (
+                "content/c.md",
+                "---\ntitle: C\n---\n# C\n\n[raw](@/b.md#raw)\n",
+            ),
+        ];
+        let tmp = site_dir(&files);
+        let failure = render_site(tmp.path()).unwrap_err();
+        assert_eq!(no_anchor_fragments(&failure), ["nope"]);
+        assert_eq!(failure.errors.len(), 1);
+        // Only the page linked with a fragment is scanned.
+        assert_eq!(html_scans(tmp.path()), 1);
+
+        // A staged build reads the target back from staging.
+        let tmp = site_dir(&files);
+        let site = Site::load(tmp.path()).unwrap();
+        let failure = site
+            .build(&BuildOptions {
+                drafts: false,
+                out: tmp.path().join("dist"),
+                jobs: None,
+            })
+            .unwrap_err();
+        assert_eq!(no_anchor_fragments(&failure), ["nope"]);
+        assert_eq!(failure.errors.len(), 1);
+        assert_eq!(html_scans(tmp.path()), 1);
+    }
+
+    #[test]
+    fn a_colliding_page_is_scanned_for_ids_as_it_renders() {
+        // `x/index.md` and `x.md` both write `x/index.html`, and x.md's output replaces it. The anchor is still checked
+        // against `x/index.md`'s own HTML.
+        let tmp = site_dir(&[
+            ("reuben.toml", ALL_RULES_OFF),
+            (
+                "content/a.md",
+                "---\ntitle: A\n---\n# A\n\n[y](@/x/index.md#only-y)\n",
+            ),
+            ("content/x.md", "---\ntitle: X\n---\n# X\n"),
+            (
+                "content/x/index.md",
+                "---\ntitle: Y\n---\n# Y\n\n## Only Y\n",
+            ),
+        ]);
+        let failure = render_site(tmp.path()).unwrap_err();
+        assert!(
+            failure
+                .errors
+                .iter()
+                .any(|e| matches!(e.kind, ErrorKind::OutputCollision { .. })),
+            "{failure:?}"
+        );
+        assert_eq!(no_anchor_fragments(&failure), Vec::<String>::new());
+    }
+
+    #[test]
+    fn each_html_rule_fires_alone() {
+        let page = "---\ntitle: T\n---\n<html><body><p id=\"d\"></p><p id=\"d\"></p><input><a href=\"/nope/\">x</a></body></html>\n";
+        for rule in [
+            reuben_a11y::Rule::HtmlLang,
+            reuben_a11y::Rule::PageTitle,
+            reuben_a11y::Rule::SingleH1,
+            reuben_a11y::Rule::MainLandmark,
+            reuben_a11y::Rule::IdUnique,
+            reuben_a11y::Rule::FormLabel,
+            reuben_a11y::Rule::LinkTarget,
+        ] {
+            let others: Vec<String> = reuben_a11y::Rule::ALL
+                .into_iter()
+                .filter(|r| *r != rule)
+                .map(|r| format!("\"{}\"", r.id()))
+                .collect();
+            let config = format!("[a11y]\ndisable = [{}]\n", others.join(","));
+            let tmp = site_dir(&[("reuben.toml", &config), ("content/bad.html", page)]);
+            let (_, report) = render_site(tmp.path()).unwrap();
+            let rules: Vec<_> = report.findings.iter().map(|f| f.rule).collect();
+            assert_eq!(rules, [rule], "{}", rule.id());
+            assert_eq!(html_scans(tmp.path()), 1, "{}", rule.id());
+        }
     }
 
     #[test]

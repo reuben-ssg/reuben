@@ -45,6 +45,16 @@ The previous minimum, 1.85, was wrong: a dependency already needed 1.89.
 Run `rustup update` if `cargo install` says your Rust is too old.
 The npm package and the installers ship prebuilt binaries, so they don't need Rust at all.
 
+### Performance
+
+A page whose accessibility rules for the finished HTML (`html-lang`, `page-title`, `single-h1`, `main-landmark`, `id-unique`, `form-label` and `link-target`) are all off is no longer parsed a second time.
+Its ids are collected only when a link such as `@/page.md#anchor` asks for one, so broken anchors are still errors.
+
+### Library API
+
+Added to `reuben-a11y`: `page_ids`, `Rule::HTML_PASS` and `RuleSet::any_html_rule`.
+Added to `reuben-core`: `check::page_ids`.
+
 ## 0.2.0 (2026-11-21)
 
 ### Changed defaults

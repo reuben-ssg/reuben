@@ -32,6 +32,17 @@ impl Rule {
         Rule::LinkTarget,
     ];
 
+    /// The rules `check_page` checks on a finished page's HTML. The rest run on the document tree.
+    pub const HTML_PASS: [Rule; 7] = [
+        Rule::HtmlLang,
+        Rule::PageTitle,
+        Rule::SingleH1,
+        Rule::MainLandmark,
+        Rule::IdUnique,
+        Rule::FormLabel,
+        Rule::LinkTarget,
+    ];
+
     pub fn id(self) -> &'static str {
         match self {
             Rule::HeadingOrder => "heading-order",
@@ -89,6 +100,11 @@ impl RuleSet {
         self.0 & Self::bit(rule) != 0
     }
 
+    /// Whether `check_page` has anything to find: some rule of the HTML pass is on.
+    pub fn any_html_rule(&self) -> bool {
+        Rule::HTML_PASS.iter().any(|&rule| self.is_on(rule))
+    }
+
     fn bit(rule: Rule) -> u16 {
         1 << (rule as u16)
     }
@@ -130,5 +146,16 @@ mod tests {
         rules.disable(Rule::LinkText);
         assert!(!rules.is_on(Rule::LinkText));
         assert!(rules.is_on(Rule::ImgAlt));
+    }
+
+    #[test]
+    fn any_html_rule_ignores_tree_rules() {
+        let mut rules = RuleSet::all();
+        for rule in Rule::HTML_PASS {
+            assert!(rules.any_html_rule());
+            rules.disable(rule);
+        }
+        assert!(!rules.any_html_rule());
+        assert!(rules.is_on(Rule::HeadingOrder));
     }
 }

@@ -226,6 +226,20 @@ pub fn check_page(html: &str, rules: &RuleSet, reported_ids: &HashSet<String>) -
     report
 }
 
+/// Every non-blank `id` in a page: the `ids` that `check_page` collects, for a page no HTML-pass rule checks.
+pub fn page_ids(html: &str) -> HashSet<String> {
+    let mut ids = HashSet::new();
+    for event in scan(&[(html, ())]) {
+        if let Event::Start(tag) = event
+            && let Some(id) = tag.attr("id")
+            && !id.trim().is_empty()
+        {
+            ids.insert(id.to_string());
+        }
+    }
+    ids
+}
+
 fn page_wide(report: &mut PageReport, rules: &RuleSet, rule: Rule, message: &str) {
     if rules.is_on(rule) {
         report.findings.push(HtmlFinding {
@@ -560,5 +574,21 @@ mod tests {
         let report = check_page(html, &rules, &HashSet::new());
         let expected: HashSet<String> = ["a", "fn-1"].map(String::from).into();
         assert_eq!(report.ids, expected);
+    }
+
+    #[test]
+    fn page_ids_match_the_ids_check_page_collects() {
+        let pages = [
+            GOOD.to_string(),
+            "<h2 id=\"a\">x</h2><p id=\"\">y</p><sup id=\"fn-1\">".to_string(),
+            "<P ID=Up></P><p id=' sp '></p><p id=\"a&amp;b\"></p><p id=a></p><p id=a></p>".to_string(),
+            "<!-- <p id=c></p> --><script>'<p id=s>'</script><style>/* <p id=t> */</style><svg><g id=g/></svg>"
+                .to_string(),
+            "<p id=x".to_string(),
+            String::new(),
+        ];
+        for html in &pages {
+            assert_eq!(page_ids(html), check(html).ids, "{html}");
+        }
     }
 }
