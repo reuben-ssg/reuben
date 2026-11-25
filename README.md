@@ -164,6 +164,8 @@ The fragment check covers only the Markdown of a page, not `url_for` results or 
 A `markdown()` link is still resolved, and a missing file there is an error, but its `#fragment` isn't checked.
 Outside a page being built, such as in a `data/` file, `url_for` and `markdown()` can't resolve a source link, so it is an error there.
 
+Made with love by [@nickvigilante](https://github.com/nickvigilante).
+
 ## License
 
 Licensed under either of
