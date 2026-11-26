@@ -57,11 +57,11 @@ A page whose accessibility rules for the finished HTML (`html-lang`, `page-title
 Its ids are collected only when a link such as `@/page.md#anchor` asks for one, so broken anchors are still errors.
 A build makes fewer system calls: each layout is found and read once per build instead of once per page, a page's output folder is created once however many pages share it, a sidecar `.rhai` is looked up in the folder listing instead of on disk, and a static template is opened once.
 Each page's Markdown is parsed once per build instead of twice, unless the site might read `collections`.
-The site might read them when the word `collections` appears anywhere in a Markdown page's body that has a `{{` or `{%` block, in a template page, in a sidecar `.rhai`, in any file in `layouts/` or in an include folder, the site's or the theme's, comments included, or when one of those files can't be read.
+The site might read them when the word `collections` appears anywhere in a Markdown page's body that has a `{{` or `{%` block, in a template page, in a sidecar `.rhai`, in any file in `layouts/`, or in an include `.rhai` file, the site's or the theme's, comments included, or when a sidecar or a file in `layouts/` can't be read.
 Then the pages in collections are parsed a second time, while the site loads, for the `summary` and `toc` other pages read from them.
 A page with `{{` or `{%` blocks finds the code they must skip once instead of twice.
 On a 10,000-page site that doesn't read collections, CPU time falls by about a fifth and peak memory by about a quarter.
-On a site that does read collections, peak memory may rise slightly, by up to about 1.5 MB on a 6,000-page site.
+On a 6,000-page site that reads collections, maximum resident memory may rise by a few MB, though peak memory footprint stays at or below 0.2.0.
 
 ### Library API
 

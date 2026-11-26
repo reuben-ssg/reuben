@@ -2350,7 +2350,9 @@ mod tests {
         let failure = render_site(tmp.path()).unwrap_err();
         let messages: Vec<String> = failure.errors.iter().map(ToString::to_string).collect();
         assert!(
-            messages.iter().any(|m| m.contains("collections")),
+            messages
+                .iter()
+                .any(|m| m.contains("Variable not found: global::collections")),
             "{messages:?}"
         );
     }
