@@ -230,30 +230,30 @@ fn splice_children(node: &mut Node, outputs: &[Output], in_image: bool) {
                 Output::Text(_) => {}
             }
         }
-        if let NodeKind::Text(t) = &child.kind {
-            if has_placeholder(t) {
-                for piece in pieces(t) {
-                    let kind = match piece {
-                        Piece::Text(s) => NodeKind::Text(s.to_string()),
-                        Piece::Slot(n) => match output(outputs, n) {
-                            Output::Nothing => continue,
-                            out if in_image => NodeKind::Text(unescape(out.markup().unwrap_or(""))),
-                            Output::Html(m) => NodeKind::Generated {
-                                html: m.html.clone(),
-                                block: n,
-                                inline: true,
-                            },
-                            Output::Text(s) => NodeKind::HtmlInline(s.clone()),
+        if let NodeKind::Text(t) = &child.kind
+            && has_placeholder(t)
+        {
+            for piece in pieces(t) {
+                let kind = match piece {
+                    Piece::Text(s) => NodeKind::Text(s.to_string()),
+                    Piece::Slot(n) => match output(outputs, n) {
+                        Output::Nothing => continue,
+                        out if in_image => NodeKind::Text(unescape(out.markup().unwrap_or(""))),
+                        Output::Html(m) => NodeKind::Generated {
+                            html: m.html.clone(),
+                            block: n,
+                            inline: true,
                         },
-                    };
-                    node.children.push(Node {
-                        kind,
-                        span: child.span,
-                        children: Vec::new(),
-                    });
-                }
-                continue;
+                        Output::Text(s) => NodeKind::HtmlInline(s.clone()),
+                    },
+                };
+                node.children.push(Node {
+                    kind,
+                    span: child.span,
+                    children: Vec::new(),
+                });
             }
+            continue;
         }
         match &mut child.kind {
             NodeKind::HtmlBlock(s) if has_placeholder(s) => {
