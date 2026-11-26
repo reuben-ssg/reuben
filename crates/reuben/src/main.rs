@@ -1,6 +1,8 @@
-#![forbid(unsafe_code)]
+// Only `jobs::performance_cores` allows unsafe code, for one `sysctlbyname` read.
+#![deny(unsafe_code)]
 
 mod diagnostic;
+mod jobs;
 
 use std::collections::HashSet;
 use std::panic::AssertUnwindSafe;
@@ -42,7 +44,8 @@ enum Command {
         /// Merge `reuben.<name>.toml` over `reuben.toml` if it exists.
         #[arg(long)]
         env: Option<String>,
-        /// Render with this many threads. Defaults to one per core.
+        /// Read, render and write with this many threads. Defaults to the performance cores on Apple silicon,
+        /// and one per core elsewhere.
         #[arg(long, value_name = "N")]
         jobs: Option<usize>,
     },
@@ -60,7 +63,8 @@ enum Command {
         /// Merge `reuben.<name>.toml` over `reuben.toml` if it exists.
         #[arg(long)]
         env: Option<String>,
-        /// Render with this many threads. Defaults to one per core.
+        /// Read, render and write with this many threads. Defaults to the performance cores on Apple silicon,
+        /// and one per core elsewhere.
         #[arg(long, value_name = "N")]
         jobs: Option<usize>,
     },
@@ -75,7 +79,8 @@ enum Command {
         /// Merge `reuben.<name>.toml` over `reuben.toml` if it exists.
         #[arg(long)]
         env: Option<String>,
-        /// Render with this many threads. Defaults to one per core.
+        /// Read, render and write with this many threads. Defaults to the performance cores on Apple silicon,
+        /// and one per core elsewhere.
         #[arg(long, value_name = "N")]
         jobs: Option<usize>,
     },
@@ -106,6 +111,7 @@ enum CssCommand {
 }
 
 fn main() -> ExitCode {
+    let resolve = |n: Option<usize>| Some(n.unwrap_or_else(jobs::default_jobs));
     match Cli::parse().command {
         Command::Build {
             root,
@@ -113,20 +119,20 @@ fn main() -> ExitCode {
             drafts,
             env,
             jobs,
-        } => build(root, out, drafts, env, jobs),
+        } => build(root, out, drafts, env, resolve(jobs)),
         Command::Serve {
             root,
             port,
             drafts,
             env,
             jobs,
-        } => serve(&root, port, drafts, env, jobs),
+        } => serve(&root, port, drafts, env, resolve(jobs)),
         Command::Check {
             root,
             drafts,
             env,
             jobs,
-        } => check(&root, drafts, env, jobs),
+        } => check(&root, drafts, env, resolve(jobs)),
         Command::Explain { page, root, env } => explain(&page, &root, env),
         Command::Css(CssCommand::Highlight { theme }) => match highlight::theme_css(&theme) {
             Ok(css) => {
@@ -154,8 +160,7 @@ fn build(
         out: out.unwrap_or_else(|| root.join("dist")),
         jobs,
     };
-    let loaded = Site::load_with(&root, &LoadOptions { env }).map_err(Failure::from);
-    match loaded.and_then(|site| site.build(&opts)) {
+    match Site::load_and_build(&root, &LoadOptions { env }, &opts) {
         Ok(report) => {
             println!(
                 "{} in {}ms",
@@ -253,11 +258,9 @@ fn rebuild(
     drafts: bool,
     jobs: Option<usize>,
 ) -> (Option<Config>, Rendered) {
-    match Site::load_with(root, &LoadOptions { env: env.clone() }) {
-        Ok(site) => {
-            let rendered = site.render(&RenderOptions { drafts, jobs });
-            (Some(site.config), rendered)
-        }
+    let load = LoadOptions { env: env.clone() };
+    match Site::load_and_render(root, &load, &RenderOptions { drafts, jobs }) {
+        Ok((site, rendered)) => (Some(site.config), rendered),
         Err(errors) => (None, Err(errors.into())),
     }
 }

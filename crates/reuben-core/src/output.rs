@@ -82,6 +82,8 @@ impl Stage {
     /// Writes one rendered file, creating its directory.
     pub(crate) fn write(&self, rel: &Path, bytes: &[u8]) -> Result<(), Error> {
         let dest = self.dir.join(rel);
+        #[cfg(test)]
+        crate::site::record_work_thread(&dest);
         if let Some(dir) = dest.parent() {
             self.make_dir(dir)?;
         }
@@ -195,6 +197,8 @@ fn stage(output: &Output, staging: &Path) -> Result<(), Vec<Error>> {
     let write_errors: Vec<Error> = files
         .par_iter()
         .filter_map(|(dest, _, file)| {
+            #[cfg(test)]
+            crate::site::record_work_thread(dest);
             let written = match file {
                 OutputFile::Bytes(bytes) => fs::write(dest, bytes).map_err(|e| (dest.clone(), e)),
                 OutputFile::Copy(src) => fs::copy(src, dest)

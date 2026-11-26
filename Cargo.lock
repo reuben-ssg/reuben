@@ -1913,6 +1913,7 @@ dependencies = [
  "assert_cmd",
  "assert_fs",
  "clap",
+ "libc",
  "predicates",
  "reuben-a11y",
  "reuben-core",
