@@ -9,6 +9,8 @@ use std::sync::Arc;
 
 use rhai::{Array, Dynamic, Map};
 
+use rayon::prelude::*;
+
 use crate::collections;
 use crate::data;
 use crate::error::{Error, ErrorKind};
@@ -65,7 +67,8 @@ impl Site {
         let mut errors = self.errors_for(found);
         let mut entries = Vec::new();
 
-        match page::page_map(found, &self.config) {
+        let math = self.config.markdown.math;
+        match page::page_map(found, &self.config, &found.pre_block(math).toc) {
             Ok(map) => self.page_entries(found, &map, &mut texts, &mut entries),
             Err(e) => errors.push(e),
         }
@@ -73,6 +76,13 @@ impl Site {
         self.data_entries(&mut entries);
 
         let visible: Vec<&Page> = self.pages.iter().filter(|p| !p.draft_excluded).collect();
+        // Parsed in parallel here rather than one by one as the collections are built.
+        visible
+            .par_iter()
+            .filter(|p| collections::is_member(p))
+            .for_each(|p| {
+                p.pre_block(math);
+            });
         let (collections, _) = collections::build(&visible, &self.config);
         for (name, value) in &collections {
             let count = value

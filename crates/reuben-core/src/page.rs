@@ -11,7 +11,7 @@ use crate::collections;
 use crate::config::Config;
 use crate::doc::Document;
 use crate::error::{Error, ErrorKind};
-use crate::headings;
+use crate::headings::{self, TocEntry};
 use crate::links::{self, AnchorRequest, PageIndex};
 use crate::markdown;
 use crate::math;
@@ -35,7 +35,8 @@ pub fn site_map(config: &Config) -> Result<Map, Error> {
     Ok(map)
 }
 
-pub(crate) fn page_map(page: &Page, config: &Config) -> Result<Map, Error> {
+/// `toc` is the page's table of contents before blocks run.
+pub(crate) fn page_map(page: &Page, config: &Config, toc: &[TocEntry]) -> Result<Map, Error> {
     let fm = &page.front_matter;
     let fail = |e: Box<rhai::EvalAltResult>| {
         Error::new(
@@ -73,43 +74,46 @@ pub(crate) fn page_map(page: &Page, config: &Config) -> Result<Map, Error> {
         "collection".into(),
         collections::public_name(&page.rel, config).into(),
     );
-    map.insert(
-        "toc".into(),
-        headings::toc_array(&page.pre_block_toc).into(),
-    );
+    map.insert("toc".into(), headings::toc_array(toc).into());
     Ok(map)
 }
 
-/// From one parse of the body: the table of contents before blocks run, and the summary (front matter
-/// `description`, else the plain text of the first paragraph with block placeholders removed). Both are what page
-/// blocks and collection items see. A body whose blocks can't be extracted has neither, beyond a `description`;
-/// the page's own render reports that error.
-pub(crate) fn precompute(
-    kind: PageKind,
-    description: Option<&str>,
-    body: &str,
-    body_line: usize,
-    math: bool,
-) -> (Vec<headings::TocEntry>, String) {
-    let described = || description.map_or_else(String::new, str::to_string);
-    if kind != PageKind::Markdown {
-        return (Vec::new(), described());
+/// What another page sees of this one before it renders: its collection item's `toc` and `summary`.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct PreBlock {
+    /// The table of contents before blocks run, which is also the page's own `page.toc` in its sidecar and blocks.
+    pub toc: Vec<TocEntry>,
+    /// Front matter `description`, else the plain text of the first paragraph with block placeholders removed.
+    pub summary: String,
+}
+
+/// From one parse of the body. A body whose blocks can't be extracted has neither a toc nor a summary beyond its
+/// `description`; the page's own render reports that error.
+pub(crate) fn pre_block(page: &Page, math: bool) -> PreBlock {
+    let description = page.front_matter.description.as_deref();
+    let described = || PreBlock {
+        toc: Vec::new(),
+        summary: description.map_or_else(String::new, str::to_string),
+    };
+    if page.kind != PageKind::Markdown {
+        return described();
     }
-    let skip = if markdown::has_blocks(body) {
-        markdown::code_ranges_with(body, math)
-    } else {
-        Vec::new()
+    let Some(doc) = parse_body(page, math) else {
+        return described();
     };
-    let Ok(extracted) = blocks::extract(body, body_line, &skip) else {
-        return (Vec::new(), described());
-    };
-    let mut doc = markdown::parse_extracted(&extracted, body_line, math);
-    let toc = headings::assign_ids_before_blocks(&mut doc);
-    let summary = match description {
-        Some(d) => d.to_string(),
-        None => first_paragraph_text(&doc),
-    };
-    (toc, summary)
+    PreBlock {
+        toc: headings::toc_before_blocks(&doc),
+        summary: match description {
+            Some(d) => d.to_string(),
+            None => first_paragraph_text(&doc),
+        },
+    }
+}
+
+/// The body with its blocks cut out and parsed, or `None` when the blocks can't be extracted.
+fn parse_body(page: &Page, math: bool) -> Option<Document> {
+    let extracted = blocks::extract(&page.body, page.body_line, page.code_ranges(math)).ok()?;
+    Some(markdown::parse_extracted(&extracted, page.body_line, math))
 }
 
 fn first_paragraph_text(doc: &Document) -> String {
@@ -143,8 +147,20 @@ pub fn build_scope(
     config: &Config,
     scopes: &SiteScopes<'_>,
 ) -> Result<Scope<'static>, Vec<Error>> {
+    let toc = &page.pre_block(config.markdown.math).toc;
+    scope_with_toc(page, engine, config, scopes, toc)
+}
+
+/// [`build_scope`] with the page's table of contents before blocks run already in hand.
+fn scope_with_toc(
+    page: &Page,
+    engine: &ScriptEngine,
+    config: &Config,
+    scopes: &SiteScopes<'_>,
+    toc: &[TocEntry],
+) -> Result<Scope<'static>, Vec<Error>> {
     let mut scope = Scope::new();
-    scope.push_constant("page", page_map(page, config).map_err(|e| vec![e])?);
+    scope.push_constant("page", page_map(page, config, toc).map_err(|e| vec![e])?);
     scope.push_constant("site", scopes.site.clone());
     scope.push_constant("data", scopes.data.clone());
     scope.push_constant("collections", scopes.collections.clone());
@@ -191,17 +207,20 @@ pub fn render_body(
     config: &Config,
     scopes: &SiteScopes<'_>,
 ) -> Result<RenderedBody, Failed> {
-    let mut scope = build_scope(page, engine, config, scopes)?;
     let math = config.markdown.math;
-
-    let skip = if markdown::has_blocks(&page.body) {
-        markdown::code_ranges_with(&page.body, math)
-    } else {
-        Vec::new()
-    };
-    let extracted = blocks::extract(&page.body, page.body_line, &skip)
-        .map_err(|e| vec![Error::new(&page.source, ErrorKind::Block(e))])?;
-    let mut doc = markdown::parse_extracted(&extracted, page.body_line, math);
+    // The page's own parse gives its toc before blocks run, so its scope needs no parse of its own. A sidecar
+    // error still comes before an extraction error, as the sidecar runs first.
+    let extracted = blocks::extract(&page.body, page.body_line, page.code_ranges(math));
+    let parsed = extracted
+        .as_ref()
+        .ok()
+        .map(|e| markdown::parse_extracted(e, page.body_line, math));
+    let pre_block_toc = parsed
+        .as_ref()
+        .map_or_else(Vec::new, headings::toc_before_blocks);
+    let mut scope = scope_with_toc(page, engine, config, scopes, &pre_block_toc)?;
+    let extracted = extracted.map_err(|e| vec![Error::new(&page.source, ErrorKind::Block(e))])?;
+    let mut doc = parsed.expect("an extracted body is parsed");
 
     let mut outputs = Vec::with_capacity(extracted.blocks.len());
     let mut errors = Vec::new();

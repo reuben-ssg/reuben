@@ -8,7 +8,8 @@ use std::path::{Path, PathBuf};
 use rayon::prelude::*;
 use walkdir::WalkDir;
 
-use std::sync::Arc;
+use std::ops::Range;
+use std::sync::{Arc, OnceLock};
 
 use reuben_a11y::{LocalLink, RuleSet};
 
@@ -21,19 +22,18 @@ use crate::data::{self, SiteData};
 use crate::dirs::{self, DirDefaults};
 use crate::error::{Error, ErrorKind};
 use crate::frontmatter::{self, FrontMatter};
-use crate::headings::TocEntry;
 use crate::lastmod;
 use crate::layout::Layouts;
 use crate::links::{AnchorRequest, LinkProblem, PageIndex, Target};
 use crate::output::{Output, OutputFile, Stage, check_out_dir, finish_atomic, prepare_staging};
-use crate::page::Failed;
+use crate::page::{Failed, PreBlock};
 use crate::route::{Route, route_for_page, route_for_template};
 use crate::script::helpers::url_for;
 use crate::script::{Html, LinkContext, ScriptEngine, take_asset_misses, with_link_context};
 use crate::sitemap;
 use crate::template::{self, Escape};
 use crate::theme::{PageShell, builtin_page};
-use crate::{html, layout, page, splice};
+use crate::{html, layout, markdown, page, splice};
 
 /// Written into every output directory Reuben builds. Only a directory containing it is ever cleared.
 pub const OUTPUT_MARKER: &str = ".reuben-output";
@@ -64,12 +64,33 @@ pub struct Page {
     pub front_matter_sources: BTreeMap<String, PathBuf>,
     /// Hidden from normal builds: the page or a folder above it is a draft.
     pub draft_excluded: bool,
-    /// The table of contents before blocks run, computed once at load.
-    pub pre_block_toc: Vec<TocEntry>,
-    /// Front matter `description`, else the first paragraph's text, computed once at load.
-    pub summary: String,
     /// The accessibility rules checked on this page: the config's, minus the page's own `a11y.disable`.
     pub rules: RuleSet,
+    /// Parsed only when another page may read it before this one renders: see [`Page::pre_block`].
+    pub(crate) pre_block: OnceLock<PreBlock>,
+    /// See [`Page::code_ranges`].
+    pub(crate) code_ranges: OnceLock<Vec<Range<usize>>>,
+}
+
+impl Page {
+    /// The table of contents before blocks run and the summary, parsed on first use and kept. A render asks for
+    /// them only when a script may read them from another page; the page's own render takes its toc from its own
+    /// parse.
+    pub fn pre_block(&self, math: bool) -> &PreBlock {
+        self.pre_block.get_or_init(|| page::pre_block(self, math))
+    }
+
+    /// Byte ranges of the body inside code, where `{{` stays literal, found on first use and kept so the early
+    /// parse and the render share them. Empty without a block opener.
+    pub(crate) fn code_ranges(&self, math: bool) -> &[Range<usize>] {
+        self.code_ranges.get_or_init(|| {
+            if markdown::has_blocks(&self.body) {
+                markdown::code_ranges_with(&self.body, math)
+            } else {
+                Vec::new()
+            }
+        })
+    }
 }
 
 #[derive(Debug)]
@@ -372,17 +393,6 @@ impl Site {
             _ => Vec::new(),
         };
 
-        let math = config.markdown.math;
-        pages.par_iter_mut().for_each(|page| {
-            (page.pre_block_toc, page.summary) = page::precompute(
-                page.kind,
-                page.front_matter.description.as_deref(),
-                &page.body,
-                page.body_line,
-                math,
-            );
-        });
-
         Ok(Site {
             data: site_data,
             root: root.to_path_buf(),
@@ -427,6 +437,40 @@ impl Site {
         PageIndex::new(loaded.chain(failed))
     }
 
+    /// Whether any script a render of `pages` may run names `collections`: a page's blocks or template body, a
+    /// sidecar, a layout or an include. A script reads a scope variable only by naming it, since `eval` is off and
+    /// scripts can't list their scope, so when none does no page can read another's summary or toc. A file that
+    /// can't be read counts as naming it.
+    fn collections_named(&self, pages: &[&Page]) -> bool {
+        const NAME: &str = "collections";
+        let names = |path: &Path| fs::read_to_string(path).map_or(true, |text| text.contains(NAME));
+        let in_dir = |dir: &Path| match fs::read_dir(dir) {
+            Ok(mut entries) => entries.any(|entry| match entry {
+                Ok(entry) => {
+                    let path = entry.path();
+                    path.is_file() && names(&path)
+                }
+                Err(_) => true,
+            }),
+            Err(e) => e.kind() != io::ErrorKind::NotFound,
+        };
+        let in_page = |page: &&Page| {
+            let blocks = match page.kind {
+                PageKind::Markdown => markdown::has_blocks(&page.body),
+                PageKind::Template { .. } => true,
+            };
+            (blocks && page.body.contains(NAME)) || page.sidecar.as_deref().is_some_and(names)
+        };
+        let layout_dirs = [Some(self.root.as_path()), self.config.theme.as_deref()]
+            .into_iter()
+            .flatten()
+            .map(|dir| dir.join("layouts"));
+        pages.iter().any(in_page)
+            || layout_dirs
+                .chain(include_dirs(&self.root, &self.config))
+                .any(|dir| in_dir(&dir))
+    }
+
     /// Renders the whole site into memory. Nothing touches the disk, and no file is `OutputFile::Staged`.
     pub fn render(&self, opts: &RenderOptions) -> Result<(Output, BuildReport), Failure> {
         self.render_into(opts, None)
@@ -448,8 +492,39 @@ impl Site {
         let mut errors = self.load_errors.clone();
         let (mut collision_errors, colliding) = self.check_collisions(&pages, opts.drafts);
         errors.append(&mut collision_errors);
-        let (collections, mut collection_errors) = collections::build(&pages, &self.config);
+        // A pool that can't start is reported, and the build carries on with rayon's default pool.
+        let mut pool_error = None;
+        let pool =
+            opts.jobs.and_then(
+                |n| match rayon::ThreadPoolBuilder::new().num_threads(n).build() {
+                    Ok(pool) => Some(pool),
+                    Err(e) => {
+                        pool_error = Some(Error::new(
+                            "reuben.toml",
+                            ErrorKind::Config(format!("can't start {n} render threads: {e}")),
+                        ));
+                        None
+                    }
+                },
+            );
+        // Collection items carry each member's summary and toc before blocks run, which takes a parse of its own.
+        // Only a script that names `collections` can read them, so without one the items go without.
+        let read = self.collections_named(&pages);
+        if read {
+            let math = self.config.markdown.math;
+            in_pool(pool.as_ref(), || {
+                pages
+                    .par_iter()
+                    .filter(|p| collections::is_member(p))
+                    .for_each(|p| {
+                        p.pre_block(math);
+                    });
+            });
+        }
+        let (collections, mut collection_errors) =
+            collections::build_with(&pages, &self.config, read);
         errors.append(&mut collection_errors);
+        errors.extend(pool_error);
 
         let index = Arc::new(self.page_index(opts.drafts));
         let scopes = page::SiteScopes {
@@ -478,20 +553,6 @@ impl Site {
             }
             Ok(done)
         };
-        // A pool that can't start is reported, and the build carries on with rayon's default pool.
-        let pool =
-            opts.jobs.and_then(
-                |n| match rayon::ThreadPoolBuilder::new().num_threads(n).build() {
-                    Ok(pool) => Some(pool),
-                    Err(e) => {
-                        errors.push(Error::new(
-                            "reuben.toml",
-                            ErrorKind::Config(format!("can't start {n} render threads: {e}")),
-                        ));
-                        None
-                    }
-                },
-            );
         // Skipped pages count as failed with nothing to add, so templated partials still import as empty.
         let render_all =
             |batch: &[&Page], assets: &Arc<AssetMap>| -> Vec<Result<Rendered, Failed>> {
@@ -1498,8 +1559,8 @@ fn load_page_from(
         route,
         front_matter_sources: merged.sources,
         draft_excluded: false,
-        pre_block_toc: Vec::new(),
-        summary: String::new(),
+        pre_block: OnceLock::new(),
+        code_ranges: OnceLock::new(),
         rules,
     })
 }
@@ -1628,8 +1689,8 @@ mod tests {
             route: route_for_template(Path::new("side.css")),
             front_matter_sources: BTreeMap::new(),
             draft_excluded: false,
-            pre_block_toc: Vec::new(),
-            summary: String::new(),
+            pre_block: OnceLock::new(),
+            code_ranges: OnceLock::new(),
             rules: RuleSet::all(),
         }
     }
@@ -2075,5 +2136,178 @@ mod tests {
             Some(OutputFile::Bytes(_))
         ));
         assert!(!stage.join("theme.css").exists());
+    }
+
+    /// How many body parses and code-range parses ran on a page whose body holds `marker`.
+    fn parses(marker: &str) -> (usize, usize) {
+        use crate::markdown;
+        let log = markdown::PARSES.lock().unwrap();
+        let count = |pass| {
+            log.iter()
+                .filter(|(p, text)| *p == pass && text.contains(marker))
+                .count()
+        };
+        (
+            count(markdown::Pass::Body),
+            count(markdown::Pass::CodeRanges),
+        )
+    }
+
+    fn html_of(output: &Output, file: &str) -> String {
+        match output.files.get(Path::new(file)) {
+            Some(OutputFile::Bytes(bytes)) => String::from_utf8(bytes.clone()).unwrap(),
+            other => panic!("{file}: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn each_page_is_parsed_once_when_no_script_reads_collections() {
+        let tmp = site_dir(&[
+            (
+                "content/index.md",
+                "---\ntitle: Home\n---\nparsed-once-home {{ page.toc.len() }}\n",
+            ),
+            (
+                "content/docs/a.md",
+                "---\ntitle: A\n---\n# A\n\nparsed-once-blocks `{{ x }}` {{ 1 + 1 }}\n",
+            ),
+            (
+                "content/docs/b.md",
+                "---\ntitle: B\n---\n# B\n\nparsed-once-plain text\n",
+            ),
+        ]);
+        render_site(tmp.path()).unwrap();
+        assert_eq!(parses("parsed-once-home"), (1, 1));
+        assert_eq!(parses("parsed-once-blocks"), (1, 1));
+        assert_eq!(parses("parsed-once-plain"), (1, 0));
+    }
+
+    #[test]
+    fn only_collection_members_are_parsed_early_and_only_when_collections_are_read() {
+        let tmp = site_dir(&[
+            (
+                "content/index.md",
+                "---\ntitle: Home\n---\nparsed-early-home {{ collections.docs.map(|p| p.summary) }}\n",
+            ),
+            (
+                "content/docs/a.md",
+                "---\ntitle: A\n---\n# A\n\nparsed-early-blocks `{{ x }}` {{ 1 + 1 }}\n",
+            ),
+            (
+                "content/docs/b.md",
+                "---\ntitle: B\n---\n# B\n\nparsed-early-plain text\n",
+            ),
+        ]);
+        let (output, _) = render_site(tmp.path()).unwrap();
+        // The home page is in no collection, so nothing reads its summary before it renders.
+        assert_eq!(parses("parsed-early-home"), (1, 1));
+        // Members are parsed once for their summary and table of contents, and again when they render, but their
+        // code ranges are found once.
+        assert_eq!(parses("parsed-early-blocks"), (2, 1));
+        assert_eq!(parses("parsed-early-plain"), (2, 0));
+        let home = html_of(&output, "index.html");
+        assert!(home.contains("parsed-early-blocks {{ x }}"), "{home}");
+        assert!(home.contains("parsed-early-plain text"), "{home}");
+    }
+
+    /// Every member reads every member's summary and table of contents, so under parallel rendering some read a page
+    /// that hasn't rendered yet. The page's own `page.toc` is the one before blocks run in its sidecar and blocks,
+    /// and the final one in its layout.
+    #[test]
+    fn early_summaries_and_tables_of_contents_are_the_same_everywhere() {
+        let mut files = vec![
+            (
+                "layouts/default.html".to_string(),
+                "<html><body>{{ content }}<p>final-toc {{ page.toc.map(|t| t.id) }}</p></body></html>\n"
+                    .to_string(),
+            ),
+            (
+                "content/index.md".to_string(),
+                "---\ntitle: Home\n---\n{{ collections.docs.map(|p| p.summary + \"|\" + p.toc.map(|t| t.id)) }}\n"
+                    .to_string(),
+            ),
+        ];
+        for i in 0..24 {
+            files.push((
+                format!("content/docs/p{i:02}.md"),
+                format!(
+                    "---\ntitle: P{i}\n---\n# Head {i}\n\nSummary {i} with *em* and `{{{{ code }}}}`.\n\n## {{{{ page.title }}}}\n\n## Tail\n\nown-toc {{{{ page.toc.map(|t| t.id) }}}} sidecar {{{{ own }}}}\n\nall {{{{ collections.docs.map(|p| p.summary + \"|\" + p.toc.map(|t| t.id)) }}}}\n"
+                ),
+            ));
+            files.push((
+                format!("content/docs/p{i:02}.rhai"),
+                "let own = page.toc.len();\n".to_string(),
+            ));
+        }
+        let refs: Vec<(&str, &str)> = files
+            .iter()
+            .map(|(p, t)| (p.as_str(), t.as_str()))
+            .collect();
+        let tmp = site_dir(&refs);
+        let site = Site::load(tmp.path()).unwrap();
+        for jobs in [Some(1), Some(4), None] {
+            let (output, _) = site
+                .render(&RenderOptions {
+                    drafts: false,
+                    jobs,
+                })
+                .unwrap();
+            let mut pages = vec![html_of(&output, "index.html")];
+            for i in 0..24 {
+                let html = html_of(&output, &format!("docs/p{i:02}/index.html"));
+                assert!(
+                    html.contains(&format!("own-toc head-{i}tail sidecar 2")),
+                    "{html}"
+                );
+                assert!(
+                    html.contains(&format!("final-toc head-{i}p{i}tail</p>")),
+                    "{html}"
+                );
+                pages.push(html);
+            }
+            for html in &pages {
+                for i in 0..24 {
+                    let item = format!(
+                        "Summary {i} with em and {{{{ code }}}}.|[&quot;head-{i}&quot;, &quot;tail&quot;]"
+                    );
+                    assert!(html.contains(&item), "{item} in {html}");
+                }
+            }
+        }
+    }
+
+    /// Collections are read from a layout, a sidecar or a template page, with no page block naming them.
+    #[test]
+    fn collections_read_outside_page_blocks_still_see_summaries() {
+        let member = (
+            "content/docs/a.md",
+            "---\ntitle: A\n---\n# Alpha\n\nAlpha summary.\n",
+        );
+        let read = "{{ collections.docs.map(|p| p.summary + \"|\" + p.toc.map(|t| t.id)) }}";
+        let expected = "Alpha summary.|[&quot;alpha&quot;]";
+
+        let layout = format!("<html><body>{{{{ content }}}}{read}</body></html>\n");
+        let tmp = site_dir(&[member, ("layouts/default.html", &layout)]);
+        let (output, _) = render_site(tmp.path()).unwrap();
+        let html = html_of(&output, "docs/a/index.html");
+        assert!(html.contains(expected), "{html}");
+
+        let tmp = site_dir(&[
+            member,
+            ("content/b.md", "---\ntitle: B\n---\n{{ seen }}\n"),
+            (
+                "content/b.rhai",
+                "let seen = collections.docs.map(|p| p.summary + \"|\" + p.toc.map(|t| t.id));\n",
+            ),
+        ]);
+        let (output, _) = render_site(tmp.path()).unwrap();
+        let html = html_of(&output, "b/index.html");
+        assert!(html.contains(expected), "{html}");
+
+        let template = format!("---\ntitle: L\n---\n{read}\n");
+        let tmp = site_dir(&[member, ("static/list.html", &template)]);
+        let (output, _) = render_site(tmp.path()).unwrap();
+        let html = html_of(&output, "list/index.html");
+        assert!(html.contains(expected), "{html}");
     }
 }
