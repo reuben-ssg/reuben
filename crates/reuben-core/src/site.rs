@@ -12,7 +12,7 @@ use std::borrow::Cow;
 use std::ops::Range;
 use std::sync::Arc;
 
-use reuben_a11y::{LocalLink, RuleSet};
+use reuben_a11y::{LocalLink, Rule, RuleSet};
 
 use crate::assets::{self, AssetMap};
 use crate::check::{self, Finding, TreeReport};
@@ -817,7 +817,20 @@ impl Site {
                 let missing = page_ids
                     .get(anchor.target.as_path())
                     .is_some_and(|ids| !ids.contains(&anchor.fragment));
-                if missing {
+                if missing && anchor.plain {
+                    findings.push(Finding {
+                        path: page.source.clone(),
+                        location: Some(anchor.location),
+                        rule: Rule::LinkTarget,
+                        message: LinkProblem::NoAnchor {
+                            target: anchor.target.clone(),
+                            fragment: anchor.fragment.clone(),
+                        }
+                        .to_string(),
+                        include: None,
+                        built: None,
+                    });
+                } else if missing {
                     errors.push(Error::new(
                         &page.source,
                         ErrorKind::Link {

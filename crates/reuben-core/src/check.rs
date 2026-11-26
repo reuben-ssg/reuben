@@ -18,7 +18,8 @@ use crate::splice::{Markup, Output};
 pub struct Finding {
     /// The page's source file.
     pub path: PathBuf,
-    /// The line in `path` the problem is traced to. `None` for HTML-pass findings, which have `built` instead.
+    /// The line in `path` the problem is traced to. `None` for HTML-pass findings, which have `built` instead; a
+    /// missing anchor on a plain link has a location and no `built`.
     pub location: Option<Span>,
     pub rule: Rule,
     pub message: String,

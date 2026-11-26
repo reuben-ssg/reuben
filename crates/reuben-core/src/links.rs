@@ -270,20 +270,26 @@ pub struct AnchorRequest {
     pub target: PathBuf,
     pub fragment: String,
     pub location: Span,
+    /// Written as a plain root-relative link, not `@/page.md`. A missing anchor is then a `link-target` finding,
+    /// which the rule can switch off, instead of an error.
+    pub plain: bool,
 }
 
 /// Rewrites every source link in `doc` (written in the page at `from_rel`) to its page URL under `base_path`.
 /// A link that can't be resolved is left as written and reported with the link's position.
+/// Plain root-relative links with a `#fragment` are only looked at when `plain_anchors` is set.
 pub fn resolve_tree(
     doc: &mut Document,
     from_rel: &Path,
     index: &PageIndex,
     base_path: &str,
+    plain_anchors: bool,
 ) -> (Vec<(Span, LinkProblem)>, Vec<AnchorRequest>) {
     let mut resolver = Resolver {
         from_rel,
         index,
         base: base_path.trim_end_matches('/'),
+        plain_anchors,
         problems: Vec::new(),
         anchors: Vec::new(),
     };
@@ -312,6 +318,7 @@ struct Resolver<'a> {
     from_rel: &'a Path,
     index: &'a PageIndex,
     base: &'a str,
+    plain_anchors: bool,
     problems: Vec<(Span, LinkProblem)>,
     anchors: Vec<AnchorRequest>,
 }
@@ -326,15 +333,17 @@ impl Resolver<'_> {
                         *url = format!("{page}{suffix}");
                     }
                 }
-                None => {
+                None if self.plain_anchors => {
                     if let Some((target, fragment)) = self.index.plain_anchor(url, self.base) {
                         self.anchors.push(AnchorRequest {
                             target,
                             fragment,
                             location: span,
+                            plain: true,
                         });
                     }
                 }
+                None => {}
             },
             NodeKind::HtmlBlock(html) | NodeKind::HtmlInline(html) => {
                 self.resolve_html(html, &mut [], span);
@@ -360,6 +369,7 @@ impl Resolver<'_> {
                         target: resolved.target,
                         fragment,
                         location,
+                        plain: false,
                     });
                 }
                 Some((
@@ -561,7 +571,7 @@ mod tests {
         let mut doc = tree("`[x](a.md)`\n\n```\n[y](b.md)\n```");
         let before = doc.clone();
         let (problems, anchors) =
-            resolve_tree(&mut doc, Path::new("p.md"), &PageIndex::default(), "");
+            resolve_tree(&mut doc, Path::new("p.md"), &PageIndex::default(), "", true);
         assert!(problems.is_empty() && anchors.is_empty());
         assert_eq!(doc, before);
     }
@@ -569,7 +579,7 @@ mod tests {
     #[test]
     fn reference_links_resolve() {
         let mut doc = tree("[x][r]\n\n[r]: ../c.md");
-        let (problems, _) = resolve_tree(&mut doc, Path::new("a/b.md"), &index(), "");
+        let (problems, _) = resolve_tree(&mut doc, Path::new("a/b.md"), &index(), "", true);
         assert!(problems.is_empty(), "{problems:?}");
         fn find(n: &crate::doc::Node) -> Option<String> {
             if let crate::doc::NodeKind::Link { url, .. } = &n.kind {

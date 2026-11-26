@@ -7,6 +7,8 @@ use rhai::serde::to_dynamic;
 use rhai::{Dynamic, Map, Scope};
 
 use crate::blocks::{self};
+use reuben_a11y::Rule;
+
 use crate::check;
 use crate::collections;
 use crate::config::Config;
@@ -276,6 +278,7 @@ pub fn render_body(
         &page.rel,
         scopes.pages,
         &check::base_path(&config.base_url),
+        page.rules.is_on(Rule::LinkTarget),
     );
     errors.extend(link_problems.into_iter().map(|(location, problem)| {
         Error::new(&page.source, ErrorKind::Link { problem, location })

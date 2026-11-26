@@ -2,8 +2,9 @@ use std::fs;
 
 use assert_fs::TempDir;
 use assert_fs::prelude::*;
+use reuben_a11y::Rule;
 use reuben_core::ErrorKind;
-use reuben_core::site::{BuildOptions, Failure, Site};
+use reuben_core::site::{BuildOptions, BuildReport, Failure, Site};
 
 fn site_of(files: &[(&str, &str)]) -> TempDir {
     let tmp = TempDir::new().unwrap();
@@ -434,6 +435,28 @@ fn link_errors(errors: &[reuben_core::Error]) -> Vec<(usize, usize, String)> {
         .collect()
 }
 
+fn build_report(tmp: &TempDir) -> Result<BuildReport, Failure> {
+    Site::load(tmp.path())?.build(&BuildOptions {
+        drafts: false,
+        out: tmp.path().join("dist"),
+        jobs: None,
+    })
+}
+
+fn link_target_findings(report: &BuildReport) -> Vec<(usize, usize, String)> {
+    report
+        .findings
+        .iter()
+        .filter(|f| f.rule == Rule::LinkTarget)
+        .filter_map(|f| {
+            let at = f.location?;
+            Some((at.line, at.column, f.message.clone()))
+        })
+        .collect()
+}
+
+const BROKEN_PLAIN_ANCHOR: &str = "[no](/c/#nope)";
+
 #[test]
 fn plain_links_check_their_anchors() {
     let tmp = site_of(&[
@@ -445,10 +468,11 @@ fn plain_links_check_their_anchors() {
         ),
         ("content/c.md", &page("# Top")),
     ]);
-    let errors = build(&tmp).unwrap_err();
-    let got = link_errors(&errors);
+    let report = build_report(&tmp).unwrap();
+    let got = link_target_findings(&report);
     let lines: Vec<usize> = got.iter().map(|g| g.0).collect();
     assert_eq!(lines, [6, 8, 10, 12], "{got:?}");
+    assert_eq!(got[0].1, 1);
     assert_eq!(got[0].2, "links to `#nope` on `c.md`, which has no such id");
 }
 
@@ -468,10 +492,66 @@ fn plain_anchors_follow_the_base_path() {
         ("content/c.md", &page("# Top")),
         ("static/f.txt", "hi"),
     ]);
-    let errors = build(&tmp).unwrap_err();
-    let got = link_errors(&errors);
+    let report = build_report(&tmp).unwrap();
+    let got = link_target_findings(&report);
     assert_eq!(got.len(), 1, "{got:?}");
     assert_eq!(got[0].0, 6);
+}
+
+#[test]
+fn plain_anchors_are_not_checked_without_link_target() {
+    let tmp = site_of(&[
+        (
+            "reuben.toml",
+            "title = \"S\"\n[a11y]\ndisable = [\"link-target\"]\n",
+        ),
+        ("content/b.md", &page(BROKEN_PLAIN_ANCHOR)),
+        ("content/c.md", &page("# Top")),
+    ]);
+    let report = build_report(&tmp).unwrap();
+    assert!(link_target_findings(&report).is_empty(), "{report:?}");
+}
+
+#[test]
+fn plain_anchors_follow_a_pages_own_a11y_disable() {
+    let tmp = site_of(&[
+        (
+            "content/b.md",
+            &format!(
+                "---\ntitle: T\na11y:\n  disable: [link-target]\n---\n{BROKEN_PLAIN_ANCHOR}\n"
+            ),
+        ),
+        ("content/d.md", &page(BROKEN_PLAIN_ANCHOR)),
+        ("content/c.md", &page("# Top")),
+    ]);
+    let report = build_report(&tmp).unwrap();
+    let files: Vec<_> = report
+        .findings
+        .iter()
+        .filter(|f| f.rule == Rule::LinkTarget)
+        .map(|f| f.path.file_name().unwrap().to_string_lossy().into_owned())
+        .collect();
+    assert_eq!(files, ["d.md"], "{report:?}");
+}
+
+#[test]
+fn source_link_anchors_are_errors_without_link_target() {
+    let tmp = site_of(&[
+        (
+            "reuben.toml",
+            "title = \"S\"\n[a11y]\ndisable = [\"link-target\"]\n",
+        ),
+        ("content/b.md", &page("[no](@/c.md#nope)")),
+        ("content/c.md", &page("# Top")),
+    ]);
+    let errors = build(&tmp).unwrap_err();
+    assert_eq!(
+        link_errors(&errors)
+            .into_iter()
+            .map(|e| e.2)
+            .collect::<Vec<_>>(),
+        ["links to `#nope` on `c.md`, which has no such id"]
+    );
 }
 
 #[test]
