@@ -1,5 +1,6 @@
 //! Evaluates a page: sidecar script, then its blocks in one scope, spliced into the document tree.
 
+use std::ops::Range;
 use std::sync::Arc;
 
 use rhai::serde::to_dynamic;
@@ -11,7 +12,7 @@ use crate::collections;
 use crate::config::Config;
 use crate::doc::Document;
 use crate::error::{Error, ErrorKind};
-use crate::headings;
+use crate::headings::{self, TocEntry};
 use crate::links::{self, AnchorRequest, PageIndex};
 use crate::markdown;
 use crate::math;
@@ -35,7 +36,8 @@ pub fn site_map(config: &Config) -> Result<Map, Error> {
     Ok(map)
 }
 
-pub(crate) fn page_map(page: &Page, config: &Config) -> Result<Map, Error> {
+/// `toc` is the page's table of contents before blocks run.
+pub(crate) fn page_map(page: &Page, config: &Config, toc: &[TocEntry]) -> Result<Map, Error> {
     let fm = &page.front_matter;
     let fail = |e: Box<rhai::EvalAltResult>| {
         Error::new(
@@ -73,43 +75,68 @@ pub(crate) fn page_map(page: &Page, config: &Config) -> Result<Map, Error> {
         "collection".into(),
         collections::public_name(&page.rel, config).into(),
     );
-    map.insert(
-        "toc".into(),
-        headings::toc_array(&page.pre_block_toc).into(),
-    );
+    map.insert("toc".into(), headings::toc_array(toc).into());
     Ok(map)
 }
 
-/// From one parse of the body: the table of contents before blocks run, and the summary (front matter
-/// `description`, else the plain text of the first paragraph with block placeholders removed). Both are what page
-/// blocks and collection items see. A body whose blocks can't be extracted has neither, beyond a `description`;
-/// the page's own render reports that error.
-pub(crate) fn precompute(
-    kind: PageKind,
-    description: Option<&str>,
-    body: &str,
-    body_line: usize,
-    math: bool,
-) -> (Vec<headings::TocEntry>, String) {
-    let described = || description.map_or_else(String::new, str::to_string);
-    if kind != PageKind::Markdown {
-        return (Vec::new(), described());
+/// What another page sees of this one before it renders: its collection item's `toc` and `summary`.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct PreBlock {
+    /// The table of contents before blocks run, which is also the page's own `page.toc` in its sidecar and blocks.
+    pub toc: Vec<TocEntry>,
+    /// Front matter `description`, else the plain text of the first paragraph with block placeholders removed.
+    pub summary: String,
+    /// Byte ranges of the body inside code, where `{{` stays literal, kept so the page's render needn't find them
+    /// again.
+    pub(crate) code_ranges: Box<[Range<usize>]>,
+}
+
+/// From one parse of the body. A body whose blocks can't be extracted has neither a toc nor a summary beyond its
+/// `description`; the page's own render reports that error.
+pub(crate) fn pre_block(page: &Page, math: bool) -> PreBlock {
+    let description = page.front_matter.description.as_deref();
+    let summary = || description.map_or_else(String::new, str::to_string);
+    if page.kind != PageKind::Markdown {
+        return PreBlock {
+            summary: summary(),
+            ..PreBlock::default()
+        };
     }
-    let skip = if markdown::has_blocks(body) {
-        markdown::code_ranges_with(body, math)
-    } else {
-        Vec::new()
+    let code_ranges: Box<[Range<usize>]> = code_ranges(&page.body, math).into();
+    let Ok(extracted) = blocks::extract(&page.body, page.body_line, &code_ranges) else {
+        return PreBlock {
+            summary: summary(),
+            code_ranges,
+            ..PreBlock::default()
+        };
     };
-    let Ok(extracted) = blocks::extract(body, body_line, &skip) else {
-        return (Vec::new(), described());
-    };
-    let mut doc = markdown::parse_extracted(&extracted, body_line, math);
-    let toc = headings::assign_ids_before_blocks(&mut doc);
-    let summary = match description {
-        Some(d) => d.to_string(),
-        None => first_paragraph_text(&doc),
-    };
-    (toc, summary)
+    let doc = markdown::parse_extracted(&extracted, page.body_line, math);
+    let mut toc = headings::toc_before_blocks(&doc);
+    toc.shrink_to_fit();
+    PreBlock {
+        toc,
+        summary: match description {
+            Some(d) => d.to_string(),
+            None => first_paragraph_text(&doc),
+        },
+        code_ranges,
+    }
+}
+
+/// The byte ranges of `body` inside code that hold a block opener, which must stay literal. [`blocks::extract`]
+/// checks ranges only at an opener, so the other ranges are dropped rather than kept until the page renders.
+pub(crate) fn code_ranges(body: &str, math: bool) -> Vec<Range<usize>> {
+    if !markdown::has_blocks(body) {
+        return Vec::new();
+    }
+    let bytes = body.as_bytes();
+    let mut ranges = markdown::code_ranges_with(body, math);
+    ranges.retain(|r| {
+        bytes[r.start..(r.end + 1).min(bytes.len())]
+            .windows(2)
+            .any(|w| w == b"{{" || w == b"{%")
+    });
+    ranges
 }
 
 fn first_paragraph_text(doc: &Document) -> String {
@@ -143,8 +170,20 @@ pub fn build_scope(
     config: &Config,
     scopes: &SiteScopes<'_>,
 ) -> Result<Scope<'static>, Vec<Error>> {
+    let pre_block = page.pre_block(config.markdown.math);
+    scope_with_toc(page, engine, config, scopes, &pre_block.toc)
+}
+
+/// [`build_scope`] with the page's table of contents before blocks run already in hand.
+fn scope_with_toc(
+    page: &Page,
+    engine: &ScriptEngine,
+    config: &Config,
+    scopes: &SiteScopes<'_>,
+    toc: &[TocEntry],
+) -> Result<Scope<'static>, Vec<Error>> {
     let mut scope = Scope::new();
-    scope.push_constant("page", page_map(page, config).map_err(|e| vec![e])?);
+    scope.push_constant("page", page_map(page, config, toc).map_err(|e| vec![e])?);
     scope.push_constant("site", scopes.site.clone());
     scope.push_constant("data", scopes.data.clone());
     scope.push_constant("collections", scopes.collections.clone());
@@ -191,17 +230,31 @@ pub fn render_body(
     config: &Config,
     scopes: &SiteScopes<'_>,
 ) -> Result<RenderedBody, Failed> {
-    let mut scope = build_scope(page, engine, config, scopes)?;
     let math = config.markdown.math;
-
-    let skip = if markdown::has_blocks(&page.body) {
-        markdown::code_ranges_with(&page.body, math)
-    } else {
-        Vec::new()
+    // The page's own parse gives its toc before blocks run, so its scope needs no parse of its own. A sidecar
+    // error still comes before an extraction error, as the sidecar runs first.
+    let extracted = {
+        let code_ranges = page.code_ranges(math);
+        blocks::extract(&page.body, page.body_line, &code_ranges)
     };
-    let extracted = blocks::extract(&page.body, page.body_line, &skip)
-        .map_err(|e| vec![Error::new(&page.source, ErrorKind::Block(e))])?;
-    let mut doc = markdown::parse_extracted(&extracted, page.body_line, math);
+    let parsed = extracted
+        .as_ref()
+        .ok()
+        .map(|e| markdown::parse_extracted(e, page.body_line, math));
+    // A toc kept from load is reused: working it out again costs a measurable rise in peak memory.
+    let computed;
+    let pre_block_toc: &[TocEntry] = match &page.pre_block {
+        Some(kept) => &kept.toc,
+        None => {
+            computed = parsed
+                .as_ref()
+                .map_or_else(Vec::new, headings::toc_before_blocks);
+            &computed
+        }
+    };
+    let mut scope = scope_with_toc(page, engine, config, scopes, pre_block_toc)?;
+    let extracted = extracted.map_err(|e| vec![Error::new(&page.source, ErrorKind::Block(e))])?;
+    let mut doc = parsed.expect("an extracted body is parsed");
 
     let mut outputs = Vec::with_capacity(extracted.blocks.len());
     let mut errors = Vec::new();
@@ -248,4 +301,29 @@ pub fn render_body(
         outputs,
         anchors,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Dropping code ranges that hold no opener changes nothing `extract` produces.
+    #[test]
+    fn kept_code_ranges_extract_like_all_of_them() {
+        let bodies = [
+            "a `{{ x }}` b {{ 1 }} `plain` c\n\n```\n{% y %}\n```\n\n{{ 2 }} `{` `{{` `{%`{{ 3 }}\n",
+            "`a`{{ 1 }}`b`\n\n    {{ indented }}\n\n$x {{ m }}$ {{{ 4 }}}\n",
+            "``{{`` {{ 5 }} `}}` `{{ unclosed",
+        ];
+        for body in bodies {
+            for math in [false, true] {
+                let all = markdown::code_ranges_with(body, math);
+                let kept = code_ranges(body, math);
+                assert!(kept.len() <= all.len());
+                let a = blocks::extract(body, 1, &all).map(|e| (e.text, e.blocks));
+                let k = blocks::extract(body, 1, &kept).map(|e| (e.text, e.blocks));
+                assert_eq!(format!("{a:?}"), format!("{k:?}"), "{body}");
+            }
+        }
+    }
 }

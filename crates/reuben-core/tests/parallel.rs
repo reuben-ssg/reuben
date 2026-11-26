@@ -104,7 +104,8 @@ fn pre_block_toc_computed_once() {
         .unwrap();
     let site = Site::load(tmp.path()).unwrap();
     let page = site.pages.iter().find(|p| p.rel.ends_with("a.md")).unwrap();
-    let ids: Vec<&str> = page.pre_block_toc.iter().map(|t| t.id.as_str()).collect();
+    let pre_block = site.pre_block(page);
+    let ids: Vec<&str> = pre_block.toc.iter().map(|t| t.id.as_str()).collect();
     assert_eq!(ids, ["one", "one-1"]);
     let output = render(&site, 2).unwrap();
     let home = output
@@ -125,13 +126,16 @@ fn site_is_sync() {
 }
 
 #[test]
-fn summary_is_precomputed() {
+fn summary_is_first_paragraph() {
     let tmp = TempDir::new().unwrap();
     tmp.child("content/index.md")
         .write_str("---\ntitle: Home\n---\nFirst paragraph here.\n\nSecond.\n")
         .unwrap();
     let site = Site::load(tmp.path()).unwrap();
-    assert_eq!(site.pages[0].summary, "First paragraph here.");
+    assert_eq!(
+        site.pre_block(&site.pages[0]).summary,
+        "First paragraph here."
+    );
 }
 
 #[test]

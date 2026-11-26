@@ -65,7 +65,7 @@ impl Site {
         let mut errors = self.errors_for(found);
         let mut entries = Vec::new();
 
-        match page::page_map(found, &self.config) {
+        match page::page_map(found, &self.config, &self.pre_block(found).toc) {
             Ok(map) => self.page_entries(found, &map, &mut texts, &mut entries),
             Err(e) => errors.push(e),
         }
@@ -73,7 +73,8 @@ impl Site {
         self.data_entries(&mut entries);
 
         let visible: Vec<&Page> = self.pages.iter().filter(|p| !p.draft_excluded).collect();
-        let (collections, _) = collections::build(&visible, &self.config);
+        let (collections, _) =
+            collections::build_with(&visible, &self.config, self.collections_named);
         for (name, value) in &collections {
             let count = value
                 .clone()

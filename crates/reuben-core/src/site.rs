@@ -8,6 +8,8 @@ use std::path::{Path, PathBuf};
 use rayon::prelude::*;
 use walkdir::WalkDir;
 
+use std::borrow::Cow;
+use std::ops::Range;
 use std::sync::Arc;
 
 use reuben_a11y::{LocalLink, RuleSet};
@@ -21,19 +23,18 @@ use crate::data::{self, SiteData};
 use crate::dirs::{self, DirDefaults};
 use crate::error::{Error, ErrorKind};
 use crate::frontmatter::{self, FrontMatter};
-use crate::headings::TocEntry;
 use crate::lastmod;
 use crate::layout::Layouts;
 use crate::links::{AnchorRequest, LinkProblem, PageIndex, Target};
 use crate::output::{Output, OutputFile, Stage, check_out_dir, finish_atomic, prepare_staging};
-use crate::page::Failed;
+use crate::page::{Failed, PreBlock};
 use crate::route::{Route, route_for_page, route_for_template};
 use crate::script::helpers::url_for;
 use crate::script::{Html, LinkContext, ScriptEngine, take_asset_misses, with_link_context};
 use crate::sitemap;
 use crate::template::{self, Escape};
 use crate::theme::{PageShell, builtin_page};
-use crate::{html, layout, page, splice};
+use crate::{html, layout, markdown, page, splice};
 
 /// Written into every output directory Reuben builds. Only a directory containing it is ever cleared.
 pub const OUTPUT_MARKER: &str = ".reuben-output";
@@ -64,12 +65,29 @@ pub struct Page {
     pub front_matter_sources: BTreeMap<String, PathBuf>,
     /// Hidden from normal builds: the page or a folder above it is a draft.
     pub draft_excluded: bool,
-    /// The table of contents before blocks run, computed once at load.
-    pub pre_block_toc: Vec<TocEntry>,
-    /// Front matter `description`, else the first paragraph's text, computed once at load.
-    pub summary: String,
     /// The accessibility rules checked on this page: the config's, minus the page's own `a11y.disable`.
     pub rules: RuleSet,
+    /// Parsed at load for a collection member when some script may read `collections`, so other pages can read its
+    /// summary and toc before it renders; `None` otherwise. Boxed, so a page that never needs it costs one pointer.
+    pub(crate) pre_block: Option<Box<PreBlock>>,
+}
+
+impl Page {
+    /// The table of contents before blocks run and the summary: the ones parsed at load, or else parsed now.
+    pub(crate) fn pre_block(&self, math: bool) -> Cow<'_, PreBlock> {
+        match &self.pre_block {
+            Some(kept) => Cow::Borrowed(kept),
+            None => Cow::Owned(page::pre_block(self, math)),
+        }
+    }
+
+    /// Byte ranges of the body inside code, where `{{` stays literal: the ones found at load, or else found now.
+    pub(crate) fn code_ranges(&self, math: bool) -> Cow<'_, [Range<usize>]> {
+        match &self.pre_block {
+            Some(kept) => Cow::Borrowed(&kept.code_ranges),
+            None => Cow::Owned(page::code_ranges(&self.body, math)),
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -96,6 +114,9 @@ pub struct Site {
     /// An `includes/*.rhai` file failed, so nothing that runs Rhai is rendered: every call into the includes would
     /// fail and bury the real error.
     pub(crate) includes_broken: bool,
+    /// Some script may read `collections`, so members' summaries and tocs were parsed at load. See
+    /// [`collections_named`].
+    pub(crate) collections_named: bool,
     /// The `site` scope variable, built once from the config.
     pub(crate) site_map: rhai::Map,
 }
@@ -372,16 +393,18 @@ impl Site {
             _ => Vec::new(),
         };
 
-        let math = config.markdown.math;
-        pages.par_iter_mut().for_each(|page| {
-            (page.pre_block_toc, page.summary) = page::precompute(
-                page.kind,
-                page.front_matter.description.as_deref(),
-                &page.body,
-                page.body_line,
-                math,
-            );
-        });
+        // Collection items carry each member's summary and toc before blocks run, which takes a parse of its own.
+        // Only a script that names `collections` can read them, so without one the items go without and each page
+        // is parsed only when it renders.
+        let collections_named = collections_named(root, &config, &pages, &engine);
+        if collections_named {
+            let math = config.markdown.math;
+            pages.par_iter_mut().for_each(|p| {
+                if collections::is_member(p) {
+                    p.pre_block = Some(Box::new(page::pre_block(p, math)));
+                }
+            });
+        }
 
         Ok(Site {
             data: site_data,
@@ -397,6 +420,7 @@ impl Site {
             failed_markdown,
             includes_broken,
             site_map: site_scope,
+            collections_named,
         })
     }
 
@@ -427,6 +451,12 @@ impl Site {
         PageIndex::new(loaded.chain(failed))
     }
 
+    /// A page's table of contents before blocks run and its summary, as other pages read them from its collection
+    /// item: the ones parsed at load when a script may read `collections`, or else parsed now.
+    pub fn pre_block<'a>(&self, page: &'a Page) -> Cow<'a, PreBlock> {
+        page.pre_block(self.config.markdown.math)
+    }
+
     /// Renders the whole site into memory. Nothing touches the disk, and no file is `OutputFile::Staged`.
     pub fn render(&self, opts: &RenderOptions) -> Result<(Output, BuildReport), Failure> {
         self.render_into(opts, None)
@@ -448,7 +478,8 @@ impl Site {
         let mut errors = self.load_errors.clone();
         let (mut collision_errors, colliding) = self.check_collisions(&pages, opts.drafts);
         errors.append(&mut collision_errors);
-        let (collections, mut collection_errors) = collections::build(&pages, &self.config);
+        let (collections, mut collection_errors) =
+            collections::build_with(&pages, &self.config, self.collections_named);
         errors.append(&mut collection_errors);
 
         let index = Arc::new(self.page_index(opts.drafts));
@@ -1267,6 +1298,42 @@ fn built_html(output: &Output, stage: Option<&Path>, page: &Page) -> Option<Resu
     }
 }
 
+/// Whether any script a render may run names `collections`: a Markdown page's body when it has a block opener, a
+/// template page's body, a sidecar, any file in the site's or the theme's `layouts/` (comments and unused layouts
+/// included), or an include as it was compiled. A sidecar or layout that can't be read counts as naming it.
+///
+/// When none does, no page can read another's summary or toc, because a script reaches a scope variable only by
+/// naming it: `eval` is disabled, scripts can't list their scope, `markdown()` never runs blocks so no script text
+/// is built at run time, the module resolver is the dummy one so nothing is imported, and includes can't see a
+/// page's constants, as each is evaluated into a module from an empty scope (`global::collections` fails there).
+fn collections_named(root: &Path, config: &Config, pages: &[Page], engine: &ScriptEngine) -> bool {
+    const NAME: &str = "collections";
+    let names = |path: &Path| fs::read_to_string(path).map_or(true, |text| text.contains(NAME));
+    let in_dir = |dir: &Path| match fs::read_dir(dir) {
+        Ok(mut entries) => entries.any(|entry| match entry {
+            Ok(entry) => {
+                let path = entry.path();
+                path.is_file() && names(&path)
+            }
+            Err(_) => true,
+        }),
+        Err(e) => e.kind() != io::ErrorKind::NotFound,
+    };
+    let in_page = |page: &Page| {
+        let blocks = match page.kind {
+            PageKind::Markdown => markdown::has_blocks(&page.body),
+            PageKind::Template { .. } => true,
+        };
+        (blocks && page.body.contains(NAME)) || page.sidecar.as_deref().is_some_and(names)
+    };
+    engine.includes_mention(NAME)
+        || pages.iter().any(in_page)
+        || [Some(root), config.theme.as_deref()]
+            .into_iter()
+            .flatten()
+            .any(|dir| in_dir(&dir.join("layouts")))
+}
+
 /// The folders of `*.rhai` includes that exist, lowest precedence first: the theme's, then the site's.
 pub(crate) fn include_dirs(root: &Path, config: &Config) -> Vec<PathBuf> {
     config
@@ -1498,8 +1565,7 @@ fn load_page_from(
         route,
         front_matter_sources: merged.sources,
         draft_excluded: false,
-        pre_block_toc: Vec::new(),
-        summary: String::new(),
+        pre_block: None,
         rules,
     })
 }
@@ -1628,8 +1694,7 @@ mod tests {
             route: route_for_template(Path::new("side.css")),
             front_matter_sources: BTreeMap::new(),
             draft_excluded: false,
-            pre_block_toc: Vec::new(),
-            summary: String::new(),
+            pre_block: None,
             rules: RuleSet::all(),
         }
     }
@@ -2075,5 +2140,220 @@ mod tests {
             Some(OutputFile::Bytes(_))
         ));
         assert!(!stage.join("theme.css").exists());
+    }
+
+    /// How many body parses and code-range parses ran on a page whose body holds `marker`.
+    fn parses(marker: &str) -> (usize, usize) {
+        use crate::markdown;
+        let log = markdown::PARSES.lock().unwrap();
+        let count = |pass| {
+            log.iter()
+                .filter(|(p, text)| *p == pass && text.contains(marker))
+                .count()
+        };
+        (
+            count(markdown::Pass::Body),
+            count(markdown::Pass::CodeRanges),
+        )
+    }
+
+    fn html_of(output: &Output, file: &str) -> String {
+        match output.files.get(Path::new(file)) {
+            Some(OutputFile::Bytes(bytes)) => String::from_utf8(bytes.clone()).unwrap(),
+            other => panic!("{file}: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn each_page_is_parsed_once_when_no_script_reads_collections() {
+        let tmp = site_dir(&[
+            (
+                "content/index.md",
+                "---\ntitle: Home\n---\nparsed-once-home {{ page.toc.len() }}\n",
+            ),
+            (
+                "content/docs/a.md",
+                "---\ntitle: A\n---\n# A\n\nparsed-once-blocks `{{ x }}` {{ 1 + 1 }}\n",
+            ),
+            (
+                "content/docs/b.md",
+                "---\ntitle: B\n---\n# B\n\nparsed-once-plain text\n",
+            ),
+        ]);
+        render_site(tmp.path()).unwrap();
+        assert_eq!(parses("parsed-once-home"), (1, 1));
+        assert_eq!(parses("parsed-once-blocks"), (1, 1));
+        assert_eq!(parses("parsed-once-plain"), (1, 0));
+    }
+
+    #[test]
+    fn only_collection_members_are_parsed_early_and_only_when_collections_are_read() {
+        let tmp = site_dir(&[
+            (
+                "content/index.md",
+                "---\ntitle: Home\n---\nparsed-early-home {{ collections.docs.map(|p| p.summary) }}\n",
+            ),
+            (
+                "content/docs/a.md",
+                "---\ntitle: A\n---\n# A\n\nparsed-early-blocks `{{ x }}` {{ 1 + 1 }}\n",
+            ),
+            (
+                "content/docs/b.md",
+                "---\ntitle: B\n---\n# B\n\nparsed-early-plain text\n",
+            ),
+        ]);
+        let (output, _) = render_site(tmp.path()).unwrap();
+        // The home page is in no collection, so nothing reads its summary before it renders.
+        assert_eq!(parses("parsed-early-home"), (1, 1));
+        // Members are parsed once for their summary and table of contents, and again when they render, but their
+        // code ranges are found once.
+        assert_eq!(parses("parsed-early-blocks"), (2, 1));
+        assert_eq!(parses("parsed-early-plain"), (2, 0));
+        let home = html_of(&output, "index.html");
+        assert!(home.contains("parsed-early-blocks {{ x }}"), "{home}");
+        assert!(home.contains("parsed-early-plain text"), "{home}");
+    }
+
+    /// Every member reads every member's summary and table of contents, so under parallel rendering some read a page
+    /// that hasn't rendered yet. The page's own `page.toc` is the one before blocks run in its sidecar and blocks,
+    /// and the final one in its layout.
+    #[test]
+    fn early_summaries_and_tables_of_contents_are_the_same_everywhere() {
+        let mut files = vec![
+            (
+                "layouts/default.html".to_string(),
+                "<html><body>{{ content }}<p>final-toc {{ page.toc.map(|t| t.id) }}</p></body></html>\n"
+                    .to_string(),
+            ),
+            (
+                "content/index.md".to_string(),
+                "---\ntitle: Home\n---\n{{ collections.docs.map(|p| p.summary + \"|\" + p.toc.map(|t| t.id)) }}\n"
+                    .to_string(),
+            ),
+        ];
+        for i in 0..24 {
+            files.push((
+                format!("content/docs/p{i:02}.md"),
+                format!(
+                    "---\ntitle: P{i}\n---\n# Head {i}\n\nSummary {i} with *em* and `{{{{ code }}}}`.\n\n## {{{{ page.title }}}}\n\n## Tail\n\nown-toc {{{{ page.toc.map(|t| t.id) }}}} sidecar {{{{ own }}}}\n\nall {{{{ collections.docs.map(|p| p.summary + \"|\" + p.toc.map(|t| t.id)) }}}}\n"
+                ),
+            ));
+            files.push((
+                format!("content/docs/p{i:02}.rhai"),
+                "let own = page.toc.len();\n".to_string(),
+            ));
+        }
+        let refs: Vec<(&str, &str)> = files
+            .iter()
+            .map(|(p, t)| (p.as_str(), t.as_str()))
+            .collect();
+        let tmp = site_dir(&refs);
+        let site = Site::load(tmp.path()).unwrap();
+        for jobs in [Some(1), Some(4), None] {
+            let (output, _) = site
+                .render(&RenderOptions {
+                    drafts: false,
+                    jobs,
+                })
+                .unwrap();
+            let mut pages = vec![html_of(&output, "index.html")];
+            for i in 0..24 {
+                let html = html_of(&output, &format!("docs/p{i:02}/index.html"));
+                assert!(
+                    html.contains(&format!("own-toc head-{i}tail sidecar 2")),
+                    "{html}"
+                );
+                assert!(
+                    html.contains(&format!("final-toc head-{i}p{i}tail</p>")),
+                    "{html}"
+                );
+                pages.push(html);
+            }
+            for html in &pages {
+                for i in 0..24 {
+                    let item = format!(
+                        "Summary {i} with em and {{{{ code }}}}.|[&quot;head-{i}&quot;, &quot;tail&quot;]"
+                    );
+                    assert!(html.contains(&item), "{item} in {html}");
+                }
+            }
+        }
+    }
+
+    /// Collections are read from a layout, a sidecar or a template page, with no page block naming them.
+    #[test]
+    fn collections_read_outside_page_blocks_still_see_summaries() {
+        let member = (
+            "content/docs/a.md",
+            "---\ntitle: A\n---\n# Alpha\n\nAlpha summary.\n",
+        );
+        let read = "{{ collections.docs.map(|p| p.summary + \"|\" + p.toc.map(|t| t.id)) }}";
+        let expected = "Alpha summary.|[&quot;alpha&quot;]";
+
+        let layout = format!("<html><body>{{{{ content }}}}{read}</body></html>\n");
+        let tmp = site_dir(&[member, ("layouts/default.html", &layout)]);
+        let (output, _) = render_site(tmp.path()).unwrap();
+        let html = html_of(&output, "docs/a/index.html");
+        assert!(html.contains(expected), "{html}");
+
+        let tmp = site_dir(&[
+            member,
+            ("content/b.md", "---\ntitle: B\n---\n{{ seen }}\n"),
+            (
+                "content/b.rhai",
+                "let seen = collections.docs.map(|p| p.summary + \"|\" + p.toc.map(|t| t.id));\n",
+            ),
+        ]);
+        let (output, _) = render_site(tmp.path()).unwrap();
+        let html = html_of(&output, "b/index.html");
+        assert!(html.contains(expected), "{html}");
+
+        let template = format!("---\ntitle: L\n---\n{read}\n");
+        let tmp = site_dir(&[member, ("static/list.html", &template)]);
+        let (output, _) = render_site(tmp.path()).unwrap();
+        let html = html_of(&output, "list/index.html");
+        assert!(html.contains(expected), "{html}");
+    }
+
+    #[test]
+    fn a_theme_only_layout_reading_collections_sees_summaries() {
+        let tmp = site_dir(&[
+            ("reuben.toml", "theme = \"theme\"\n"),
+            (
+                "theme/layouts/default.html",
+                "<html><body>{{ content }}{{ collections.docs.map(|p| p.summary + \"|\" + p.toc.map(|t| t.id)) }}</body></html>\n",
+            ),
+            (
+                "content/docs/a.md",
+                "---\ntitle: A\n---\n# Alpha\n\nAlpha summary.\n",
+            ),
+        ]);
+        let (output, _) = render_site(tmp.path()).unwrap();
+        let html = html_of(&output, "docs/a/index.html");
+        assert!(
+            html.contains("Alpha summary.|[&quot;alpha&quot;]"),
+            "{html}"
+        );
+    }
+
+    /// The `collections` scan relies on includes not seeing a page's constants.
+    #[test]
+    fn an_include_cannot_reach_collections_through_global() {
+        let tmp = site_dir(&[
+            (
+                "includes/peek.rhai",
+                "fn peek() { global::collections.docs.len() }\n",
+            ),
+            ("content/index.md", "---\ntitle: Home\n---\n{{ peek() }}\n"),
+            ("content/docs/a.md", "---\ntitle: A\n---\nAlpha.\n"),
+        ]);
+        let failure = render_site(tmp.path()).unwrap_err();
+        let messages: Vec<String> = failure.errors.iter().map(ToString::to_string).collect();
+        assert!(
+            messages
+                .iter()
+                .any(|m| m.contains("Variable not found: global::collections")),
+            "{messages:?}"
+        );
     }
 }

@@ -7,7 +7,7 @@ use rhai::{Array, Dynamic, Map};
 
 use crate::config::Config;
 use crate::error::{Error, ErrorKind};
-use crate::page::page_map;
+use crate::page::{PreBlock, page_map};
 use crate::script::collection::{Collection, compare, sort_array};
 use crate::site::{Page, PageKind};
 
@@ -50,9 +50,22 @@ fn joins_collection(page: &Page) -> bool {
     }
 }
 
+/// Whether `page` is an item of some collection, so other pages may read its summary and toc.
+pub(crate) fn is_member(page: &Page) -> bool {
+    joins_collection(page) && collection_of(&page.rel).is_some()
+}
+
 /// Builds every collection from the pages that are in the build. Callers exclude drafts first.
 /// A collection that can't be built is reported and left out; the others are still returned.
 pub fn build(pages: &[&Page], config: &Config) -> (Map, Vec<Error>) {
+    build_with(pages, config, true)
+}
+
+/// [`build`], with each item's `toc` and `summary` left empty unless `pre_block` is set, for a render where no script
+/// can read them. With it set, a member parsed for neither yet is parsed here.
+pub(crate) fn build_with(pages: &[&Page], config: &Config, pre_block: bool) -> (Map, Vec<Error>) {
+    let math = config.markdown.math;
+    let unread = PreBlock::default();
     let mut folders: BTreeMap<String, Vec<&Page>> = BTreeMap::new();
     for page in pages.iter().filter(|p| joins_collection(p)) {
         if let Some(folder) = collection_of(&page.rel) {
@@ -71,9 +84,14 @@ pub fn build(pages: &[&Page], config: &Config) -> (Map, Vec<Error>) {
 
         let mut entries = Vec::with_capacity(group.len());
         for page in group {
-            match page_map(page, config) {
+            let early = if pre_block {
+                page.pre_block(math)
+            } else {
+                std::borrow::Cow::Borrowed(&unread)
+            };
+            match page_map(page, config, &early.toc) {
                 Ok(mut map) => {
-                    map.insert("summary".into(), page.summary.clone().into());
+                    map.insert("summary".into(), early.summary.clone().into());
                     entries.push((page.rel.as_path(), map));
                 }
                 Err(e) => errors.push(e),
@@ -223,8 +241,7 @@ mod tests {
             route: route_for_page(Path::new(rel)),
             front_matter_sources: Default::default(),
             draft_excluded: false,
-            pre_block_toc: Vec::new(),
-            summary: crate::page::precompute(PageKind::Markdown, description, body, 1, false).1,
+            pre_block: None,
             rules: reuben_a11y::RuleSet::all(),
         }
     }
@@ -269,18 +286,18 @@ mod tests {
     #[test]
     fn summary_prefers_description_then_first_paragraph() {
         let p = page("guide/v.md", Some("Tone."), "Other.");
-        assert_eq!(p.summary, "Tone.");
+        assert_eq!(p.pre_block(false).summary, "Tone.");
         let p = page("guide/v.md", None, "Intro {{ x }} text.\n\nMore");
-        assert_eq!(p.summary, "Intro text.");
+        assert_eq!(p.pre_block(false).summary, "Intro text.");
     }
 
     #[test]
     fn page_knows_its_collection() {
         let p = page("posts/a.md", None, "x");
-        let map = crate::page::page_map(&p, &config()).unwrap();
+        let map = crate::page::page_map(&p, &config(), &[]).unwrap();
         assert_eq!(map["collection"].clone().into_string().unwrap(), "blog");
         let p = page("index.md", None, "x");
-        let map = crate::page::page_map(&p, &config()).unwrap();
+        let map = crate::page::page_map(&p, &config(), &[]).unwrap();
         assert_eq!(map["collection"].clone().into_string().unwrap(), "");
     }
 }

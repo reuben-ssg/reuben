@@ -75,29 +75,55 @@ pub fn assign_ids_before_blocks(doc: &mut Document) -> Vec<TocEntry> {
     toc
 }
 
-fn walk(node: &mut Node, ids: &mut Ids, toc: &mut Vec<TocEntry>, skip_placeholders: bool) {
-    if let NodeKind::Heading { level, id } = &mut node.kind {
-        let mut raw = String::new();
-        node.children.iter().for_each(|c| collect(c, &mut raw));
-        if skip_placeholders && raw.contains('\u{E000}') {
+/// The table of contents [`assign_ids_before_blocks`] returns, leaving the tree as it is.
+pub fn toc_before_blocks(doc: &Document) -> Vec<TocEntry> {
+    fn visit(node: &Node, ids: &mut Ids, toc: &mut Vec<TocEntry>) {
+        if let NodeKind::Heading { level, .. } = node.kind {
+            toc.extend(entry(node, level, ids, true));
             return;
         }
-        let text = strip_placeholders(&raw).trim().to_string();
-        let base = match slug(&text) {
-            s if s.is_empty() => "section".to_string(),
-            s => s,
-        };
-        *id = ids.claim(&base);
-        toc.push(TocEntry {
-            level: *level,
-            id: id.clone(),
-            text,
-        });
+        for child in &node.children {
+            visit(child, ids, toc);
+        }
+    }
+    let mut ids = Ids::default();
+    let mut toc = Vec::new();
+    visit(doc, &mut ids, &mut toc);
+    toc
+}
+
+fn walk(node: &mut Node, ids: &mut Ids, toc: &mut Vec<TocEntry>, skip_placeholders: bool) {
+    if let NodeKind::Heading { level, .. } = node.kind {
+        if let Some(e) = entry(node, level, ids, skip_placeholders) {
+            if let NodeKind::Heading { id, .. } = &mut node.kind {
+                id.clone_from(&e.id);
+            }
+            toc.push(e);
+        }
         return;
     }
     for child in &mut node.children {
         walk(child, ids, toc, skip_placeholders);
     }
+}
+
+/// The toc entry for a heading, claiming its id. `None` for a heading left out because it holds a placeholder.
+fn entry(heading: &Node, level: u8, ids: &mut Ids, skip_placeholders: bool) -> Option<TocEntry> {
+    let mut raw = String::new();
+    heading.children.iter().for_each(|c| collect(c, &mut raw));
+    if skip_placeholders && raw.contains('\u{E000}') {
+        return None;
+    }
+    let text = strip_placeholders(&raw).trim().to_string();
+    let base = match slug(&text) {
+        s if s.is_empty() => "section".to_string(),
+        s => s,
+    };
+    Some(TocEntry {
+        level,
+        id: ids.claim(&base),
+        text,
+    })
 }
 
 /// Unlike `html::plain_text`, this reads spliced `{{ }}` output: tags are dropped and basic entities decoded.
@@ -143,6 +169,18 @@ fn decode(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn toc_before_blocks_matches_assign_and_leaves_the_tree() {
+        let body = "# A\n\n## \u{E000}0\u{E001}\n\n## A\n\n### \n";
+        let doc = crate::markdown::parse(body, 1);
+        let mut assigned = doc.clone();
+        assert_eq!(
+            toc_before_blocks(&doc),
+            assign_ids_before_blocks(&mut assigned)
+        );
+        assert_eq!(doc, crate::markdown::parse(body, 1));
+    }
 
     #[test]
     fn github_slugs() {

@@ -31,8 +31,25 @@ pub fn parse_with(body: &str, body_line: usize, math: bool) -> Document {
 
 /// Parses a body whose blocks were extracted, with spans pointing where each node is in the body before extraction.
 pub fn parse_extracted(extracted: &Extracted, body_line: usize, math: bool) -> Document {
+    #[cfg(test)]
+    PARSES
+        .lock()
+        .unwrap()
+        .push((Pass::Body, extracted.text.clone()));
     parse_mapped(&extracted.text, &extracted.map, body_line, math)
 }
+
+/// A full comrak parse of a page, for tests that count them.
+#[cfg(test)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Pass {
+    Body,
+    CodeRanges,
+}
+
+/// Every page parse and the text it parsed, for tests that check each page is parsed once.
+#[cfg(test)]
+pub(crate) static PARSES: std::sync::Mutex<Vec<(Pass, String)>> = std::sync::Mutex::new(Vec::new());
 
 fn parse_mapped(text: &str, map: &SourceMap, body_line: usize, math: bool) -> Document {
     let arena = Arena::new();
@@ -180,6 +197,11 @@ pub fn code_ranges(body: &str) -> Vec<std::ops::Range<usize>> {
 
 /// Like `code_ranges`; math spans count only when `math` is set.
 pub fn code_ranges_with(body: &str, math: bool) -> Vec<std::ops::Range<usize>> {
+    #[cfg(test)]
+    PARSES
+        .lock()
+        .unwrap()
+        .push((Pass::CodeRanges, body.to_string()));
     let mut line_starts = vec![0];
     line_starts.extend(body.match_indices('\n').map(|(i, _)| i + 1));
     let offset = |line: usize, column: usize| {
