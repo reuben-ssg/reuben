@@ -56,6 +56,10 @@ This covers blocks between paragraphs and blocks inside a paragraph, list item, 
 A page whose accessibility rules for the finished HTML (`html-lang`, `page-title`, `single-h1`, `main-landmark`, `id-unique`, `form-label` and `link-target`) are all off is no longer parsed a second time.
 Its ids are collected only when a link such as `@/page.md#anchor` asks for one, so broken anchors are still errors.
 A build makes fewer system calls: each layout is found and read once per build instead of once per page, a page's output folder is created once however many pages share it, a sidecar `.rhai` is looked up in the folder listing instead of on disk, and a static template is opened once.
+Each page's Markdown is parsed once per build instead of twice, unless a script names `collections`.
+When one does, only the pages in collections are parsed a second time, for the `summary` and `toc` other pages read from them.
+A page with `{{` or `{%` blocks finds the code they must skip once instead of twice.
+On a 10,000-page site that doesn't read collections, this cuts CPU time by about a fifth and peak memory by about a quarter.
 
 ### Library API
 
@@ -64,6 +68,9 @@ Added to `reuben-core`: `check::page_ids` and `layout::Layouts`, which finds and
 Changed in `reuben-core`: `layout::render_layout` takes a `&Layouts` after the layout's path, and reads the layout through it.
 Added to `reuben-core`: `blocks::SourceMap`, the `map` field of `blocks::Extracted`, and `markdown::parse_extracted`, which gives nodes their positions in the page before its blocks were taken out.
 Changed in `reuben-core`: `splice::splice` takes how many line breaks each block spanned, and `doc::Fill` has a `newlines` field and counts its `line` in the page source.
+Changed in `reuben-core`: `site::Page` no longer has the `pre_block_toc` and `summary` fields; `Page::pre_block` returns a `page::PreBlock` with `toc` and `summary`, parsed on first use.
+`site::Page` has private fields now, so it can't be built with a struct literal outside the crate.
+Added to `reuben-core`: `headings::toc_before_blocks`, which gives the table of contents before blocks run without changing the tree.
 
 ## 0.2.0 (2026-11-21)
 
