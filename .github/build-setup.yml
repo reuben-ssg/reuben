@@ -1,0 +1,6 @@
+- name: Update Rust to the latest stable
+  shell: bash
+  run: |
+    rustup update stable --no-self-update
+    rustup default stable
+    rustc --version

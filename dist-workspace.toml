@@ -25,6 +25,8 @@ npm-scope = "@reuben-ssg"
 github-attestations = true
 # Which actions to run on pull requests
 pr-run-mode = "plan"
+# Runner images can ship a Rust older than the workspace's rust-version, so update it before building
+github-build-setup = "../build-setup.yml"
 
 [dist.github-custom-runners]
 x86_64-unknown-linux-gnu = "ubuntu-22.04"
