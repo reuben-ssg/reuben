@@ -18,3 +18,15 @@ jobs:
       - run: cargo clippy --workspace --all-targets -- -D warnings
       - run: cargo test --workspace
       - run: cargo publish --workspace --dry-run
+
+  # Builds and tests on the declared rust-version, so a dependency that needs a newer
+  # toolchain fails here instead of in users' `cargo install`.
+  msrv:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.100"
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo test --workspace --locked

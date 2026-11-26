@@ -227,12 +227,10 @@ pub fn render_body(
     errors.extend(link_problems.into_iter().map(|(location, problem)| {
         Error::new(&page.source, ErrorKind::Link { problem, location })
     }));
-    if math {
-        if let Err(math_errors) = math::render_math(&mut doc) {
-            errors.extend(math_errors.into_iter().map(|(location, message)| {
-                Error::new(&page.source, ErrorKind::Math { message, location })
-            }));
-        }
+    if math && let Err(math_errors) = math::render_math(&mut doc) {
+        errors.extend(math_errors.into_iter().map(|(location, message)| {
+            Error::new(&page.source, ErrorKind::Math { message, location })
+        }));
     }
     if !errors.is_empty() {
         return Err(Failed { errors, anchors });
