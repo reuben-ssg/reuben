@@ -105,13 +105,15 @@ pub enum NodeKind {
     Raw(String),
 }
 
-/// The output of block number `block` in a `FilledHtmlBlock`: the byte range of the block's `html` it fills, and the
-/// 1-based line of the HTML block its placeholder was on.
+/// The output of block number `block` in a `FilledHtmlBlock`: the byte range of the block's `html` it fills, the
+/// 1-based line of the HTML block's source the block starts on, and how many line breaks the block spanned, which
+/// its one-line placeholder took out. A block that printed nothing has a fill only when it spanned lines.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Fill {
     pub range: std::ops::Range<usize>,
     pub block: usize,
     pub line: usize,
+    pub newlines: usize,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]

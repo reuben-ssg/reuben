@@ -103,7 +103,7 @@ pub(crate) fn precompute(
     let Ok(extracted) = blocks::extract(body, body_line, &skip) else {
         return (Vec::new(), described());
     };
-    let mut doc = markdown::parse_with(&extracted.text, body_line, math);
+    let mut doc = markdown::parse_extracted(&extracted, body_line, math);
     let toc = headings::assign_ids_before_blocks(&mut doc);
     let summary = match description {
         Some(d) => d.to_string(),
@@ -201,7 +201,7 @@ pub fn render_body(
     };
     let extracted = blocks::extract(&page.body, page.body_line, &skip)
         .map_err(|e| vec![Error::new(&page.source, ErrorKind::Block(e))])?;
-    let mut doc = markdown::parse_with(&extracted.text, page.body_line, math);
+    let mut doc = markdown::parse_extracted(&extracted, page.body_line, math);
 
     let mut outputs = Vec::with_capacity(extracted.blocks.len());
     let mut errors = Vec::new();
@@ -215,7 +215,7 @@ pub fn render_body(
         }
     }
     // A failed block is spliced as `Output::Nothing`, so link and math errors on the page still surface.
-    splice::splice(&mut doc, &outputs);
+    splice::splice(&mut doc, &outputs, &extracted.map.lines());
     // Ids are assigned first so a heading's slug reads its LaTeX, not the MathML's annotation.
     let toc = headings::toc_array(&headings::assign_ids(&mut doc));
     let (link_problems, anchors) = links::resolve_tree(

@@ -3,6 +3,7 @@
 use comrak::nodes::{AstNode, ListType, NodeValue, TableAlignment};
 use comrak::{Arena, Options};
 
+use crate::blocks::{Extracted, SourceMap};
 use crate::doc::{Alignment, Document, Node, NodeKind, Span};
 
 pub(crate) fn options(math: bool) -> Options<'static> {
@@ -25,10 +26,24 @@ pub fn parse(body: &str, body_line: usize) -> Document {
 
 /// Like `parse`, with `$...$` and `$$...$$` read as math when `math` is set.
 pub fn parse_with(body: &str, body_line: usize, math: bool) -> Document {
+    parse_mapped(body, &SourceMap::default(), body_line, math)
+}
+
+/// Parses a body whose blocks were extracted, with spans pointing where each node is in the body before extraction.
+pub fn parse_extracted(extracted: &Extracted, body_line: usize, math: bool) -> Document {
+    parse_mapped(&extracted.text, &extracted.map, body_line, math)
+}
+
+fn parse_mapped(text: &str, map: &SourceMap, body_line: usize, math: bool) -> Document {
     let arena = Arena::new();
     let options = options(math);
-    let root = comrak::parse_document(&arena, body, &options);
-    let mut doc = convert(root, body_line - 1, &options);
+    let root = comrak::parse_document(&arena, text, &options);
+    let place = Place {
+        map,
+        line_offset: body_line - 1,
+        options: &options,
+    };
+    let mut doc = convert(root, &place);
     // comrak numbers footnotes by first reference and moves the definitions to the end of the document in that order.
     let definitions = doc
         .children
@@ -50,11 +65,21 @@ pub fn parse_with(body: &str, body_line: usize, math: bool) -> Document {
     doc
 }
 
-fn convert<'a>(node: &'a AstNode<'a>, line_offset: usize, options: &Options) -> Node {
+/// What `convert` needs to turn the parser's positions into file positions.
+struct Place<'a> {
+    map: &'a SourceMap,
+    line_offset: usize,
+    options: &'a Options<'a>,
+}
+
+fn convert<'a>(node: &'a AstNode<'a>, place: &Place) -> Node {
+    let options = place.options;
     let ast = node.data.borrow();
+    let start = ast.sourcepos.start;
+    let in_body = place.map.source(start.line, start.column);
     let span = Span {
-        line: ast.sourcepos.start.line + line_offset,
-        column: ast.sourcepos.start.column,
+        line: in_body.line + place.line_offset,
+        column: in_body.column,
     };
     let kind = match &ast.value {
         NodeValue::Document => NodeKind::Document,
@@ -138,10 +163,7 @@ fn convert<'a>(node: &'a AstNode<'a>, line_offset: usize, options: &Options) -> 
     Node {
         kind,
         span,
-        children: node
-            .children()
-            .map(|child| convert(child, line_offset, options))
-            .collect(),
+        children: node.children().map(|child| convert(child, place)).collect(),
     }
 }
 
@@ -225,6 +247,37 @@ mod tests {
         assert_eq!(d.children[1].kind, NodeKind::Paragraph);
         assert_eq!(d.children[1].span.line, 6);
         assert_eq!(d.children[1].children[1].kind, NodeKind::Emphasis);
+    }
+
+    #[test]
+    fn spans_after_a_multi_line_block_are_body_lines() {
+        let body =
+            "{%\n  let a = 1;\n  let b = 2;\n%}\n\n# Heading\n\nSee {{ a +\n  b }} [x](/x/).\n";
+        let e = crate::blocks::extract(body, 1, &[]).unwrap();
+        let d = parse_extracted(&e, 3, false);
+        let heading = &d.children[1];
+        assert!(matches!(heading.kind, NodeKind::Heading { .. }));
+        assert_eq!(heading.span, Span { line: 8, column: 1 });
+        let paragraph = &d.children[2];
+        assert_eq!(
+            paragraph.span,
+            Span {
+                line: 10,
+                column: 1
+            }
+        );
+        let link = paragraph
+            .children
+            .iter()
+            .find(|n| matches!(n.kind, NodeKind::Link { .. }))
+            .unwrap();
+        assert_eq!(
+            link.span,
+            Span {
+                line: 11,
+                column: 8
+            }
+        );
     }
 
     #[test]

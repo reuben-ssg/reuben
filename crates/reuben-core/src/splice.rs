@@ -53,8 +53,16 @@ const CLOSE: char = '\u{E001}';
 const OPEN_ENCODED: &str = "%EE%80%80";
 const CLOSE_ENCODED: &str = "%EE%80%81";
 
-pub fn splice(doc: &mut Document, outputs: &[Output]) {
-    splice_children(doc, outputs, false);
+/// `lines` holds how many line breaks each block spanned in the page, so HTML-block fills can say which page line
+/// each output is on; a block it doesn't cover spanned none.
+pub fn splice(doc: &mut Document, outputs: &[Output], lines: &[usize]) {
+    splice_children(doc, &Blocks { outputs, lines }, false);
+}
+
+/// The blocks' outputs and the line breaks each one spanned.
+struct Blocks<'a> {
+    outputs: &'a [Output],
+    lines: &'a [usize],
 }
 
 /// One piece of a string split on placeholders.
@@ -129,7 +137,7 @@ fn replace_with(s: &str, outputs: &[Output], f: impl Fn(&str) -> String) -> Stri
 }
 
 /// Fills an HTML block's placeholders with their output as is, recording where each output went.
-fn fill_html_block(s: &str, outputs: &[Output]) -> NodeKind {
+fn fill_html_block(s: &str, blocks: &Blocks<'_>) -> NodeKind {
     let mut html = String::new();
     let mut fills = Vec::new();
     let mut line = 1;
@@ -140,15 +148,19 @@ fn fill_html_block(s: &str, outputs: &[Output]) -> NodeKind {
                 line += t.matches('\n').count();
             }
             Piece::Slot(block) => {
-                if let Some(markup) = output(outputs, block).markup() {
+                let newlines = blocks.lines.get(block).copied().unwrap_or(0);
+                let markup = output(blocks.outputs, block).markup();
+                if markup.is_some() || newlines > 0 {
                     let start = html.len();
-                    html.push_str(markup);
+                    html.push_str(markup.unwrap_or(""));
                     fills.push(Fill {
                         range: start..html.len(),
                         block,
                         line,
+                        newlines,
                     });
                 }
+                line += newlines;
             }
         }
     }
@@ -211,7 +223,8 @@ fn sole_placeholder(node: &Node) -> Option<usize> {
 }
 
 /// `in_image` is true inside an image's alt text, where an output must stay text so `plain_text` can read it.
-fn splice_children(node: &mut Node, outputs: &[Output], in_image: bool) {
+fn splice_children(node: &mut Node, blocks: &Blocks<'_>, in_image: bool) {
+    let outputs = blocks.outputs;
     let children = std::mem::take(&mut node.children);
     for mut child in children {
         if let Some(n) = sole_placeholder(&child) {
@@ -257,7 +270,7 @@ fn splice_children(node: &mut Node, outputs: &[Output], in_image: bool) {
         }
         match &mut child.kind {
             NodeKind::HtmlBlock(s) if has_placeholder(s) => {
-                child.kind = fill_html_block(s, outputs);
+                child.kind = fill_html_block(s, blocks);
             }
             NodeKind::HtmlBlock(s) | NodeKind::HtmlInline(s) => {
                 *s = replace_with(s, outputs, str::to_string);
@@ -270,7 +283,7 @@ fn splice_children(node: &mut Node, outputs: &[Output], in_image: bool) {
             _ => {}
         }
         let image = in_image || matches!(child.kind, NodeKind::Image { .. });
-        splice_children(&mut child, outputs, image);
+        splice_children(&mut child, blocks, image);
         node.children.push(child);
     }
 }
@@ -287,7 +300,7 @@ mod tests {
     }
     fn html(md: &str, outputs: &[Output]) -> String {
         let mut d = doc(md);
-        splice(&mut d, outputs);
+        splice(&mut d, outputs, &[]);
         crate::html::render(&d)
     }
 
@@ -310,6 +323,7 @@ mod tests {
                 Output::Html("<b>a</b>".into()),
                 Output::Html("<i>b</i>".into()),
             ],
+            &[],
         );
         assert_eq!(
             d.children[0].kind,
@@ -377,6 +391,7 @@ mod tests {
         splice(
             &mut d,
             &[Output::Html("<b>\n</b>".into()), Output::Text("t".into())],
+            &[],
         );
         let NodeKind::FilledHtmlBlock { html, fills } = &d.children[0].kind else {
             panic!("{:?}", d.children[0].kind);
@@ -388,12 +403,46 @@ mod tests {
                 Fill {
                     range: 6..14,
                     block: 0,
-                    line: 2
+                    line: 2,
+                    newlines: 0
                 },
                 Fill {
                     range: 15..16,
                     block: 1,
-                    line: 3
+                    line: 3,
+                    newlines: 0
+                }
+            ]
+        );
+    }
+
+    #[test]
+    fn fills_count_the_lines_their_blocks_spanned() {
+        // Block 0 spanned two line breaks and printed nothing; block 1 spanned one.
+        let mut d = doc(&format!("<div>\n{}\n{}\nx\n</div>\n", p(0), p(1)));
+        splice(
+            &mut d,
+            &[Output::Nothing, Output::Text("t".into())],
+            &[2, 1],
+        );
+        let NodeKind::FilledHtmlBlock { html, fills } = &d.children[0].kind else {
+            panic!("{:?}", d.children[0].kind);
+        };
+        assert_eq!(html, "<div>\n\nt\nx\n</div>\n");
+        assert_eq!(
+            fills,
+            &[
+                Fill {
+                    range: 6..6,
+                    block: 0,
+                    line: 2,
+                    newlines: 2
+                },
+                Fill {
+                    range: 7..8,
+                    block: 1,
+                    line: 5,
+                    newlines: 1
                 }
             ]
         );
