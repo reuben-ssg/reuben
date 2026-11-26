@@ -423,3 +423,62 @@ fn markdown_helper_resolves_links() {
     assert!(matches!(errors[0].kind, ErrorKind::Script(_)), "{errors:?}");
     assert!(errors[0].kind.to_string().contains("nope.md"), "{errors:?}");
 }
+
+fn link_errors(errors: &[reuben_core::Error]) -> Vec<(usize, usize, String)> {
+    errors
+        .iter()
+        .map(|e| {
+            let at = e.location().expect("a link error has a location");
+            (at.line, at.column, e.kind.to_string())
+        })
+        .collect()
+}
+
+#[test]
+fn plain_links_check_their_anchors() {
+    let tmp = site_of(&[
+        (
+            "content/b.md",
+            &page(
+                "[ok](/c/#top)\n\n[no](/c/#nope)\n\n[idx](/c/index.html#nope2)\n\n[bare](/c#nope3)\n\n[query](/c/?x=1#nope4)",
+            ),
+        ),
+        ("content/c.md", &page("# Top")),
+    ]);
+    let errors = build(&tmp).unwrap_err();
+    let got = link_errors(&errors);
+    let lines: Vec<usize> = got.iter().map(|g| g.0).collect();
+    assert_eq!(lines, [6, 8, 10, 12], "{got:?}");
+    assert_eq!(got[0].2, "links to `#nope` on `c.md`, which has no such id");
+}
+
+#[test]
+fn plain_anchors_follow_the_base_path() {
+    let tmp = site_of(&[
+        (
+            "reuben.toml",
+            "title = \"S\"\nbase_url = \"https://x.dev/sub/\"\n",
+        ),
+        (
+            "content/b.md",
+            &page(
+                "[ok](/sub/c/#top)\n\n[no](/sub/c/#nope)\n\n[other](/c/#elsewhere)\n\n[file](/f.txt#x)\n\n[ext](https://x.dev/sub/c/#nope)",
+            ),
+        ),
+        ("content/c.md", &page("# Top")),
+        ("static/f.txt", "hi"),
+    ]);
+    let errors = build(&tmp).unwrap_err();
+    let got = link_errors(&errors);
+    assert_eq!(got.len(), 1, "{got:?}");
+    assert_eq!(got[0].0, 6);
+}
+
+#[test]
+fn plain_anchors_are_not_collected_without_one() {
+    let tmp = site_of(&[
+        ("content/b.md", &page("[ok](/c/) [also](/c/?x=1)")),
+        ("content/c.md", &page("# Top")),
+    ]);
+    build(&tmp).unwrap();
+}

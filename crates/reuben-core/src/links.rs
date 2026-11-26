@@ -1,7 +1,8 @@
 //! Links in Markdown that name `.md` source files, and their resolution to page URLs.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
 
 use crate::doc::{Document, Node, NodeKind, Span};
 
@@ -155,13 +156,46 @@ pub fn parse_source_link(dest: &str) -> Option<Result<SourceLink, LinkProblem>> 
 #[derive(Debug, Default)]
 pub struct PageIndex {
     pages: BTreeMap<PathBuf, Target>,
+    /// Built by the first plain link that carries a `#fragment`, so a site without one never pays for it.
+    by_url: OnceLock<HashMap<String, PathBuf>>,
 }
 
 impl PageIndex {
     pub fn new(entries: impl IntoIterator<Item = (PathBuf, Target)>) -> Self {
         PageIndex {
             pages: entries.into_iter().collect(),
+            by_url: OnceLock::new(),
         }
+    }
+
+    /// The page a plain root-relative `dest` with a `#fragment` points at, and that fragment. `base` is the path of
+    /// `base_url` without its trailing slash. Links to anything else, such as static files or other sites, are `None`.
+    fn plain_anchor(&self, dest: &str, base: &str) -> Option<(PathBuf, String)> {
+        let (before, fragment) = dest.split_once('#')?;
+        let fragment = percent_decode(fragment);
+        if fragment.is_empty() || !before.starts_with('/') || before.starts_with("//") {
+            return None;
+        }
+        let path = before.split('?').next().unwrap_or(before);
+        let path = path.strip_prefix(base)?;
+        if !path.is_empty() && !path.starts_with('/') {
+            return None;
+        }
+        let path = percent_decode(path);
+        let path = path.strip_suffix("index.html").unwrap_or(&path);
+        let by_url = self.by_url.get_or_init(|| {
+            self.pages
+                .iter()
+                .filter(|(_, t)| !t.excluded_draft)
+                .rev()
+                .map(|(rel, t)| (t.url.clone(), rel.clone()))
+                .collect()
+        });
+        let target = by_url.get(path).or_else(|| {
+            let slashed = format!("{path}/");
+            by_url.get(slashed.as_str())
+        })?;
+        Some((target.clone(), fragment))
     }
 
     /// Resolves `link`, written in the page at `from_rel` (relative to `content/`).
@@ -245,11 +279,15 @@ pub fn resolve_tree(
     index: &PageIndex,
     base_path: &str,
 ) -> (Vec<(Span, LinkProblem)>, Vec<AnchorRequest>) {
-    let mut problems = Vec::new();
-    let mut anchors = Vec::new();
-    let base = base_path.trim_end_matches('/');
-    walk(doc, from_rel, index, base, &mut problems, &mut anchors);
-    (problems, anchors)
+    let mut resolver = Resolver {
+        from_rel,
+        index,
+        base: base_path.trim_end_matches('/'),
+        problems: Vec::new(),
+        anchors: Vec::new(),
+    };
+    resolver.walk(doc);
+    (resolver.problems, resolver.anchors)
 }
 
 /// The destinations of the source links in `doc`, as written.
@@ -269,33 +307,65 @@ pub fn source_links(doc: &Document) -> Vec<String> {
     out
 }
 
-fn walk(
-    node: &mut Node,
-    from_rel: &Path,
-    index: &PageIndex,
-    base: &str,
-    problems: &mut Vec<(Span, LinkProblem)>,
-    anchors: &mut Vec<AnchorRequest>,
-) {
-    if let NodeKind::Link { url, .. } = &mut node.kind
-        && let Some(parsed) = parse_source_link(url)
-    {
-        match parsed.and_then(|link| index.resolve(from_rel, &link).map(|r| (link, r))) {
-            Ok((link, resolved)) => {
-                *url = format!("{base}{}{}", resolved.route_url, resolved.suffix);
-                if let Some(fragment) = link.fragment {
-                    anchors.push(AnchorRequest {
-                        target: resolved.target,
-                        fragment,
-                        location: node.span,
-                    });
+struct Resolver<'a> {
+    from_rel: &'a Path,
+    index: &'a PageIndex,
+    base: &'a str,
+    problems: Vec<(Span, LinkProblem)>,
+    anchors: Vec<AnchorRequest>,
+}
+
+impl Resolver<'_> {
+    fn walk(&mut self, node: &mut Node) {
+        let span = node.span;
+        if let NodeKind::Link { url, .. } = &mut node.kind {
+            match parse_source_link(url) {
+                Some(parsed) => {
+                    if let Some((page, suffix)) = self.resolve_dest(parsed, span) {
+                        *url = format!("{page}{suffix}");
+                    }
+                }
+                None => {
+                    if let Some((target, fragment)) = self.index.plain_anchor(url, self.base) {
+                        self.anchors.push(AnchorRequest {
+                            target,
+                            fragment,
+                            location: span,
+                        });
+                    }
                 }
             }
-            Err(problem) => problems.push((node.span, problem)),
+        }
+        for child in &mut node.children {
+            self.walk(child);
         }
     }
-    for child in &mut node.children {
-        walk(child, from_rel, index, base, problems, anchors);
+
+    /// The page URL and the `?query#fragment` to write for a source link, or `None` if it didn't resolve and was reported.
+    fn resolve_dest(
+        &mut self,
+        parsed: Result<SourceLink, LinkProblem>,
+        location: Span,
+    ) -> Option<(String, String)> {
+        match parsed.and_then(|link| self.index.resolve(self.from_rel, &link).map(|r| (link, r))) {
+            Ok((link, resolved)) => {
+                if let Some(fragment) = link.fragment {
+                    self.anchors.push(AnchorRequest {
+                        target: resolved.target,
+                        fragment,
+                        location,
+                    });
+                }
+                Some((
+                    format!("{}{}", self.base, resolved.route_url),
+                    resolved.suffix,
+                ))
+            }
+            Err(problem) => {
+                self.problems.push((location, problem));
+                None
+            }
+        }
     }
 }
 
