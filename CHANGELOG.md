@@ -45,17 +45,30 @@ It runs on the finished HTML, so a site that switches off every other check of t
 
 ### Changed output
 
-Reuben now marks its output folder with a `.<name>.reuben-output` file beside it (`.dist.reuben-output` for `dist/`), next to the `.<name>.reuben-staging` and `.<name>.reuben-old` folders it already uses.
-The marker records which folder it belongs to, so a different folder later made at the same path is refused even if the marker is left over.
-Reuben still refuses to clear a non-empty output folder that has no matching marker.
-An output folder from 0.3.0 that still has `.reuben-output` inside is recognised and replaced, and the new output doesn't contain that file.
+Every code block and table written in Markdown is now a named region that keyboard users can focus and scroll, in every browser.
+Safari doesn't put scroll containers in the tab order the way Chrome and Firefox do, so before this a wide code block or table couldn't be scrolled from the keyboard there.
+A code block's `<pre>` gets `tabindex="0"`, `role="region"` and `aria-label="Code"`, or `aria-label="Code: rust"` when the fence names a language:
 
-### Library API
+```html
+<pre tabindex="0" role="region" aria-label="Code: rust"><code class="language-rust">fn main() {}
+</code></pre>
+```
 
-Added to `reuben-core`: `MarkdownConfig::focusable_scroll` and `HtmlOptions::focusable_scroll`.
-Changed behavior in `reuben-core`: `HtmlOptions::default()`, and so `html::render`, writes the focusable markup for code blocks and tables; set `focusable_scroll: false` for the 0.3.0 markup.
+Each table is wrapped in a `<div class="table-wrap">` named after the nearest heading before it, or just `Table` when there is none:
 
-### Changed output
+```html
+<div class="table-wrap" tabindex="0" role="region" aria-label="Table: Breads">
+<table>
+...
+</table>
+</div>
+```
+
+The region only scrolls if your theme lets it, so put the sideways scrolling on the wrapper rather than on the table: `.table-wrap { overflow-x: auto; }`, and `pre { overflow-x: auto; }` for code.
+HTML tables and `<pre>` elements you write yourself are left as they are.
+Each code block costs 45 bytes plus 2 more and the length of the language word when there is one (51 bytes for `rust`).
+Each table costs 78 bytes plus 2 more and the length of the heading text when there is one.
+On the 10,000-page benchmark site, with one code block and one table per page, the output grew by 1,400,000 bytes, from 18,042,709 to 19,442,709 (7.8%), or 140 bytes a page (55 bytes a page gzipped).
 
 Reuben now marks its output folder with a `.<name>.reuben-output` file beside it (`.dist.reuben-output` for `dist/`), next to the `.<name>.reuben-staging` and `.<name>.reuben-old` folders it already uses.
 The marker records which folder it belongs to, so a different folder later made at the same path is refused even if the marker is left over.
@@ -72,7 +85,9 @@ Two collections with the same name are still an error.
 
 ### Library API
 
-`Site::load_and_build_for_exit` is `Site::load_and_build` for a process that exits right after it returns: it leaves the site and the build's working state allocated instead of freeing them.
+Added to `reuben-core`: `MarkdownConfig::focusable_scroll` and `HtmlOptions::focusable_scroll`.
+Changed behavior in `reuben-core`: `HtmlOptions::default()`, and so `html::render`, writes the focusable markup for code blocks and tables; set `focusable_scroll: false` for the 0.3.0 markup.
+Added to `reuben-core`: `Site::load_and_build_for_exit`, which is `Site::load_and_build` for a process that exits right after it returns: it leaves the site and the build's working state allocated instead of freeing them.
 
 ## 0.3.0 (2026-11-26)
 
