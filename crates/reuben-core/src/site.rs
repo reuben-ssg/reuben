@@ -134,6 +134,9 @@ pub struct BuildOptions {
     pub jobs: Option<usize>,
 }
 
+/// What `Site::render` returns: the built site and its report, or why it failed.
+pub type RenderResult = Result<(Output, BuildReport), Failure>;
+
 pub struct RenderOptions {
     pub drafts: bool,
     /// Worker threads for rendering; `None` lets the renderer choose.
@@ -322,6 +325,8 @@ impl Site {
         let loaded_all: Vec<_> = to_load
             .par_iter()
             .map(|(path, rel)| {
+                #[cfg(test)]
+                record_work_thread(path);
                 if path.extension().is_some_and(|e| e == "md") {
                     let kind = PageKind::Markdown;
                     load_page(path, rel, Some(&dirs), &listing, kind, config.a11y).map(Some)
@@ -459,7 +464,37 @@ impl Site {
 
     /// Renders the whole site into memory. Nothing touches the disk, and no file is `OutputFile::Staged`.
     pub fn render(&self, opts: &RenderOptions) -> Result<(Output, BuildReport), Failure> {
-        self.render_into(opts, None)
+        let pool = Pool::new(opts.jobs);
+        pool.install(|| self.render_into(opts, None, &pool))
+    }
+
+    /// Loads the site at `root` and renders it into memory, both on one pool of `opts.jobs` threads. The site comes
+    /// back with the render's result, so its config can be read even when the render fails.
+    pub fn load_and_render(
+        root: &Path,
+        load: &LoadOptions,
+        opts: &RenderOptions,
+    ) -> Result<(Site, RenderResult), Vec<Error>> {
+        let pool = Pool::new(opts.jobs);
+        pool.install(|| {
+            let site = Site::load_with(root, load).map_err(|errors| pool.with_error(errors))?;
+            let rendered = site.render_into(opts, None, &pool);
+            Ok((site, rendered))
+        })
+    }
+
+    /// Loads the site at `root` and builds it into `opts.out`, all on one pool of `opts.jobs` threads, like
+    /// `Site::load_with` and then `Site::build`.
+    pub fn load_and_build(
+        root: &Path,
+        load: &LoadOptions,
+        opts: &BuildOptions,
+    ) -> Result<BuildReport, Failure> {
+        let pool = Pool::new(opts.jobs);
+        pool.install(|| match Site::load_with(root, load) {
+            Ok(site) => site.build_in(opts, &pool),
+            Err(errors) => Err(pool.with_error(errors).into()),
+        })
     }
 
     /// Renders the site, writing each page except CSS into `stage` as soon as it renders and keeping only its
@@ -468,6 +503,7 @@ impl Site {
         &self,
         opts: &RenderOptions,
         stage: Option<&Path>,
+        pool: &Pool,
     ) -> Result<(Output, BuildReport), Failure> {
         let (pages, drafts): (Vec<&Page>, Vec<&Page>) = self
             .pages
@@ -509,34 +545,19 @@ impl Site {
             }
             Ok(done)
         };
-        // A pool that can't start is reported, and the build carries on with rayon's default pool.
-        let pool =
-            opts.jobs.and_then(
-                |n| match rayon::ThreadPoolBuilder::new().num_threads(n).build() {
-                    Ok(pool) => Some(pool),
-                    Err(e) => {
-                        errors.push(Error::new(
-                            "reuben.toml",
-                            ErrorKind::Config(format!("can't start {n} render threads: {e}")),
-                        ));
-                        None
-                    }
-                },
-            );
+        errors.extend(pool.error.clone());
         // Skipped pages count as failed with nothing to add, so templated partials still import as empty.
         let render_all =
             |batch: &[&Page], assets: &Arc<AssetMap>| -> Vec<Result<Rendered, Failed>> {
                 if self.includes_broken {
                     batch.iter().map(|_| Err(Failed::default())).collect()
                 } else {
-                    in_pool(pool.as_ref(), || {
-                        batch.par_iter().map(|p| render_one(p, assets)).collect()
-                    })
+                    pool.install(|| batch.par_iter().map(|p| render_one(p, assets)).collect())
                 }
             };
         let run_css =
             |jobs: &[(CssJob, bool)], templates: &CssTemplates, assets: Option<&AssetMap>| {
-                in_pool(pool.as_ref(), || {
+                pool.install(|| {
                     jobs.par_iter()
                         .map(|(job, _)| job.run(&self.config.css, templates, assets))
                         .collect::<Vec<_>>()
@@ -568,7 +589,7 @@ impl Site {
                     m.css_jobs.push((job, hashable));
                 }
             }
-            let names = in_pool(pool.as_ref(), || {
+            let names = pool.install(|| {
                 copies
                     .par_iter()
                     .map(|&(rel, src, hashable)| match hashable {
@@ -768,7 +789,7 @@ impl Site {
             .collect::<BTreeMap<_, _>>()
             .into_values()
             .collect();
-        let scanned: Vec<_> = in_pool(pool.as_ref(), || {
+        let scanned: Vec<_> = pool.install(|| {
             wanted
                 .par_iter()
                 .map(|page| {
@@ -906,6 +927,12 @@ impl Site {
 
     /// Renders the site and swaps it into `opts.out`. A failed build leaves the previous output untouched.
     pub fn build(&self, opts: &BuildOptions) -> Result<BuildReport, Failure> {
+        let pool = Pool::new(opts.jobs);
+        pool.install(|| self.build_in(opts, &pool))
+    }
+
+    /// `build`, on `pool`.
+    fn build_in(&self, opts: &BuildOptions, pool: &Pool) -> Result<BuildReport, Failure> {
         let staging = check_out_dir(&opts.out).and_then(|()| prepare_staging(&opts.out));
         let rendered = self.render_into(
             &RenderOptions {
@@ -913,6 +940,7 @@ impl Site {
                 jobs: opts.jobs,
             },
             staging.as_deref().ok(),
+            pool,
         );
         let (output, report, staging) = match (rendered, staging) {
             (Ok((output, report)), Ok(staging)) => (output, report, staging),
@@ -934,10 +962,13 @@ impl Site {
             }
         };
         // Pages are already in `staging`; `out` changes only when the swap succeeds.
-        finish_atomic(&output, &opts.out, &staging).map_err(|errors| Failure {
+        let left = finish_atomic(&output, &opts.out, &staging).map_err(|errors| Failure {
             errors,
             findings: report.findings.clone(),
         })?;
+        // The new output is in place, so leftovers of the old one are only warnings; the next build retries them.
+        let mut report = report;
+        report.warnings.extend(left.iter().map(ToString::to_string));
         Ok(report)
     }
 
@@ -1351,11 +1382,66 @@ fn unreadable(errors: &mut Vec<Error>, map: &mut AssetMap, rel: &Path, src: &Pat
     map.insert(rel.to_path_buf(), rel.to_path_buf());
 }
 
-fn in_pool<R: Send>(pool: Option<&rayon::ThreadPool>, f: impl FnOnce() -> R + Send) -> R {
-    match pool {
-        Some(pool) => pool.install(f),
-        None => f(),
+/// The threads every parallel step of one load and build runs on: reading sources, rendering, writing the output.
+/// It is `jobs` threads, or rayon's global pool when `jobs` is `None`.
+pub(crate) struct Pool {
+    pool: Option<rayon::ThreadPool>,
+    /// Why a pool of `jobs` threads couldn't start. The build then carries on with rayon's global pool, and fails
+    /// with this error.
+    error: Option<Error>,
+}
+
+impl Pool {
+    pub(crate) fn new(jobs: Option<usize>) -> Self {
+        let Some(n) = jobs else {
+            return Self {
+                pool: None,
+                error: None,
+            };
+        };
+        match rayon::ThreadPoolBuilder::new().num_threads(n).build() {
+            Ok(pool) => Self {
+                pool: Some(pool),
+                error: None,
+            },
+            Err(e) => Self {
+                pool: None,
+                error: Some(Error::new(
+                    "reuben.toml",
+                    ErrorKind::Config(format!("can't start {n} build threads: {e}")),
+                )),
+            },
+        }
     }
+
+    /// Runs `f` on the pool, so every rayon call inside it uses the pool's threads.
+    pub(crate) fn install<R: Send>(&self, f: impl FnOnce() -> R + Send) -> R {
+        match &self.pool {
+            Some(pool) => pool.install(f),
+            None => f(),
+        }
+    }
+
+    /// `errors`, with the pool's own error if it couldn't start, sorted.
+    fn with_error(&self, mut errors: Vec<Error>) -> Vec<Error> {
+        errors.extend(self.error.clone());
+        Error::sort(&mut errors);
+        errors
+    }
+}
+
+/// The thread of each unit of parallel work, keyed by the file it was for, and the size of the pool it ran in.
+#[cfg(test)]
+pub(crate) static WORK_THREADS: std::sync::Mutex<Vec<(PathBuf, std::thread::ThreadId, usize)>> =
+    std::sync::Mutex::new(Vec::new());
+
+#[cfg(test)]
+pub(crate) fn record_work_thread(path: &Path) {
+    WORK_THREADS.lock().unwrap().push((
+        path.to_path_buf(),
+        std::thread::current().id(),
+        rayon::current_num_threads(),
+    ));
 }
 
 /// Every sidecar path the filesystem was asked about, for tests that count them.
@@ -1925,6 +2011,65 @@ mod tests {
             })
     }
 
+    #[test]
+    fn jobs_sets_the_threads_that_load_render_and_write() {
+        let mut files = vec![("static/plain.txt".to_string(), "text".to_string())];
+        for i in 0..24 {
+            files.push((
+                format!("content/p{i}.md"),
+                format!("---\ntitle: P{i}\n---\nPage {i}\n"),
+            ));
+        }
+        let files: Vec<(&str, &str)> = files
+            .iter()
+            .map(|(p, c)| (p.as_str(), c.as_str()))
+            .collect();
+        let tmp = site_dir(&files);
+        let root = tmp.path();
+        for jobs in [1, 3] {
+            let out = root.join(format!("dist{jobs}"));
+            let opts = BuildOptions {
+                drafts: false,
+                out: out.clone(),
+                jobs: Some(jobs),
+            };
+            Site::load_and_build(root, &LoadOptions::default(), &opts).unwrap();
+            let staging = root.join(format!(".dist{jobs}.reuben-staging"));
+            let work: Vec<_> = WORK_THREADS
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|(path, ..)| {
+                    path.starts_with(root.join("content")) || path.starts_with(&staging)
+                })
+                .cloned()
+                .collect();
+            WORK_THREADS
+                .lock()
+                .unwrap()
+                .retain(|(path, ..)| !path.starts_with(root));
+            let count = |dir: &Path, ext: &str| {
+                work.iter()
+                    .filter(|(p, ..)| p.starts_with(dir) && p.extension().is_some_and(|e| e == ext))
+                    .count()
+            };
+            assert_eq!(count(&root.join("content"), "md"), 24, "loads");
+            assert_eq!(count(&staging, "html"), 24, "rendered pages");
+            assert_eq!(count(&staging, "txt"), 1, "copied files");
+            assert!(
+                work.iter().all(|(_, _, size)| *size == jobs),
+                "every step on the {jobs}-thread pool: {work:?}"
+            );
+            let threads: HashSet<_> = work.iter().map(|(_, id, _)| *id).collect();
+            assert!(
+                threads.len() <= jobs,
+                "{jobs} jobs used {} threads",
+                threads.len()
+            );
+            assert!(out.join("p0/index.html").is_file());
+        }
+    }
+
     fn dist_files(dir: &Path) -> BTreeMap<PathBuf, Vec<u8>> {
         WalkDir::new(dir.join("dist"))
             .into_iter()
@@ -2127,7 +2272,8 @@ mod tests {
             drafts: false,
             jobs: None,
         };
-        let (output, _) = site.render_into(&opts, Some(&stage)).unwrap();
+        let pool = Pool::new(opts.jobs);
+        let (output, _) = site.render_into(&opts, Some(&stage), &pool).unwrap();
         let about = Path::new("about/index.html");
         assert_eq!(output.files.get(about), Some(&OutputFile::Staged));
         assert!(

@@ -4,7 +4,9 @@ use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Mutex, PoisonError};
+use std::thread;
 
 use rayon::prelude::*;
 
@@ -36,11 +38,14 @@ pub struct Output {
 ///
 /// Writes only `Bytes` and `Copy` entries. A `Staged` entry is skipped without an error, and the staging directory
 /// starts empty, so that file is missing from `out`; only `Site::build`'s streaming path produces `Staged`.
+///
+/// The previous output is deleted after the swap. What can't be deleted then is left behind without an error, and
+/// deleted before the next swap.
 pub fn write_atomic(output: &Output, out: &Path) -> Result<(), Vec<Error>> {
     let (real, _, _) = paths(out).map_err(|e| vec![e])?;
     check_out_dir(&real).map_err(|e| vec![e])?;
     let staging = prepare_staging(out).map_err(|e| vec![e])?;
-    finish_atomic(output, out, &staging)
+    finish_atomic(output, out, &staging).map(|_| ())
 }
 
 /// Empties and creates the staging directory beside `out`, and returns it.
@@ -52,8 +57,12 @@ pub(crate) fn prepare_staging(out: &Path) -> Result<PathBuf, Error> {
 }
 
 /// Writes every file not yet in `staging` plus the marker, then swaps `staging` into `out`. On failure `out` is
-/// untouched and `staging` is removed.
-pub(crate) fn finish_atomic(output: &Output, out: &Path, staging: &Path) -> Result<(), Vec<Error>> {
+/// untouched and `staging` is removed. On success, returns what of the old output couldn't be deleted.
+pub(crate) fn finish_atomic(
+    output: &Output,
+    out: &Path,
+    staging: &Path,
+) -> Result<Vec<Error>, Vec<Error>> {
     let result = paths(out).map_err(|e| vec![e]).and_then(|(real, _, old)| {
         // Rechecked here because `out` may have changed while the site rendered, and the swap deletes it.
         check_out_dir(&real).map_err(|e| vec![e])?;
@@ -82,6 +91,8 @@ impl Stage {
     /// Writes one rendered file, creating its directory.
     pub(crate) fn write(&self, rel: &Path, bytes: &[u8]) -> Result<(), Error> {
         let dest = self.dir.join(rel);
+        #[cfg(test)]
+        crate::site::record_work_thread(&dest);
         if let Some(dir) = dest.parent() {
             self.make_dir(dir)?;
         }
@@ -195,6 +206,8 @@ fn stage(output: &Output, staging: &Path) -> Result<(), Vec<Error>> {
     let write_errors: Vec<Error> = files
         .par_iter()
         .filter_map(|(dest, _, file)| {
+            #[cfg(test)]
+            crate::site::record_work_thread(dest);
             let written = match file {
                 OutputFile::Bytes(bytes) => fs::write(dest, bytes).map_err(|e| (dest.clone(), e)),
                 OutputFile::Copy(src) => fs::copy(src, dest)
@@ -217,8 +230,11 @@ fn stage(output: &Output, staging: &Path) -> Result<(), Vec<Error>> {
     }
 }
 
-fn swap(staging: &Path, out: &Path, old: &Path) -> Result<(), Error> {
-    remove_dir(old)?;
+/// Swaps `staging` into `out`, then deletes the old output. Returns what couldn't be deleted after the swap, which
+/// doesn't fail the build: the new output is already in place.
+fn swap(staging: &Path, out: &Path, old: &Path) -> Result<Vec<Error>, Error> {
+    // Left by a run that stopped between the swap and the deletion.
+    remove_stale(old)?;
     let had_old = out.exists();
     if had_old {
         fs::rename(out, old).map_err(|e| Error::new(out, e))?;
@@ -229,29 +245,107 @@ fn swap(staging: &Path, out: &Path, old: &Path) -> Result<(), Error> {
         }
         return Err(Error::new(out, e));
     }
-    // The new output is in place; a failure to delete the old one isn't a failed build.
-    remove_tree_par(old);
-    Ok(())
+    Ok(if had_old {
+        remove_tree_par(old, DELETE_THREADS)
+    } else {
+        Vec::new()
+    })
 }
 
-/// Deletes a directory tree, removing its top-level entries in parallel. Each subtree goes through
-/// `remove_dir_all`, which is safe against a directory being swapped for a symlink mid-delete, and a symlink is
-/// removed itself, never followed. Best effort: a failure leaves files behind.
-fn remove_tree_par(dir: &Path) {
-    let Ok(entries) = fs::read_dir(dir) else {
-        return;
-    };
-    let entries: Vec<_> = entries.flatten().collect();
-    entries.par_iter().for_each(|entry| {
-        let path = entry.path();
-        if entry.file_type().is_ok_and(|t| t.is_dir()) {
-            let _ = fs::remove_dir_all(&path);
-        } else {
-            let _ = fs::remove_file(&path);
+/// How many threads delete the old output. Deleting isn't build work, so `--jobs` doesn't limit it: with one job a
+/// rebuild would wait for a deletion on one thread. More than four delete no faster on APFS.
+const DELETE_THREADS: usize = 4;
+
+/// Deletes an old-output folder left from an earlier run with one `remove_dir_all` call on the folder itself, which
+/// never follows a symlink at any level, even if the folder is swapped for one meanwhile: it sat on disk where
+/// anything could have happened to it. A symlink or file in its place is removed, not followed, and a missing folder
+/// is not an error.
+fn remove_stale(dir: &Path) -> Result<(), Error> {
+    #[cfg(test)]
+    if FAIL_REMOVAL.lock().unwrap().iter().any(|p| p == dir) {
+        let e = io::Error::from(io::ErrorKind::PermissionDenied);
+        return Err(removal_error(dir, e));
+    }
+    match fs::remove_dir_all(dir) {
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(_) if fs::symlink_metadata(dir).is_ok_and(|m| m.is_file()) => {
+            fs::remove_file(dir).map_err(|e| removal_error(dir, e))
         }
-    });
-    let _ = fs::remove_dir(dir);
+        Err(e) => Err(removal_error(dir, e)),
+        Ok(()) => Ok(()),
+    }
 }
+
+/// Deletes the old output this run just renamed aside, removing its top-level entries on up to `threads` threads,
+/// and returns every failure in path order. Each subtree goes through `remove_dir_all`, which is safe against a
+/// directory being swapped for a symlink mid-delete, and a symlink is removed itself, never followed. The folder
+/// was renamed a moment ago from the output this run checked, so reaching entries through its path is safe enough.
+fn remove_tree_par(dir: &Path, threads: usize) -> Vec<Error> {
+    let mut errors = Vec::new();
+    let entries: Vec<fs::DirEntry> = match fs::read_dir(dir) {
+        Ok(entries) => entries
+            .filter_map(|entry| entry.map_err(|e| errors.push(removal_error(dir, e))).ok())
+            .collect(),
+        Err(e) => return vec![removal_error(dir, e)],
+    };
+    let next = AtomicUsize::new(0);
+    let failed = Mutex::new(Vec::new());
+    let work = || {
+        while let Some(entry) = entries.get(next.fetch_add(1, Ordering::Relaxed)) {
+            if let Err(e) = remove_entry(entry) {
+                failed
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .push(e);
+            }
+        }
+    };
+    thread::scope(|s| {
+        // A thread that can't start leaves its share to the others; this one always works too.
+        for _ in 1..threads.min(entries.len()) {
+            if thread::Builder::new().spawn_scoped(s, work).is_err() {
+                break;
+            }
+        }
+        work();
+    });
+    errors.extend(failed.into_inner().unwrap_or_else(PoisonError::into_inner));
+    // A folder with something left in it can't be removed, and the error for what's left already says why.
+    if errors.is_empty()
+        && let Err(e) = fs::remove_dir(dir)
+    {
+        errors.push(removal_error(dir, e));
+    }
+    errors.sort_by(|a, b| a.path.cmp(&b.path));
+    errors
+}
+
+fn remove_entry(entry: &fs::DirEntry) -> Result<(), Error> {
+    let path = entry.path();
+    #[cfg(test)]
+    if FAIL_REMOVAL.lock().unwrap().contains(&path) {
+        let e = io::Error::from(io::ErrorKind::PermissionDenied);
+        return Err(removal_error(&path, e));
+    }
+    let removed = if entry.file_type().is_ok_and(|t| t.is_dir()) {
+        fs::remove_dir_all(&path)
+    } else {
+        fs::remove_file(&path)
+    };
+    match removed {
+        Err(e) if e.kind() != io::ErrorKind::NotFound => Err(removal_error(&path, e)),
+        _ => Ok(()),
+    }
+}
+
+fn removal_error(path: &Path, e: io::Error) -> Error {
+    let message = format!("can't delete the previous build's output: {e}");
+    Error::new(path, io::Error::new(e.kind(), message))
+}
+
+/// Paths that `remove_stale` and `remove_entry` refuse to delete, for tests of a failed deletion.
+#[cfg(test)]
+static FAIL_REMOVAL: std::sync::Mutex<Vec<PathBuf>> = std::sync::Mutex::new(Vec::new());
 
 fn remove_dir(dir: &Path) -> Result<(), Error> {
     match fs::remove_dir_all(dir) {
@@ -299,6 +393,158 @@ mod tests {
             "mine"
         );
         assert!(!tmp.path().join("dist/a.html").exists());
+    }
+
+    #[test]
+    fn stale_old_output_from_a_crash_is_deleted() {
+        let tmp = TempDir::new().unwrap();
+        // Half deleted: no marker, and a folder of what's left.
+        tmp.child(".dist.reuben-old/blog/x/index.html")
+            .write_str("left")
+            .unwrap();
+        tmp.child("dist/.reuben-output").write_str("").unwrap();
+        tmp.child("dist/keep.html").write_str("previous").unwrap();
+        write_atomic(&one_page(), &tmp.path().join("dist")).unwrap();
+        assert!(!tmp.path().join(".dist.reuben-old").exists());
+        assert!(tmp.path().join("dist/a.html").is_file());
+        assert!(!tmp.path().join("dist/keep.html").exists());
+    }
+
+    #[test]
+    fn stale_old_output_file_is_deleted() {
+        let tmp = TempDir::new().unwrap();
+        tmp.child(".dist.reuben-old")
+            .write_str("not a folder")
+            .unwrap();
+        write_atomic(&one_page(), &tmp.path().join("dist")).unwrap();
+        assert!(!tmp.path().join(".dist.reuben-old").exists());
+        assert!(tmp.path().join("dist/a.html").is_file());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symlinked_stale_old_output_is_removed_not_followed() {
+        let tmp = TempDir::new().unwrap();
+        tmp.child("elsewhere/keep/index.html")
+            .write_str("mine")
+            .unwrap();
+        let old = tmp.path().join(".dist.reuben-old");
+        std::os::unix::fs::symlink(tmp.path().join("elsewhere"), &old).unwrap();
+        write_atomic(&one_page(), &tmp.path().join("dist")).unwrap();
+        assert!(fs::symlink_metadata(&old).is_err());
+        assert_eq!(
+            fs::read_to_string(tmp.path().join("elsewhere/keep/index.html")).unwrap(),
+            "mine"
+        );
+        assert!(tmp.path().join("dist/a.html").is_file());
+    }
+
+    #[test]
+    fn custom_output_name_deletes_only_its_own_old_output() {
+        let tmp = TempDir::new().unwrap();
+        tmp.child(".public.reuben-old/x.html")
+            .write_str("x")
+            .unwrap();
+        tmp.child(".dist.reuben-old/y.html").write_str("y").unwrap();
+        write_atomic(&one_page(), &tmp.path().join("public")).unwrap();
+        assert!(!tmp.path().join(".public.reuben-old").exists());
+        assert!(tmp.path().join(".dist.reuben-old/y.html").is_file());
+        assert!(tmp.path().join("public/a.html").is_file());
+    }
+
+    #[test]
+    fn stale_old_output_that_cant_be_deleted_fails_and_keeps_out() {
+        let tmp = TempDir::new().unwrap();
+        let (dist, old) = (tmp.path().join("dist"), tmp.path().join(".dist.reuben-old"));
+        tmp.child("dist/.reuben-output").write_str("").unwrap();
+        tmp.child("dist/keep.html").write_str("previous").unwrap();
+        tmp.child(".dist.reuben-old/b/index.html")
+            .write_str("")
+            .unwrap();
+        FAIL_REMOVAL.lock().unwrap().push(old.clone());
+        let errs = write_atomic(&one_page(), &dist).unwrap_err();
+        assert_eq!(errs.len(), 1);
+        assert_eq!(errs[0].path, old);
+        assert!(
+            errs[0]
+                .to_string()
+                .contains("can't delete the previous build's output")
+        );
+        assert_eq!(
+            fs::read_to_string(dist.join("keep.html")).unwrap(),
+            "previous"
+        );
+        assert!(!dist.join("a.html").exists());
+        assert!(!tmp.path().join(".dist.reuben-staging").exists());
+    }
+
+    /// A real failure, where the platform allows one: a read-only folder's files can't be deleted.
+    #[cfg(unix)]
+    #[test]
+    fn unwritable_stale_old_output_fails_the_write() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = TempDir::new().unwrap();
+        let (dist, old) = (tmp.path().join("dist"), tmp.path().join(".dist.reuben-old"));
+        tmp.child("dist/.reuben-output").write_str("").unwrap();
+        tmp.child("dist/keep.html").write_str("previous").unwrap();
+        tmp.child(".dist.reuben-old/locked/x.html")
+            .write_str("")
+            .unwrap();
+        let locked = old.join("locked");
+        fs::set_permissions(&locked, fs::Permissions::from_mode(0o555)).unwrap();
+        // Root ignores the permission, so there's nothing to test.
+        if fs::write(locked.join("probe"), "").is_ok() {
+            fs::set_permissions(&locked, fs::Permissions::from_mode(0o755)).unwrap();
+            return;
+        }
+        let result = write_atomic(&one_page(), &dist);
+        fs::set_permissions(&locked, fs::Permissions::from_mode(0o755)).unwrap();
+        let errs = result.unwrap_err();
+        assert_eq!(errs.len(), 1, "{errs:?}");
+        assert!(errs[0].path.starts_with(&old), "{errs:?}");
+        assert_eq!(
+            fs::read_to_string(dist.join("keep.html")).unwrap(),
+            "previous"
+        );
+        assert!(!tmp.path().join(".dist.reuben-staging").exists());
+    }
+
+    #[test]
+    fn old_output_left_after_the_swap_is_returned_and_deleted_next_time() {
+        let tmp = TempDir::new().unwrap();
+        let (dist, old) = (tmp.path().join("dist"), tmp.path().join(".dist.reuben-old"));
+        tmp.child("dist/.reuben-output").write_str("").unwrap();
+        tmp.child("dist/a/index.html").write_str("").unwrap();
+        tmp.child("dist/b/index.html").write_str("").unwrap();
+        tmp.child("dist/c.html").write_str("").unwrap();
+        FAIL_REMOVAL.lock().unwrap().push(old.join("b"));
+        FAIL_REMOVAL.lock().unwrap().push(old.join("c.html"));
+        let staging = prepare_staging(&dist).unwrap();
+        let left = finish_atomic(&one_page(), &dist, &staging).unwrap();
+        let paths: Vec<&Path> = left.iter().map(|e| e.path.as_path()).collect();
+        assert_eq!(
+            paths,
+            [old.join("b").as_path(), old.join("c.html").as_path()]
+        );
+        assert_eq!(fs::read_to_string(dist.join("a.html")).unwrap(), "new");
+        assert!(!old.join("a").exists());
+        assert!(old.join("b/index.html").is_file());
+        // The next write deletes the rest before it swaps.
+        write_atomic(&one_page(), &dist).unwrap();
+        assert!(!old.exists());
+    }
+
+    #[test]
+    fn remove_tree_par_deletes_everything() {
+        let tmp = TempDir::new().unwrap();
+        for i in 0..40 {
+            tmp.child(format!("old/s{i}/p/index.html"))
+                .write_str("x")
+                .unwrap();
+            tmp.child(format!("old/f{i}.html")).write_str("x").unwrap();
+        }
+        assert!(remove_tree_par(&tmp.path().join("old"), DELETE_THREADS).is_empty());
+        assert!(!tmp.path().join("old").exists());
     }
 
     #[test]

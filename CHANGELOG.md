@@ -64,6 +64,12 @@ Then the pages in collections are parsed a second time, while the site loads, fo
 A page with `{{` or `{%` blocks finds the code they must skip once instead of twice.
 On a 10,000-page site that doesn't read collections, CPU time falls by about a fifth and peak memory by about a quarter.
 On a 6,000-page site that reads collections, maximum resident memory may rise by a few MB, though peak memory footprint stays at or below 0.2.0.
+`--jobs` now sets the threads for every step of a build, reading sources and writing files included, so `--jobs 1` really reads, renders and writes on one thread.
+Deleting the previous output after the swap isn't build work, so it runs on up to four threads of its own whatever `--jobs` says.
+A stale `.dist.reuben-old` left by an interrupted build is deleted before the swap even when it is a file or a symlink, and a symlink is removed without touching its target.
+What can't be deleted of the previous output after the swap is now printed as a warning, and the next build deletes it before it swaps.
+Without `--jobs`, a Mac with Apple silicon builds on its performance cores (6 on an M3 Pro) instead of on every core, since a build is mostly file creation and the efficiency cores only add CPU time; elsewhere the default is still one thread per core.
+On the 10,000-page benchmark on an M3 Pro, a default build uses about a quarter less CPU time.
 
 ### Library API
 
@@ -75,6 +81,8 @@ Changed in `reuben-core`: `splice::splice` takes how many line breaks each block
 Changed in `reuben-core`: `site::Page` no longer has the `pre_block_toc` and `summary` fields; `Site::pre_block(&page)` returns the page's `page::PreBlock`, with `toc` and `summary`.
 `site::Page` has private fields now, so it can't be built with a struct literal outside the crate.
 Added to `reuben-core`: `headings::toc_before_blocks`, which gives the table of contents before blocks run without changing the tree.
+Added to `reuben-core`: `Site::load_and_render` and `Site::load_and_build`, which load and then render or build on one pool of `jobs` threads, and the `site::RenderResult` type.
+Changed in `reuben-core`: `Site::build` writes the output files on its `jobs` pool, and a pool that can't start is reported as "can't start N build threads".
 
 ## 0.2.0 (2026-11-21)
 
