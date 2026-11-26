@@ -41,16 +41,7 @@ pub fn site_map(config: &Config) -> Result<Map, Error> {
 /// `toc` is the page's table of contents before blocks run.
 pub(crate) fn page_map(page: &Page, config: &Config, toc: &[TocEntry]) -> Result<Map, Error> {
     let fm = &page.front_matter;
-    let fail = |e: Box<rhai::EvalAltResult>| {
-        Error::new(
-            &page.source,
-            ErrorKind::Config(format!("front matter can't be passed to scripts: {e}")),
-        )
-    };
-    let mut map = Map::new();
-    for (key, value) in &fm.extra {
-        map.insert(key.as_str().into(), to_dynamic(value).map_err(fail)?);
-    }
+    let mut map = extra_map(page)?;
     map.insert("title".into(), fm.title.clone().into());
     map.insert("draft".into(), page.draft_excluded.into());
     map.insert("description".into(), opt(fm.description.clone()));
@@ -78,6 +69,21 @@ pub(crate) fn page_map(page: &Page, config: &Config, toc: &[TocEntry]) -> Result
         collections::public_name(&page.rel, config).into(),
     );
     map.insert("toc".into(), headings::toc_array(toc).into());
+    Ok(map)
+}
+
+/// The front matter fields Reuben doesn't recognize, as scripts see them. Only these can make [`page_map`] fail.
+pub(crate) fn extra_map(page: &Page) -> Result<Map, Error> {
+    let fail = |e: Box<rhai::EvalAltResult>| {
+        Error::new(
+            &page.source,
+            ErrorKind::Config(format!("front matter can't be passed to scripts: {e}")),
+        )
+    };
+    let mut map = Map::new();
+    for (key, value) in &page.front_matter.extra {
+        map.insert(key.as_str().into(), to_dynamic(value).map_err(fail)?);
+    }
     Ok(map)
 }
 

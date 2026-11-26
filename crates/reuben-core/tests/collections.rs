@@ -95,3 +95,52 @@ fn array_sort_by_helper_orders_filtered_collection() {
     let html = fs::read_to_string(tmp.path().join("dist/sorted/index.html")).unwrap();
     assert!(html.contains("ABC|ab"), "{html}");
 }
+
+/// The errors of a build of a site with two collections named alike and a member page whose block fails, with or
+/// without a script that names `collections`.
+fn duplicate_name_errors(names_collections: bool) -> Vec<String> {
+    let tmp = TempDir::new().unwrap();
+    tmp.child("reuben.toml")
+        .write_str("[collections.a]\nname = \"same\"\n[collections.b]\nname = \"same\"\n")
+        .unwrap();
+    tmp.child("content/a/x.md")
+        .write_str("---\ntitle: X\n---\n{{ nope( }}\n")
+        .unwrap();
+    tmp.child("content/b/y.md")
+        .write_str("---\ntitle: Y\n---\ny\n")
+        .unwrap();
+    if names_collections {
+        tmp.child("layouts/unused.html")
+            .write_str("{{ collections.len() }}")
+            .unwrap();
+    }
+    let failure = Site::load(tmp.path())
+        .unwrap()
+        .build(&BuildOptions {
+            drafts: false,
+            out: tmp.path().join("dist"),
+            jobs: None,
+        })
+        .unwrap_err();
+    let root = tmp.path().to_string_lossy().into_owned();
+    failure
+        .errors
+        .iter()
+        .map(|e| e.to_string().replace(&root, ""))
+        .collect()
+}
+
+#[test]
+fn duplicate_collection_names_are_reported_once_whether_or_not_a_script_reads_collections() {
+    for names_collections in [false, true] {
+        let errors = duplicate_name_errors(names_collections);
+        let duplicates = errors
+            .iter()
+            .filter(|e| e.contains("two collections are named \"same\""))
+            .count();
+        assert_eq!(duplicates, 1, "{names_collections}: {errors:?}");
+        let page = errors.iter().filter(|e| e.contains("a/x.md")).count();
+        assert_eq!(page, 1, "{names_collections}: {errors:?}");
+    }
+    assert_eq!(duplicate_name_errors(false), duplicate_name_errors(true));
+}

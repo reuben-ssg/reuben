@@ -7,7 +7,7 @@ use rhai::{Array, Dynamic, Map};
 
 use crate::config::Config;
 use crate::error::{Error, ErrorKind};
-use crate::page::{PreBlock, page_map};
+use crate::page::{PreBlock, extra_map, page_map};
 use crate::script::collection::{Collection, compare, sort_array};
 use crate::site::{Page, PageKind};
 
@@ -55,6 +55,11 @@ pub(crate) fn is_member(page: &Page) -> bool {
     joins_collection(page) && collection_of(&page.rel).is_some()
 }
 
+/// The source of every page an item was built for, for tests that count them.
+#[cfg(test)]
+pub(crate) static ITEMS_BUILT: std::sync::Mutex<Vec<std::path::PathBuf>> =
+    std::sync::Mutex::new(Vec::new());
+
 /// Builds every collection from the pages that are in the build. Callers exclude drafts first.
 /// A collection that can't be built is reported and left out; the others are still returned.
 pub fn build(pages: &[&Page], config: &Config) -> (Map, Vec<Error>) {
@@ -66,20 +71,11 @@ pub fn build(pages: &[&Page], config: &Config) -> (Map, Vec<Error>) {
 pub(crate) fn build_with(pages: &[&Page], config: &Config, pre_block: bool) -> (Map, Vec<Error>) {
     let math = config.markdown.math;
     let unread = PreBlock::default();
-    let mut folders: BTreeMap<String, Vec<&Page>> = BTreeMap::new();
-    for page in pages.iter().filter(|p| joins_collection(p)) {
-        if let Some(folder) = collection_of(&page.rel) {
-            folders.entry(folder).or_default().push(page);
-        }
-    }
-
     let mut out = Map::new();
     let mut errors = Vec::new();
-    for (folder, group) in folders {
+    for (folder, group) in folders(pages) {
         let settings = config.collections.get(&folder);
-        let name = settings
-            .and_then(|c| c.name.clone())
-            .unwrap_or_else(|| folder.clone());
+        let name = name_of(&folder, config);
         let sort = settings.and_then(|c| c.sort.as_deref()).unwrap_or("");
 
         let mut entries = Vec::with_capacity(group.len());
@@ -89,6 +85,8 @@ pub(crate) fn build_with(pages: &[&Page], config: &Config, pre_block: bool) -> (
             } else {
                 std::borrow::Cow::Borrowed(&unread)
             };
+            #[cfg(test)]
+            ITEMS_BUILT.lock().unwrap().push(page.source.clone());
             match page_map(page, config, &early.toc) {
                 Ok(mut map) => {
                     map.insert("summary".into(), early.summary.clone().into());
@@ -105,12 +103,7 @@ pub(crate) fn build_with(pages: &[&Page], config: &Config, pre_block: bool) -> (
         let tree = tree_node(Path::new(&folder), &entries, sort);
 
         if out.contains_key(name.as_str()) {
-            errors.push(Error::new(
-                "reuben.toml",
-                ErrorKind::Config(format!(
-                    "two collections are named \"{name}\"; rename one under [collections.<folder>]"
-                )),
-            ));
+            errors.push(duplicate_name(&name));
         } else {
             out.insert(
                 name.into(),
@@ -119,6 +112,49 @@ pub(crate) fn build_with(pages: &[&Page], config: &Config, pre_block: bool) -> (
         }
     }
     (out, errors)
+}
+
+/// The errors [`build_with`] reports, without building any item, for a render where no script can read
+/// `collections`.
+pub(crate) fn check(pages: &[&Page], config: &Config) -> Vec<Error> {
+    let mut names = std::collections::HashSet::new();
+    let mut errors = Vec::new();
+    for (folder, group) in folders(pages) {
+        errors.extend(group.iter().filter_map(|p| extra_map(p).err()));
+        let name = name_of(&folder, config);
+        if !names.insert(name.clone()) {
+            errors.push(duplicate_name(&name));
+        }
+    }
+    errors
+}
+
+/// Collection members grouped by folder, in folder order and in `pages` order within each.
+fn folders<'a>(pages: &[&'a Page]) -> BTreeMap<String, Vec<&'a Page>> {
+    let mut folders: BTreeMap<String, Vec<&Page>> = BTreeMap::new();
+    for page in pages.iter().filter(|p| joins_collection(p)) {
+        if let Some(folder) = collection_of(&page.rel) {
+            folders.entry(folder).or_default().push(page);
+        }
+    }
+    folders
+}
+
+fn name_of(folder: &str, config: &Config) -> String {
+    config
+        .collections
+        .get(folder)
+        .and_then(|c| c.name.clone())
+        .unwrap_or_else(|| folder.to_string())
+}
+
+fn duplicate_name(name: &str) -> Error {
+    Error::new(
+        "reuben.toml",
+        ErrorKind::Config(format!(
+            "two collections are named \"{name}\"; rename one under [collections.<folder>]"
+        )),
+    )
 }
 
 struct TreeNode {
@@ -289,6 +325,31 @@ mod tests {
         assert_eq!(p.pre_block(false).summary, "Tone.");
         let p = page("guide/v.md", None, "Intro {{ x }} text.\n\nMore");
         assert_eq!(p.pre_block(false).summary, "Intro text.");
+    }
+
+    #[test]
+    fn check_reports_what_a_build_reports() {
+        let mut config = config();
+        config.collections.insert(
+            "blog".to_string(),
+            crate::config::CollectionConfig::default(),
+        );
+        let pages = [
+            page("posts/a.md", None, "x"),
+            page("blog/b.md", None, "x"),
+            page("guide/c.md", None, "x"),
+        ];
+        let pages: Vec<&Page> = pages.iter().collect();
+        let (_, built) = build_with(&pages, &config, false);
+        let checked = check(&pages, &config);
+        let messages =
+            |errors: &[Error]| errors.iter().map(ToString::to_string).collect::<Vec<_>>();
+        assert_eq!(messages(&checked), messages(&built));
+        assert_eq!(checked.len(), 1, "{checked:?}");
+        assert!(
+            checked[0].to_string().contains("named \"blog\""),
+            "{checked:?}"
+        );
     }
 
     #[test]

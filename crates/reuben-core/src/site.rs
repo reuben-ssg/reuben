@@ -516,9 +516,16 @@ impl Site {
         let mut errors = self.load_errors.clone();
         let (mut collision_errors, colliding) = self.check_collisions(&pages, opts.drafts);
         errors.append(&mut collision_errors);
-        let (collections, mut collection_errors) =
-            collections::build_with(&pages, &self.config, self.collections_named);
-        errors.append(&mut collection_errors);
+        // Without a script that names `collections` nothing reads the items, so only their errors are worked out.
+        let collections = if self.collections_named {
+            let (collections, mut collection_errors) =
+                collections::build_with(&pages, &self.config, true);
+            errors.append(&mut collection_errors);
+            collections
+        } else {
+            errors.extend(collections::check(&pages, &self.config));
+            rhai::Map::new()
+        };
 
         let index = Arc::new(self.page_index(opts.drafts));
         let scopes = page::SiteScopes {
@@ -2373,6 +2380,34 @@ mod tests {
         let home = html_of(&output, "index.html");
         assert!(home.contains("parsed-early-blocks {{ x }}"), "{home}");
         assert!(home.contains("parsed-early-plain text"), "{home}");
+    }
+
+    fn items_built(dir: &Path) -> usize {
+        collections::ITEMS_BUILT
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|p| p.starts_with(dir))
+            .count()
+    }
+
+    #[test]
+    fn collection_items_are_built_only_when_a_script_reads_collections() {
+        let page = "---\ntitle: T\n---\nx\n";
+        let quiet = site_dir(&[("content/docs/a.md", page), ("content/docs/b.md", page)]);
+        render_site(quiet.path()).unwrap();
+        assert_eq!(items_built(quiet.path()), 0);
+
+        let reads = site_dir(&[
+            ("content/docs/a.md", page),
+            ("content/docs/b.md", page),
+            (
+                "content/index.md",
+                "---\ntitle: H\n---\n{{ collections.len() }}\n",
+            ),
+        ]);
+        render_site(reads.path()).unwrap();
+        assert_eq!(items_built(reads.path()), 2);
     }
 
     /// Every member reads every member's summary and table of contents, so under parallel rendering some read a page
