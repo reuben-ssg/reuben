@@ -26,7 +26,10 @@ impl ScriptEngine {
             files.sort();
             for path in files {
                 match self.compile_include(&path) {
-                    Ok(module) => modules.push(module),
+                    Ok((module, src)) => {
+                        modules.push(module);
+                        self.include_sources.push(src);
+                    }
                     Err(e) => errors.push(e),
                 }
             }
@@ -40,7 +43,8 @@ impl ScriptEngine {
         Ok(())
     }
 
-    fn compile_include(&self, path: &Path) -> Result<rhai::Shared<rhai::Module>, Error> {
+    /// The compiled module and the source it was compiled from.
+    fn compile_include(&self, path: &Path) -> Result<(rhai::Shared<rhai::Module>, String), Error> {
         let fail = |message: String, pos: rhai::Position| {
             Error::new(
                 path,
@@ -68,7 +72,7 @@ impl ScriptEngine {
                 let pos = e.take_position();
                 fail(e.to_string(), pos)
             })?;
-        Ok(module.into())
+        Ok((module.into(), src))
     }
 }
 

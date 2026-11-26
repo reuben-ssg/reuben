@@ -62,6 +62,8 @@ impl std::fmt::Display for ScriptError {
 pub struct ScriptEngine {
     engine: rhai::Engine,
     include_files: IncludeFiles,
+    /// The source of every include compiled, so a check of what the includes name reads the text that runs.
+    include_sources: Vec<String>,
 }
 
 impl std::fmt::Debug for ScriptEngine {
@@ -195,7 +197,13 @@ impl ScriptEngine {
         Self {
             engine,
             include_files,
+            include_sources: Vec::new(),
         }
+    }
+
+    /// Whether the source of any include this engine compiled contains `word`.
+    pub(crate) fn includes_mention(&self, word: &str) -> bool {
+        self.include_sources.iter().any(|s| s.contains(word))
     }
 
     pub fn eval_block(

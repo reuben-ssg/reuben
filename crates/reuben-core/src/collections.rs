@@ -87,7 +87,7 @@ pub(crate) fn build_with(pages: &[&Page], config: &Config, pre_block: bool) -> (
             let early = if pre_block {
                 page.pre_block(math)
             } else {
-                &unread
+                std::borrow::Cow::Borrowed(&unread)
             };
             match page_map(page, config, &early.toc) {
                 Ok(mut map) => {
@@ -241,8 +241,7 @@ mod tests {
             route: route_for_page(Path::new(rel)),
             front_matter_sources: Default::default(),
             draft_excluded: false,
-            pre_block: Default::default(),
-            code_ranges: Default::default(),
+            pre_block: None,
             rules: reuben_a11y::RuleSet::all(),
         }
     }

@@ -104,12 +104,8 @@ fn pre_block_toc_computed_once() {
         .unwrap();
     let site = Site::load(tmp.path()).unwrap();
     let page = site.pages.iter().find(|p| p.rel.ends_with("a.md")).unwrap();
-    let ids: Vec<&str> = page
-        .pre_block(false)
-        .toc
-        .iter()
-        .map(|t| t.id.as_str())
-        .collect();
+    let pre_block = site.pre_block(page);
+    let ids: Vec<&str> = pre_block.toc.iter().map(|t| t.id.as_str()).collect();
     assert_eq!(ids, ["one", "one-1"]);
     let output = render(&site, 2).unwrap();
     let home = output
@@ -137,7 +133,7 @@ fn summary_is_first_paragraph() {
         .unwrap();
     let site = Site::load(tmp.path()).unwrap();
     assert_eq!(
-        site.pages[0].pre_block(false).summary,
+        site.pre_block(&site.pages[0]).summary,
         "First paragraph here."
     );
 }

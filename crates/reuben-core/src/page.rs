@@ -1,5 +1,6 @@
 //! Evaluates a page: sidecar script, then its blocks in one scope, spliced into the document tree.
 
+use std::ops::Range;
 use std::sync::Arc;
 
 use rhai::serde::to_dynamic;
@@ -85,35 +86,57 @@ pub struct PreBlock {
     pub toc: Vec<TocEntry>,
     /// Front matter `description`, else the plain text of the first paragraph with block placeholders removed.
     pub summary: String,
+    /// Byte ranges of the body inside code, where `{{` stays literal, kept so the page's render needn't find them
+    /// again.
+    pub(crate) code_ranges: Box<[Range<usize>]>,
 }
 
 /// From one parse of the body. A body whose blocks can't be extracted has neither a toc nor a summary beyond its
 /// `description`; the page's own render reports that error.
 pub(crate) fn pre_block(page: &Page, math: bool) -> PreBlock {
     let description = page.front_matter.description.as_deref();
-    let described = || PreBlock {
-        toc: Vec::new(),
-        summary: description.map_or_else(String::new, str::to_string),
-    };
+    let summary = || description.map_or_else(String::new, str::to_string);
     if page.kind != PageKind::Markdown {
-        return described();
+        return PreBlock {
+            summary: summary(),
+            ..PreBlock::default()
+        };
     }
-    let Some(doc) = parse_body(page, math) else {
-        return described();
+    let code_ranges: Box<[Range<usize>]> = code_ranges(&page.body, math).into();
+    let Ok(extracted) = blocks::extract(&page.body, page.body_line, &code_ranges) else {
+        return PreBlock {
+            summary: summary(),
+            code_ranges,
+            ..PreBlock::default()
+        };
     };
+    let doc = markdown::parse_extracted(&extracted, page.body_line, math);
+    let mut toc = headings::toc_before_blocks(&doc);
+    toc.shrink_to_fit();
     PreBlock {
-        toc: headings::toc_before_blocks(&doc),
+        toc,
         summary: match description {
             Some(d) => d.to_string(),
             None => first_paragraph_text(&doc),
         },
+        code_ranges,
     }
 }
 
-/// The body with its blocks cut out and parsed, or `None` when the blocks can't be extracted.
-fn parse_body(page: &Page, math: bool) -> Option<Document> {
-    let extracted = blocks::extract(&page.body, page.body_line, page.code_ranges(math)).ok()?;
-    Some(markdown::parse_extracted(&extracted, page.body_line, math))
+/// The byte ranges of `body` inside code that hold a block opener, which must stay literal. [`blocks::extract`]
+/// checks ranges only at an opener, so the other ranges are dropped rather than kept until the page renders.
+pub(crate) fn code_ranges(body: &str, math: bool) -> Vec<Range<usize>> {
+    if !markdown::has_blocks(body) {
+        return Vec::new();
+    }
+    let bytes = body.as_bytes();
+    let mut ranges = markdown::code_ranges_with(body, math);
+    ranges.retain(|r| {
+        bytes[r.start..(r.end + 1).min(bytes.len())]
+            .windows(2)
+            .any(|w| w == b"{{" || w == b"{%")
+    });
+    ranges
 }
 
 fn first_paragraph_text(doc: &Document) -> String {
@@ -147,8 +170,8 @@ pub fn build_scope(
     config: &Config,
     scopes: &SiteScopes<'_>,
 ) -> Result<Scope<'static>, Vec<Error>> {
-    let toc = &page.pre_block(config.markdown.math).toc;
-    scope_with_toc(page, engine, config, scopes, toc)
+    let pre_block = page.pre_block(config.markdown.math);
+    scope_with_toc(page, engine, config, scopes, &pre_block.toc)
 }
 
 /// [`build_scope`] with the page's table of contents before blocks run already in hand.
@@ -210,15 +233,26 @@ pub fn render_body(
     let math = config.markdown.math;
     // The page's own parse gives its toc before blocks run, so its scope needs no parse of its own. A sidecar
     // error still comes before an extraction error, as the sidecar runs first.
-    let extracted = blocks::extract(&page.body, page.body_line, page.code_ranges(math));
+    let extracted = {
+        let code_ranges = page.code_ranges(math);
+        blocks::extract(&page.body, page.body_line, &code_ranges)
+    };
     let parsed = extracted
         .as_ref()
         .ok()
         .map(|e| markdown::parse_extracted(e, page.body_line, math));
-    let pre_block_toc = parsed
-        .as_ref()
-        .map_or_else(Vec::new, headings::toc_before_blocks);
-    let mut scope = scope_with_toc(page, engine, config, scopes, &pre_block_toc)?;
+    // A toc kept from load is reused: working it out again costs a measurable rise in peak memory.
+    let computed;
+    let pre_block_toc: &[TocEntry] = match &page.pre_block {
+        Some(kept) => &kept.toc,
+        None => {
+            computed = parsed
+                .as_ref()
+                .map_or_else(Vec::new, headings::toc_before_blocks);
+            &computed
+        }
+    };
+    let mut scope = scope_with_toc(page, engine, config, scopes, pre_block_toc)?;
     let extracted = extracted.map_err(|e| vec![Error::new(&page.source, ErrorKind::Block(e))])?;
     let mut doc = parsed.expect("an extracted body is parsed");
 
@@ -267,4 +301,29 @@ pub fn render_body(
         outputs,
         anchors,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Dropping code ranges that hold no opener changes nothing `extract` produces.
+    #[test]
+    fn kept_code_ranges_extract_like_all_of_them() {
+        let bodies = [
+            "a `{{ x }}` b {{ 1 }} `plain` c\n\n```\n{% y %}\n```\n\n{{ 2 }} `{` `{{` `{%`{{ 3 }}\n",
+            "`a`{{ 1 }}`b`\n\n    {{ indented }}\n\n$x {{ m }}$ {{{ 4 }}}\n",
+            "``{{`` {{ 5 }} `}}` `{{ unclosed",
+        ];
+        for body in bodies {
+            for math in [false, true] {
+                let all = markdown::code_ranges_with(body, math);
+                let kept = code_ranges(body, math);
+                assert!(kept.len() <= all.len());
+                let a = blocks::extract(body, 1, &all).map(|e| (e.text, e.blocks));
+                let k = blocks::extract(body, 1, &kept).map(|e| (e.text, e.blocks));
+                assert_eq!(format!("{a:?}"), format!("{k:?}"), "{body}");
+            }
+        }
+    }
 }
