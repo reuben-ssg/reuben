@@ -67,6 +67,12 @@ An output folder from 0.3.0 that still has `.reuben-output` inside is recognised
 A site that never reads `collections` no longer builds the collection items on every build.
 Two collections with the same name are still an error.
 `_dir.toml` files are found in the same walk of `content/` that finds the pages, instead of a second walk.
+`reuben build` no longer frees the site's memory piece by piece just before it exits; the operating system reclaims it at exit.
+`reuben serve` and library callers of `Site::load_and_build` still free it.
+
+### Library API
+
+`Site::load_and_build_for_exit` is `Site::load_and_build` for a process that exits right after it returns: it leaves the site and the build's working state allocated instead of freeing them.
 
 ## 0.3.0 (2026-11-26)
 

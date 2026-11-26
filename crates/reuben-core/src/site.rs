@@ -470,7 +470,7 @@ impl Site {
     /// Renders the whole site into memory. Nothing touches the disk, and no file is `OutputFile::Staged`.
     pub fn render(&self, opts: &RenderOptions) -> Result<(Output, BuildReport), Failure> {
         let pool = Pool::new(opts.jobs);
-        pool.install(|| self.render_into(opts, None, &pool))
+        pool.install(|| self.render_into(opts, None, &pool, Teardown::Drop))
     }
 
     /// Loads the site at `root` and renders it into memory, both on one pool of `opts.jobs` threads. The site comes
@@ -483,7 +483,7 @@ impl Site {
         let pool = Pool::new(opts.jobs);
         pool.install(|| {
             let site = Site::load_with(root, load).map_err(|errors| pool.with_error(errors))?;
-            let rendered = site.render_into(opts, None, &pool);
+            let rendered = site.render_into(opts, None, &pool, Teardown::Drop);
             Ok((site, rendered))
         })
     }
@@ -495,9 +495,34 @@ impl Site {
         load: &LoadOptions,
         opts: &BuildOptions,
     ) -> Result<BuildReport, Failure> {
+        Self::load_and_build_then(root, load, opts, Teardown::Drop)
+    }
+
+    /// [`Site::load_and_build`] for a process that exits as soon as this returns, such as the `reuben build`
+    /// command. The site and the build's working state are left for the operating system to reclaim at exit instead
+    /// of being freed one allocation at a time, which takes several milliseconds on a large site. A process that
+    /// goes on running never gets that memory back, so it should call [`Site::load_and_build`].
+    pub fn load_and_build_for_exit(
+        root: &Path,
+        load: &LoadOptions,
+        opts: &BuildOptions,
+    ) -> Result<BuildReport, Failure> {
+        Self::load_and_build_then(root, load, opts, Teardown::Leave)
+    }
+
+    fn load_and_build_then(
+        root: &Path,
+        load: &LoadOptions,
+        opts: &BuildOptions,
+        teardown: Teardown,
+    ) -> Result<BuildReport, Failure> {
         let pool = Pool::new(opts.jobs);
         pool.install(|| match Site::load_with(root, load) {
-            Ok(site) => site.build_in(opts, &pool),
+            Ok(site) => {
+                let built = site.build_in(opts, &pool, teardown);
+                teardown.finish(site);
+                built
+            }
             Err(errors) => Err(pool.with_error(errors).into()),
         })
     }
@@ -509,6 +534,7 @@ impl Site {
         opts: &RenderOptions,
         stage: Option<&Path>,
         pool: &Pool,
+        teardown: Teardown,
     ) -> Result<(Output, BuildReport), Failure> {
         let (pages, drafts): (Vec<&Page>, Vec<&Page>) = self
             .pages
@@ -872,6 +898,14 @@ impl Site {
             }
         }
         check::sort(&mut findings);
+        teardown.finish((
+            page_links,
+            page_ids,
+            page_anchors,
+            unscanned,
+            index,
+            collections,
+        ));
 
         if !errors.is_empty() {
             Error::sort(&mut errors);
@@ -953,11 +987,16 @@ impl Site {
     /// Renders the site and swaps it into `opts.out`. A failed build leaves the previous output untouched.
     pub fn build(&self, opts: &BuildOptions) -> Result<BuildReport, Failure> {
         let pool = Pool::new(opts.jobs);
-        pool.install(|| self.build_in(opts, &pool))
+        pool.install(|| self.build_in(opts, &pool, Teardown::Drop))
     }
 
     /// `build`, on `pool`.
-    fn build_in(&self, opts: &BuildOptions, pool: &Pool) -> Result<BuildReport, Failure> {
+    fn build_in(
+        &self,
+        opts: &BuildOptions,
+        pool: &Pool,
+        teardown: Teardown,
+    ) -> Result<BuildReport, Failure> {
         let staging = check_out_dir(&opts.out).and_then(|()| prepare_staging(&opts.out));
         let rendered = self.render_into(
             &RenderOptions {
@@ -966,6 +1005,7 @@ impl Site {
             },
             staging.as_deref().ok(),
             pool,
+            teardown,
         );
         let (output, report, staging) = match (rendered, staging) {
             (Ok((output, report)), Ok(staging)) => (output, report, staging),
@@ -987,7 +1027,9 @@ impl Site {
             }
         };
         // Pages are already in `staging`; `out` changes only when the swap succeeds.
-        let left = finish_atomic(&output, &opts.out, &staging).map_err(|errors| Failure {
+        let left = finish_atomic(&output, &opts.out, &staging);
+        teardown.finish(output);
+        let left = left.map_err(|errors| Failure {
             errors,
             findings: report.findings.clone(),
         })?;
@@ -1405,6 +1447,23 @@ pub(crate) fn include_dirs(root: &Path, config: &Config) -> Vec<PathBuf> {
 fn unreadable(errors: &mut Vec<Error>, map: &mut AssetMap, rel: &Path, src: &Path, e: io::Error) {
     errors.push(Error::new(src, e));
     map.insert(rel.to_path_buf(), rel.to_path_buf());
+}
+
+/// What happens to a build's large state once it is done with: freed, or left for the operating system to reclaim
+/// when a process that is about to exit does.
+#[derive(Clone, Copy)]
+enum Teardown {
+    Drop,
+    Leave,
+}
+
+impl Teardown {
+    fn finish<T>(self, state: T) {
+        match self {
+            Teardown::Drop => drop(state),
+            Teardown::Leave => std::mem::forget(state),
+        }
+    }
 }
 
 /// The threads every parallel step of one load and build runs on: reading sources, rendering, writing the output.
@@ -2342,7 +2401,9 @@ mod tests {
             jobs: None,
         };
         let pool = Pool::new(opts.jobs);
-        let (output, _) = site.render_into(&opts, Some(&stage), &pool).unwrap();
+        let (output, _) = site
+            .render_into(&opts, Some(&stage), &pool, Teardown::Drop)
+            .unwrap();
         let about = Path::new("about/index.html");
         assert_eq!(output.files.get(about), Some(&OutputFile::Staged));
         assert!(

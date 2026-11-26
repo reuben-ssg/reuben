@@ -160,7 +160,7 @@ fn build(
         out: out.unwrap_or_else(|| root.join("dist")),
         jobs,
     };
-    match Site::load_and_build(&root, &LoadOptions { env }, &opts) {
+    match Site::load_and_build_for_exit(&root, &LoadOptions { env }, &opts) {
         Ok(report) => {
             println!(
                 "{} in {}ms",
