@@ -24,7 +24,8 @@ Turning it off removes an accessibility feature: Safari users on a keyboard can'
 
 A plain root-relative link to a page Reuben built, such as `/guide/checks/#anchor`, now has its anchor checked, like an `@/page.md#anchor` link.
 This covers `/guide/checks/index.html#anchor` and links that carry the path of `base_url`.
-A missing anchor is reported with the file, line and column of the link.
+The `link-target` rule does this check, so a missing anchor is a `link-target` finding with the file, line and column of the link, and `disable = ["link-target"]` turns it off.
+A missing anchor in an `@/page.md#anchor` link is still an error, whatever the rules.
 Links to static files and to other sites are not checked.
 
 Calling `eval` in a script now says why it is blocked, instead of Rhai's `reserved keyword 'eval' is disabled`.
@@ -32,7 +33,8 @@ The error still points at the `eval` call.
 
 ### Changed checks
 
-Sites with a plain link to an anchor that doesn't exist will start failing to build.
+The `link-target` rule now also reports a plain link to an anchor that doesn't exist, as a finding.
+Sites that turn `link-target` off see no change.
 
 A new `region-name` check reports an element with `role="region"` and a `tabindex` of 0 or more that has no `aria-label`, `aria-labelledby` or `title`.
 A screen reader announces a focused region by its name, so a region without one tells the user nothing.

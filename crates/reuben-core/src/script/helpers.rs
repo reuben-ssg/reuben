@@ -100,11 +100,13 @@ pub fn register_markdown(
                 }
                 // Anchors aren't checked here: the output may land anywhere on the page.
                 let messages: Vec<String> = with_current_link(|ctx| match ctx {
-                    Some(ctx) => resolve_tree(&mut doc, &ctx.page_rel, &ctx.index, &ctx.base_path)
-                        .0
-                        .iter()
-                        .map(|(_, p)| p.to_string())
-                        .collect(),
+                    Some(ctx) => {
+                        resolve_tree(&mut doc, &ctx.page_rel, &ctx.index, &ctx.base_path, false)
+                            .0
+                            .iter()
+                            .map(|(_, p)| p.to_string())
+                            .collect()
+                    }
                     None => source_links(&doc)
                         .into_iter()
                         .map(|dest| format!("markdown: `{dest}` needs a page being built"))
