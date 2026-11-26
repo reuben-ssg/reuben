@@ -226,3 +226,47 @@ fn failed_build_still_ends_with_error_summary() {
     assert_eq!(lines[lines.len() - 1], "Found 1 error in 1 file");
     assert_eq!(lines[lines.len() - 2], "1 accessibility warning in 1 file");
 }
+
+fn failing_build(files: &[(&str, &str)]) -> String {
+    let tmp = assert_fs::TempDir::new().unwrap();
+    for (path, text) in files {
+        tmp.child(path).write_str(text).unwrap();
+    }
+    let out = reuben()
+        .args(["build", "--root"])
+        .arg(tmp.path())
+        .assert()
+        .code(1)
+        .get_output()
+        .stderr
+        .clone();
+    String::from_utf8(out).unwrap()
+}
+
+#[test]
+fn asset_miss_in_a_layout_prints_line_and_column() {
+    let stderr = failing_build(&[
+        ("content/index.md", "---\ntitle: H\n---\nhi"),
+        (
+            "layouts/default.html",
+            "<html>\n<head>\n<link rel=\"stylesheet\" href=\"{{ asset(\"css/nope.css\") }}\">\n</head>\n<body>{{ content }}</body>\n</html>\n",
+        ),
+    ]);
+    assert!(
+        stderr.contains("asset `css/nope.css` isn't a static file"),
+        "{stderr}"
+    );
+    assert!(stderr.contains("layouts/default.html:3:"), "{stderr}");
+}
+
+#[test]
+fn asset_miss_in_an_include_prints_line_and_column() {
+    let stderr = failing_build(&[
+        ("content/index.md", "---\ntitle: H\n---\n{{ logo() }}"),
+        (
+            "includes/logo.rhai",
+            "// logo\nfn logo() {\n    asset(\"img/nope.png\")\n}\n",
+        ),
+    ]);
+    assert!(stderr.contains("includes/logo.rhai:3:"), "{stderr}");
+}

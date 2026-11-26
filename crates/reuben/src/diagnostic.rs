@@ -36,6 +36,13 @@ pub fn render(error: &Error, source: Option<&str>, root: &Path) -> String {
             message,
             location: Some(location),
         } => (message, *location, &[]),
+        ErrorKind::Asset {
+            location: Some(location),
+            ..
+        } => {
+            let message = error.kind.to_string();
+            return located("error", &message, &error.path, *location, source, root).0;
+        }
         _ => return plain(error, root),
     };
     let (mut out, pad) = located("error", message, &error.path, span, source, root);

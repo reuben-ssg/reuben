@@ -51,6 +51,8 @@ Errors and accessibility findings after a `{{ }}` or `{% %}` block that spans se
 Before, every position after such a block was too early by the number of lines the block spanned.
 This covers blocks between paragraphs and blocks inside a paragraph, list item, table cell, heading or HTML block.
 
+A missing `asset()` path now prints the file, line and column of the call, with a source snippet, like other located errors.
+
 ### Performance
 
 A page whose accessibility rules for the finished HTML (`html-lang`, `page-title`, `single-h1`, `main-landmark`, `id-unique`, `form-label` and `link-target`) are all off is no longer parsed a second time.
