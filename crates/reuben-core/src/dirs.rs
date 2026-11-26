@@ -29,36 +29,55 @@ struct FolderFile {
 
 /// Reads every `_dir.toml` under `content`. A bad one is reported and its folder loads without defaults.
 pub fn load(content: &Path) -> (DirDefaults, Vec<Error>) {
-    let mut folders = BTreeMap::new();
-    let mut broken = BTreeSet::new();
+    let mut files = Vec::new();
     let mut errors = Vec::new();
     if content.is_dir() {
+        #[cfg(test)]
+        crate::site::WALKS
+            .lock()
+            .unwrap()
+            .push(content.to_path_buf());
         for entry in WalkDir::new(content).sort_by_file_name() {
-            let entry = match entry {
-                Ok(entry) => entry,
+            match entry {
+                Ok(entry) if entry.file_type().is_file() => files.push(entry.into_path()),
+                Ok(_) => {}
                 Err(e) => {
                     let path = e.path().unwrap_or(content).to_path_buf();
                     errors.push(Error::new(path, std::io::Error::from(e)));
-                    continue;
                 }
-            };
-            if !entry.file_type().is_file() || entry.file_name() != FILE_NAME {
-                continue;
             }
-            let path = entry.into_path();
-            let dir = path
-                .parent()
-                .and_then(|p| p.strip_prefix(content).ok())
-                .expect("walkdir yields paths under its root")
-                .to_path_buf();
-            match read_folder_file(&path) {
-                Ok(file) => {
-                    folders.insert(dir, file);
-                }
-                Err(e) => {
-                    broken.insert(dir);
-                    errors.push(e);
-                }
+        }
+    }
+    let (dirs, mut file_errors) = from_files(content, files.iter().map(PathBuf::as_path));
+    errors.append(&mut file_errors);
+    (dirs, errors)
+}
+
+/// Reads the `_dir.toml` files among `files`, which a walk of `content` found. A bad one is reported and its folder
+/// loads without defaults.
+pub(crate) fn from_files<'a>(
+    content: &Path,
+    files: impl IntoIterator<Item = &'a Path>,
+) -> (DirDefaults, Vec<Error>) {
+    let mut folders = BTreeMap::new();
+    let mut broken = BTreeSet::new();
+    let mut errors = Vec::new();
+    for path in files {
+        if path.file_name().is_none_or(|n| n != FILE_NAME) {
+            continue;
+        }
+        let dir = path
+            .parent()
+            .and_then(|p| p.strip_prefix(content).ok())
+            .expect("walkdir yields paths under its root")
+            .to_path_buf();
+        match read_folder_file(path) {
+            Ok(file) => {
+                folders.insert(dir, file);
+            }
+            Err(e) => {
+                broken.insert(dir);
+                errors.push(e);
             }
         }
     }

@@ -66,6 +66,7 @@ An output folder from 0.3.0 that still has `.reuben-output` inside is recognised
 
 A site that never reads `collections` no longer builds the collection items on every build.
 Two collections with the same name are still an error.
+`_dir.toml` files are found in the same walk of `content/` that finds the pages, instead of a second walk.
 
 ## 0.3.0 (2026-11-26)
 

@@ -298,11 +298,14 @@ impl Site {
         errors.append(&mut data_errors);
 
         let content = root.join("content");
-        let (dirs, mut dir_errors) = dirs::load(&content);
+        let mut walk_errors = Vec::new();
+        let (walked, listing) = walk(&content, &mut walk_errors);
+        let (dirs, mut dir_errors) =
+            dirs::from_files(&content, walked.iter().map(|(path, _)| path.as_path()));
         errors.append(&mut dir_errors);
+        errors.append(&mut walk_errors);
         let mut asset_rels = Vec::new();
         let mut failed_markdown = Vec::new();
-        let (walked, listing) = walk(&content, &mut errors);
         let to_load: Vec<(PathBuf, PathBuf)> = walked
             .into_iter()
             .filter(|(path, rel)| {
@@ -1466,6 +1469,10 @@ pub(crate) fn record_work_thread(path: &Path) {
     ));
 }
 
+/// The root of every folder walk, for tests that count them.
+#[cfg(test)]
+pub(crate) static WALKS: std::sync::Mutex<Vec<PathBuf>> = std::sync::Mutex::new(Vec::new());
+
 /// Every sidecar path the filesystem was asked about, for tests that count them.
 #[cfg(test)]
 static SIDECAR_PROBES: std::sync::Mutex<Vec<PathBuf>> = std::sync::Mutex::new(Vec::new());
@@ -1510,6 +1517,8 @@ impl Listing {
 
 /// Every file under `dir`, sorted, as (full path, path relative to `dir`), and the listing of what was seen.
 fn walk(dir: &Path, errors: &mut Vec<Error>) -> (Vec<(PathBuf, PathBuf)>, Listing) {
+    #[cfg(test)]
+    WALKS.lock().unwrap().push(dir.to_path_buf());
     let mut files = Vec::new();
     let mut listing = Listing::default();
     for entry in WalkDir::new(dir).sort_by_file_name() {
@@ -2211,6 +2220,44 @@ mod tests {
             .unwrap_or_else(|| panic!("no page {rel}"))
             .sidecar
             .as_deref()
+    }
+
+    #[test]
+    fn content_is_walked_once_and_folder_defaults_still_apply() {
+        let tmp = site_dir(&[
+            (
+                "content/g/_dir.toml",
+                "layout = \"none\"\n[params]\nx = 1\n",
+            ),
+            ("content/g/a.md", "---\ntitle: A\n---\nx\n"),
+            ("content/bad/_dir.toml", "x = [\n"),
+            ("content/bad/b.md", "---\ntitle: B\n---\nx\n"),
+        ]);
+        let site = Site::load(tmp.path()).unwrap();
+        let content = tmp.path().join("content");
+        let walks = WALKS
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|p| **p == content)
+            .count();
+        assert_eq!(walks, 1);
+        let a = site
+            .pages
+            .iter()
+            .find(|p| p.rel == Path::new("g/a.md"))
+            .unwrap();
+        assert_eq!(a.front_matter.layout.as_deref(), Some("none"));
+        assert_eq!(site.load_errors.len(), 1, "{:?}", site.load_errors);
+        assert!(site.load_errors[0].path.ends_with("bad/_dir.toml"));
+        assert!(
+            site.in_broken_dir(
+                site.pages
+                    .iter()
+                    .find(|p| p.rel == Path::new("bad/b.md"))
+                    .unwrap()
+            )
+        );
     }
 
     #[test]
