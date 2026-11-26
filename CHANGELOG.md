@@ -10,6 +10,16 @@ A link to a missing page or anchor is an error naming the file, line and column 
 Code blocks and inline code are not rewritten.
 Raw HTML that a Rhai block or an include produces is not rewritten.
 
+A `focusable_scroll` key in the `[markdown]` table, on by default.
+Set it to `false` to get the 0.3.0 markup for code blocks and tables back:
+
+```toml
+[markdown]
+focusable_scroll = false
+```
+
+Turning it off removes an accessibility feature: Safari users on a keyboard can't scroll a wide code block or table sideways without it.
+
 ### Fixed
 
 A plain root-relative link to a page Reuben built, such as `/guide/checks/#anchor`, now has its anchor checked, like an `@/page.md#anchor` link.
@@ -23,6 +33,43 @@ The error still points at the `eval` call.
 ### Changed checks
 
 Sites with a plain link to an anchor that doesn't exist will start failing to build.
+
+A new `region-name` check reports an element with `role="region"` and a `tabindex` of 0 or more that has no `aria-label`, `aria-labelledby` or `title`.
+A screen reader announces a focused region by its name, so a region without one tells the user nothing.
+The markup Reuben writes for code blocks and tables always has a name, so this only fires on HTML from your own layouts, includes or Markdown.
+It runs on the finished HTML, so a site that switches off every other check of the finished HTML to skip that pass now needs `region-name` in `[a11y] disable` too.
+
+### Changed output
+
+Every code block and table written in Markdown is now a named region that keyboard users can focus and scroll, in every browser.
+Safari doesn't put scroll containers in the tab order the way Chrome and Firefox do, so before this a wide code block or table couldn't be scrolled from the keyboard there.
+A code block's `<pre>` gets `tabindex="0"`, `role="region"` and `aria-label="Code"`, or `aria-label="Code: rust"` when the fence names a language:
+
+```html
+<pre tabindex="0" role="region" aria-label="Code: rust"><code class="language-rust">fn main() {}
+</code></pre>
+```
+
+Each table is wrapped in a `<div class="table-wrap">` named after the nearest heading before it, or just `Table` when there is none:
+
+```html
+<div class="table-wrap" tabindex="0" role="region" aria-label="Table: Breads">
+<table>
+...
+</table>
+</div>
+```
+
+The region only scrolls if your theme lets it, so put the sideways scrolling on the wrapper rather than on the table: `.table-wrap { overflow-x: auto; }`, and `pre { overflow-x: auto; }` for code.
+HTML tables and `<pre>` elements you write yourself are left as they are.
+Each code block costs 45 bytes plus 2 more and the length of the language word when there is one (51 bytes for `rust`).
+Each table costs 78 bytes plus 2 more and the length of the heading text when there is one.
+On the 10,000-page benchmark site, with one code block and one table per page, the output grew by 1,400,000 bytes, from 18,042,709 to 19,442,709 (7.8%), or 140 bytes a page (55 bytes a page gzipped).
+
+### Library API
+
+Added to `reuben-core`: `MarkdownConfig::focusable_scroll` and `HtmlOptions::focusable_scroll`.
+Changed behavior in `reuben-core`: `HtmlOptions::default()`, and so `html::render`, writes the focusable markup for code blocks and tables; set `focusable_scroll: false` for the 0.3.0 markup.
 
 ## 0.3.0 (2026-11-26)
 

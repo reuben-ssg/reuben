@@ -50,11 +50,20 @@ fn clean_site_has_no_findings() {
 }
 
 #[test]
+fn focusable_code_blocks_and_tables_have_no_findings() {
+    let tmp = site(&[(
+        "content/index.md",
+        "---\ntitle: Home\n---\n# Home\n\n```rust\nfn main() {}\n```\n\n    indented\n\n| a | b |\n|---|---|\n| 1 | 2 |\n\n- | c |\n  |---|\n  | 3 |\n",
+    )]);
+    assert_eq!(findings(&tmp), vec![]);
+}
+
+#[test]
 fn every_rule_fires_once() {
     let tmp = site(&[
         (
             "layouts/bare.html",
-            "<html><body><div id=\"dup\">{{ content }}</div><div id=\"dup\"></div><input type=\"text\"></body></html>\n",
+            "<html><body><div id=\"dup\">{{ content }}</div><div id=\"dup\"></div><input type=\"text\"><div role=\"region\" tabindex=\"0\"></div></body></html>\n",
         ),
         (
             "content/bare.md",
@@ -95,6 +104,7 @@ fn every_rule_fires_once() {
         built(Rule::MainLandmark, "bare.md", "bare/index.html", 1),
         built(Rule::IdUnique, "bare.md", "bare/index.html", 2),
         built(Rule::FormLabel, "bare.md", "bare/index.html", 2),
+        built(Rule::RegionName, "bare.md", "bare/index.html", 2),
         built(Rule::LinkTarget, "tree.md", "tree/index.html", 17),
     ];
     for (rule, page, line, built) in expected {

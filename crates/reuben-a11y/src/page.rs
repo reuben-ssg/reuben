@@ -143,11 +143,28 @@ pub fn check_page(html: &str, rules: &RuleSet, reported_ids: &HashSet<String>) -
                         }
                     }
                 }
-                if tag.attr("role").is_some_and(|r| {
-                    r.split_ascii_whitespace()
-                        .any(|r| r.eq_ignore_ascii_case("main"))
-                }) {
+                if has_role(&tag, "main") {
                     main_seen = true;
+                }
+                // A screen reader announces a focused region by its name, so one without a name says nothing useful.
+                if rules.is_on(Rule::RegionName)
+                    && has_role(&tag, "region")
+                    && tag
+                        .attr("tabindex")
+                        .and_then(|t| t.trim().parse::<i32>().ok())
+                        .is_some_and(|t| t >= 0)
+                    && !["aria-label", "aria-labelledby", "title"]
+                        .iter()
+                        .any(|a| non_blank(&tag, a))
+                {
+                    report.findings.push(HtmlFinding {
+                        rule: Rule::RegionName,
+                        message: format!(
+                            "a focusable <{} role=\"region\"> has no accessible name",
+                            tag.name
+                        ),
+                        line: tag.line,
+                    });
                 }
                 if let Some(id) = tag.attr("id")
                     && !id.trim().is_empty()
@@ -248,6 +265,13 @@ fn page_wide(report: &mut PageReport, rules: &RuleSet, rule: Rule, message: &str
             line: 1,
         });
     }
+}
+
+fn has_role(tag: &StartTag<()>, role: &str) -> bool {
+    tag.attr("role").is_some_and(|r| {
+        r.split_ascii_whitespace()
+            .any(|r| r.eq_ignore_ascii_case(role))
+    })
 }
 
 fn non_blank(tag: &StartTag<()>, attr: &str) -> bool {
@@ -374,6 +398,37 @@ mod tests {
         );
         let report = with_body("<input><select></select><textarea></textarea>");
         assert_eq!(rules_of(&report), [Rule::FormLabel; 3]);
+    }
+
+    #[test]
+    fn focusable_regions_need_a_name() {
+        let named = [
+            "<pre tabindex=\"0\" role=\"region\" aria-label=\"Code\"><code>x</code></pre>",
+            "<div class=\"table-wrap\" tabindex=\"0\" role=\"region\" aria-label=\"Table\"><table></table></div>",
+            "<div role=region tabindex=0 aria-labelledby=t></div>",
+            "<div role=region tabindex=0 title=T></div>",
+            "<div role=region aria-label=\" \"></div>",
+            "<div role=region tabindex=-1></div>",
+            "<div role=region tabindex=x></div>",
+            "<div role=note tabindex=0></div>",
+            "<pre tabindex=0>x</pre>",
+        ];
+        for body in named {
+            assert_eq!(with_body(body).findings, [], "{body}");
+        }
+        let unnamed = [
+            "<div role=region tabindex=0></div>",
+            "<pre role=\"Region\" tabindex=\" 0 \">x</pre>",
+            "<div role=\"region note\" tabindex=3 aria-label=\"  \"></div>",
+        ];
+        for body in unnamed {
+            let report = with_body(body);
+            assert_eq!(rules_of(&report), [Rule::RegionName], "{body}");
+        }
+        assert_eq!(
+            with_body("<div role=region tabindex=0></div>").findings[0].message,
+            "a focusable <div role=\"region\"> has no accessible name"
+        );
     }
 
     #[test]
@@ -580,8 +635,7 @@ mod tests {
     /// a page whose other HTML rules are off.
     #[test]
     fn check_page_reports_only_on_rules_that_run_on_html() {
-        let html =
-            "<html><body><p id=d></p><p id=d></p><input><a href=\"/nope/\">x</a></body></html>";
+        let html = "<html><body><p id=d></p><p id=d></p><input><div role=region tabindex=0></div><a href=\"/nope/\">x</a></body></html>";
         for rule in Rule::ALL {
             let mut only = RuleSet::all();
             for other in Rule::ALL.into_iter().filter(|r| *r != rule) {

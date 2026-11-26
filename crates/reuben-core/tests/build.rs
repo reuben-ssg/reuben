@@ -181,3 +181,33 @@ fn markdown_helper_follows_the_markdown_table() {
     assert!(render("").contains("aria-label=\"Back to reference 1\""));
     assert!(!render("[markdown]\nfootnote_backlinks = false\n").contains("Back to reference"));
 }
+
+#[test]
+fn focusable_scroll_follows_the_markdown_table() {
+    let page = "---\ntitle: T\n---\n# T\n\n```sh\nls\n```\n\n| a |\n|---|\n| 1 |\n\n{{ markdown(\"```\\nx\\n```\\n\") }}\n";
+    let render = |config: &str| {
+        let tmp = TempDir::new().unwrap();
+        tmp.child("reuben.toml").write_str(config).unwrap();
+        tmp.child("content/index.md").write_str(page).unwrap();
+        build(tmp.path(), false).unwrap();
+        fs::read_to_string(tmp.path().join("dist/index.html")).unwrap()
+    };
+    let on = render("");
+    assert!(
+        on.contains("<pre tabindex=\"0\" role=\"region\" aria-label=\"Code: sh\">"),
+        "{on}"
+    );
+    assert!(
+        on.contains("<pre tabindex=\"0\" role=\"region\" aria-label=\"Code\">"),
+        "{on}"
+    );
+    assert!(
+        on.contains(
+            "<div class=\"table-wrap\" tabindex=\"0\" role=\"region\" aria-label=\"Table: T\">"
+        ),
+        "{on}"
+    );
+    let off = render("[markdown]\nfocusable_scroll = false\n");
+    assert!(!off.contains("tabindex"), "{off}");
+    assert!(!off.contains("table-wrap"), "{off}");
+}

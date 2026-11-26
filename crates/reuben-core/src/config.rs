@@ -25,7 +25,8 @@ pub struct Config {
     pub sources: BTreeMap<String, PathBuf>,
 }
 
-/// The `[markdown]` table: every byte Reuben adds beyond the Markdown's own HTML is opt-in, except footnote back-links.
+/// The `[markdown]` table: every byte Reuben adds beyond the Markdown's own HTML is opt-in, except the accessibility
+/// features `footnote_backlinks` and `focusable_scroll`.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize)]
 #[serde(deny_unknown_fields, default)]
 pub struct MarkdownConfig {
@@ -33,6 +34,10 @@ pub struct MarkdownConfig {
     pub math: bool,
     /// Turning this off removes an accessibility feature.
     pub footnote_backlinks: bool,
+    /// Makes each code block's `<pre>`, and a `<div class="table-wrap">` around each table, a named
+    /// `role="region"` with `tabindex="0"`, so keyboard users can scroll them in every browser. Turning this off
+    /// removes an accessibility feature.
+    pub focusable_scroll: bool,
 }
 
 impl Default for MarkdownConfig {
@@ -41,6 +46,7 @@ impl Default for MarkdownConfig {
             highlight: false,
             math: false,
             footnote_backlinks: true,
+            focusable_scroll: true,
         }
     }
 }
@@ -497,6 +503,7 @@ mod tests {
                 highlight: false,
                 math: false,
                 footnote_backlinks: true,
+                focusable_scroll: true,
             }
         );
     }
@@ -507,7 +514,7 @@ mod tests {
         write(
             &tmp,
             "reuben.toml",
-            "[markdown]\nhighlight = true\nmath = true\nfootnote_backlinks = false\n",
+            "[markdown]\nhighlight = true\nmath = true\nfootnote_backlinks = false\nfocusable_scroll = false\n",
         );
         assert_eq!(
             load(tmp.path(), None).unwrap().markdown,
@@ -515,6 +522,7 @@ mod tests {
                 highlight: true,
                 math: true,
                 footnote_backlinks: false,
+                focusable_scroll: false,
             }
         );
     }

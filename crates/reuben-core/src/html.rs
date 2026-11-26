@@ -14,6 +14,8 @@ pub struct HtmlOptions<'a> {
     /// Highlights fenced code when set.
     pub highlighter: Option<&'a dyn Highlighter>,
     pub footnote_backlinks: bool,
+    /// Makes code blocks and tables named, focusable regions, so a keyboard can scroll them.
+    pub focusable_scroll: bool,
 }
 
 impl Default for HtmlOptions<'_> {
@@ -21,6 +23,7 @@ impl Default for HtmlOptions<'_> {
         HtmlOptions {
             highlighter: None,
             footnote_backlinks: true,
+            focusable_scroll: true,
         }
     }
 }
@@ -30,17 +33,22 @@ impl From<&MarkdownConfig> for HtmlOptions<'static> {
         HtmlOptions {
             highlighter: config.highlight.then(default_highlighter),
             footnote_backlinks: config.footnote_backlinks,
+            focusable_scroll: config.focusable_scroll,
         }
     }
 }
 
+/// The attributes that make a scrolling block focusable, as `tabindex`, `role` and the start of `aria-label`.
+const FOCUSABLE_REGION: &str = " tabindex=\"0\" role=\"region\" aria-label=\"";
+
 /// State the writer carries through the whole tree: the options, how many references each
-/// footnote has (for its backrefs), and how many of those references have been written so far
-/// (to give repeated references distinct ids).
+/// footnote has (for its backrefs), how many of those references have been written so far
+/// (to give repeated references distinct ids), and the text of the last heading written (to name tables).
 struct RenderCtx<'a> {
     opts: &'a HtmlOptions<'a>,
     totals: HashMap<usize, u32>,
     written: RefCell<HashMap<usize, u32>>,
+    heading: RefCell<String>,
 }
 
 impl<'a> RenderCtx<'a> {
@@ -57,6 +65,7 @@ impl<'a> RenderCtx<'a> {
             opts,
             totals,
             written: RefCell::default(),
+            heading: RefCell::default(),
         }
     }
 }
@@ -173,6 +182,11 @@ fn block(out: &mut String, node: &Node, tight: bool, ctx: &RenderCtx) {
             }
             inlines(out, node, ctx);
             let _ = writeln!(out, "</h{level}>");
+            if ctx.opts.focusable_scroll {
+                let mut heading = ctx.heading.borrow_mut();
+                heading.clear();
+                heading.push_str(plain_text(node).trim());
+            }
         }
         NodeKind::CodeBlock { info, literal } => {
             cr(out);
@@ -181,10 +195,22 @@ fn block(out: &mut String, node: &Node, tight: bool, ctx: &RenderCtx) {
                 .zip(ctx.opts.highlighter)
                 .and_then(|(lang, h)| h.highlight(lang, literal));
             out.push_str(if highlighted.is_some() {
-                "<pre class=\"hl-code\"><code"
+                "<pre class=\"hl-code\""
             } else {
-                "<pre><code"
+                "<pre"
             });
+            if ctx.opts.focusable_scroll {
+                out.push_str(FOCUSABLE_REGION);
+                out.push_str("Code");
+                // The same first word the highlighter looks up, so `rust,ignore` reads as `rust`.
+                let word = lang.and_then(|l| l.split(',').next()).unwrap_or_default();
+                if !word.is_empty() {
+                    out.push_str(": ");
+                    out.push_str(&escape_attr(word));
+                }
+                out.push('"');
+            }
+            out.push_str("><code");
             if let Some(lang) = lang {
                 let _ = write!(out, " class=\"language-{}\"", escape_attr(lang));
             }
@@ -265,6 +291,17 @@ fn block(out: &mut String, node: &Node, tight: bool, ctx: &RenderCtx) {
 
 fn table(out: &mut String, node: &Node, alignments: &[Alignment], ctx: &RenderCtx) {
     cr(out);
+    if ctx.opts.focusable_scroll {
+        out.push_str("<div class=\"table-wrap\"");
+        out.push_str(FOCUSABLE_REGION);
+        out.push_str("Table");
+        let heading = ctx.heading.borrow();
+        if !heading.is_empty() {
+            out.push_str(": ");
+            out.push_str(&escape_attr(&heading));
+        }
+        out.push_str("\">\n");
+    }
     out.push_str("<table>\n");
     for (i, row) in node.children.iter().enumerate() {
         let header = matches!(row.kind, NodeKind::TableRow { header: true });
@@ -307,6 +344,9 @@ fn table(out: &mut String, node: &Node, alignments: &[Alignment], ctx: &RenderCt
     }
     cr(out);
     out.push_str("</table>\n");
+    if ctx.opts.focusable_scroll {
+        out.push_str("</div>\n");
+    }
 }
 
 fn footnote_section(out: &mut String, node: &Node, ctx: &RenderCtx) {
@@ -481,8 +521,123 @@ mod tests {
         let d = crate::markdown::parse("```rust\nlet a = 1 < 2;\n```\n", 1);
         assert_eq!(
             render(&d),
-            "<pre><code class=\"language-rust\">let a = 1 &lt; 2;\n</code></pre>\n"
+            "<pre tabindex=\"0\" role=\"region\" aria-label=\"Code: rust\"><code class=\"language-rust\">let a = 1 &lt; 2;\n</code></pre>\n"
         );
+    }
+
+    fn not_focusable(doc: &Document) -> String {
+        render_opts(
+            doc,
+            &HtmlOptions {
+                focusable_scroll: false,
+                ..HtmlOptions::default()
+            },
+        )
+    }
+
+    #[test]
+    fn code_block_without_language_is_named_code() {
+        let d = crate::markdown::parse("```\nx\n```\n\n    indented\n", 1);
+        assert_eq!(
+            render(&d),
+            "<pre tabindex=\"0\" role=\"region\" aria-label=\"Code\"><code>x\n</code></pre>\n\
+             <pre tabindex=\"0\" role=\"region\" aria-label=\"Code\"><code>indented\n</code></pre>\n"
+        );
+    }
+
+    #[test]
+    fn code_block_name_uses_the_language_word_only() {
+        let d = crate::markdown::parse("```rust,ignore title=\"a\"\nx\n```\n", 1);
+        assert!(
+            render(&d).contains("aria-label=\"Code: rust\""),
+            "{}",
+            render(&d)
+        );
+        let d = crate::markdown::parse("```a\"b\nx\n```\n", 1);
+        assert!(
+            render(&d).contains("aria-label=\"Code: a&quot;b\""),
+            "{}",
+            render(&d)
+        );
+    }
+
+    #[test]
+    fn highlighted_code_block_is_focusable() {
+        let d = crate::markdown::parse("```rust\nfn a() {}\n```\n", 1);
+        assert!(highlighted(&d).starts_with(
+            "<pre class=\"hl-code\" tabindex=\"0\" role=\"region\" aria-label=\"Code: rust\"><code class=\"language-rust\">"
+        ));
+    }
+
+    #[test]
+    fn table_is_wrapped_and_named_after_the_heading_before_it() {
+        let d = crate::markdown::parse(
+            "# Page\n\n## Breads & `\"rolls\"`\n\ntext\n\n| a |\n|---|\n| 1 |\n",
+            1,
+        );
+        let html = render(&d);
+        assert!(
+            html.contains(
+                "<p>text</p>\n<div class=\"table-wrap\" tabindex=\"0\" role=\"region\" aria-label=\"Table: Breads &amp; &quot;rolls&quot;\">\n<table>\n"
+            ),
+            "{html}"
+        );
+        assert!(html.ends_with("</table>\n</div>\n"), "{html}");
+    }
+
+    #[test]
+    fn table_without_a_heading_before_it_is_named_table() {
+        let d = crate::markdown::parse("| a |\n|---|\n| 1 |\n\n# After\n", 1);
+        assert!(
+            render(&d).starts_with(
+                "<div class=\"table-wrap\" tabindex=\"0\" role=\"region\" aria-label=\"Table\">\n<table>"
+            ),
+            "{}",
+            render(&d)
+        );
+    }
+
+    #[test]
+    fn table_in_a_list_uses_the_nearest_heading() {
+        let d = crate::markdown::parse(
+            "## One\n\n## Two\n\n- item\n\n  | a |\n  |---|\n  | 1 |\n",
+            1,
+        );
+        assert!(
+            render(&d).contains("aria-label=\"Table: Two\""),
+            "{}",
+            render(&d)
+        );
+    }
+
+    #[test]
+    fn raw_html_tables_and_pre_are_left_alone() {
+        let src = "<table><tr><td>x</td></tr></table>\n\n<pre>y</pre>\n";
+        let d = crate::markdown::parse(src, 1);
+        assert_eq!(render(&d), src.replace("\n\n", "\n"));
+    }
+
+    #[test]
+    fn focusable_scroll_off_keeps_plain_markup() {
+        let d = crate::markdown::parse("# H\n\n```rust\nx\n```\n\n| a |\n|---|\n| 1 |\n", 1);
+        let html = not_focusable(&d);
+        assert!(!html.contains("tabindex"), "{html}");
+        assert!(!html.contains("table-wrap"), "{html}");
+        assert!(
+            html.contains("<pre><code class=\"language-rust\">"),
+            "{html}"
+        );
+    }
+
+    #[test]
+    fn config_switch_reaches_the_writer() {
+        let off = MarkdownConfig {
+            focusable_scroll: false,
+            ..MarkdownConfig::default()
+        };
+        assert!(!HtmlOptions::from(&off).focusable_scroll);
+        assert!(HtmlOptions::from(&MarkdownConfig::default()).focusable_scroll);
+        assert!(HtmlOptions::default().focusable_scroll);
     }
 
     #[test]
@@ -537,8 +692,9 @@ mod tests {
     fn code_block_uses_highlighter() {
         let d = crate::markdown::parse("```rust\nfn a() {}\n```\n", 1);
         assert!(
+            highlighted(&d).contains("<code class=\"language-rust\"><span class=\"hl-"),
+            "{}",
             highlighted(&d)
-                .contains("<pre class=\"hl-code\"><code class=\"language-rust\"><span class=\"hl-")
         );
     }
 
@@ -547,7 +703,7 @@ mod tests {
         let d = crate::markdown::parse("```rhai\nlet x = 1 < 2;\n```\n", 1);
         assert_eq!(
             highlighted(&d),
-            "<pre><code class=\"language-rhai\">let x = 1 &lt; 2;\n</code></pre>\n"
+            "<pre tabindex=\"0\" role=\"region\" aria-label=\"Code: rhai\"><code class=\"language-rhai\">let x = 1 &lt; 2;\n</code></pre>\n"
         );
     }
 
@@ -556,8 +712,9 @@ mod tests {
         let html = highlighted(&crate::markdown::parse("```rust\nlet x = 1 < 2;\n```\n", 1));
         assert!(
             html.starts_with(
-                "<pre class=\"hl-code\"><code class=\"language-rust\"><span class=\"hl-"
-            )
+                "<pre class=\"hl-code\" tabindex=\"0\" role=\"region\" aria-label=\"Code: rust\"><code class=\"language-rust\"><span class=\"hl-"
+            ),
+            "{html}"
         );
         assert!(html.contains("&lt;"));
     }
@@ -571,7 +728,8 @@ mod tests {
         assert!(html.contains("&amp;"), "{html}");
     }
 
-    /// Footnotes are left out: Reuben's footnote markup deliberately differs from comrak's.
+    /// Footnotes are left out: Reuben's footnote markup deliberately differs from comrak's. The table wrapper is off,
+    /// since comrak has none.
     #[test]
     fn table_and_strike_html_match_comrak() {
         let inputs = [
@@ -583,7 +741,7 @@ mod tests {
         for input in inputs {
             let expected = comrak::markdown_to_html(input, &crate::markdown::options(false));
             assert_eq!(
-                render(&crate::markdown::parse(input, 1)),
+                not_focusable(&crate::markdown::parse(input, 1)),
                 expected,
                 "{input:?}"
             );
