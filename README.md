@@ -56,6 +56,7 @@ Findings print as warnings with the file and line that caused them, and they nev
 | `id-unique`         | No two elements on a page share an id.                             |
 | `form-label`        | Form controls have a label.                                        |
 | `link-target`       | Internal links point at a page or file that is built.              |
+| `region-name`       | Focusable regions, such as code blocks and tables, have a name.    |
 
 A finding looks like this:
 

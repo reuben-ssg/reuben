@@ -1796,7 +1796,7 @@ mod tests {
         assert!(!is_static_sidecar(&none, dir, Path::new("side.rhai")));
     }
 
-    const ALL_RULES_OFF: &str = "[a11y]\ndisable = [\"heading-order\",\"link-text\",\"img-alt\",\"heading-id-unique\",\"table-header\",\"html-lang\",\"page-title\",\"single-h1\",\"main-landmark\",\"id-unique\",\"form-label\",\"link-target\"]\n";
+    const ALL_RULES_OFF: &str = "[a11y]\ndisable = [\"heading-order\",\"link-text\",\"img-alt\",\"heading-id-unique\",\"table-header\",\"html-lang\",\"page-title\",\"single-h1\",\"main-landmark\",\"id-unique\",\"form-label\",\"link-target\",\"region-name\"]\n";
 
     fn site_dir(files: &[(&str, &str)]) -> assert_fs::TempDir {
         use assert_fs::prelude::*;
@@ -2154,7 +2154,7 @@ mod tests {
 
     #[test]
     fn each_html_rule_fires_alone() {
-        let page = "---\ntitle: T\n---\n<html><body><p id=\"d\"></p><p id=\"d\"></p><input><a href=\"/nope/\">x</a></body></html>\n";
+        let page = "---\ntitle: T\n---\n<html><body><p id=\"d\"></p><p id=\"d\"></p><input><div role=\"region\" tabindex=\"0\"></div><a href=\"/nope/\">x</a></body></html>\n";
         let html_rules = reuben_a11y::Rule::ALL
             .into_iter()
             .filter(|r| r.runs_on_html());

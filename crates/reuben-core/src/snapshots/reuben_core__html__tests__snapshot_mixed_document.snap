@@ -9,7 +9,7 @@ A soft break follows,<br />
 and a hard break before this.</p>
 <h2>Heading two</h2>
 <!-- vale off -->
-<pre><code class="language-rhai">let x = &quot;a&quot; &lt; &quot;b&quot;;
+<pre tabindex="0" role="region" aria-label="Code: rhai"><code class="language-rhai">let x = &quot;a&quot; &lt; &quot;b&quot;;
 </code></pre>
 <ol>
 <li>First</li>
@@ -33,6 +33,7 @@ and a hard break before this.</p>
 </blockquote>
 <hr />
 <p><img src="/rye.png" alt="A sandwich" /></p>
+<div class="table-wrap" tabindex="0" role="region" aria-label="Table: Heading three">
 <table>
 <thead>
 <tr>
@@ -47,3 +48,4 @@ and a hard break before this.</p>
 </tr>
 </tbody>
 </table>
+</div>

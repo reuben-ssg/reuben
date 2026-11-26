@@ -14,10 +14,11 @@ pub enum Rule {
     IdUnique,
     FormLabel,
     LinkTarget,
+    RegionName,
 }
 
 impl Rule {
-    pub const ALL: [Rule; 12] = [
+    pub const ALL: [Rule; 13] = [
         Rule::HeadingOrder,
         Rule::LinkText,
         Rule::ImgAlt,
@@ -30,6 +31,7 @@ impl Rule {
         Rule::IdUnique,
         Rule::FormLabel,
         Rule::LinkTarget,
+        Rule::RegionName,
     ];
 
     /// Whether `check_page` checks the rule on a finished page's HTML; the others run on the document tree. A page
@@ -42,7 +44,8 @@ impl Rule {
             | Rule::MainLandmark
             | Rule::IdUnique
             | Rule::FormLabel
-            | Rule::LinkTarget => true,
+            | Rule::LinkTarget
+            | Rule::RegionName => true,
             Rule::HeadingOrder
             | Rule::LinkText
             | Rule::ImgAlt
@@ -65,6 +68,7 @@ impl Rule {
             Rule::IdUnique => "id-unique",
             Rule::FormLabel => "form-label",
             Rule::LinkTarget => "link-target",
+            Rule::RegionName => "region-name",
         }
     }
 
@@ -87,6 +91,7 @@ impl Rule {
             Rule::IdUnique => "No two elements on a page share an id.",
             Rule::FormLabel => "Form controls have a label.",
             Rule::LinkTarget => "Internal links point at a page or file that is built.",
+            Rule::RegionName => "Focusable regions, such as code blocks and tables, have a name.",
         }
     }
 }
@@ -145,6 +150,7 @@ mod tests {
                 "id-unique",
                 "form-label",
                 "link-target",
+                "region-name",
             ]
         );
         assert_eq!(Rule::from_id("nope"), None);
