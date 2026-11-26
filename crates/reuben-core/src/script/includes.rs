@@ -65,7 +65,7 @@ impl ScriptEngine {
         let mut ast = self
             .engine
             .compile(&src)
-            .map_err(|e| fail(e.err_type().to_string(), e.position()))?;
+            .map_err(|e| fail(super::parse_message(&e), e.position()))?;
         ast.set_source(path.display().to_string());
         let module = rhai::Module::eval_ast_as_new(rhai::Scope::new(), &ast, &self.engine)
             .map_err(|mut e| {
