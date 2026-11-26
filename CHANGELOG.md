@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.3.0 (2026-11-26)
 
 ### Added
 
@@ -69,7 +69,8 @@ Deleting the previous output after the swap isn't build work, so it runs on up t
 A stale `.dist.reuben-old` left by an interrupted build is deleted before the swap even when it is a file or a symlink, and a symlink is removed without touching its target.
 What can't be deleted of the previous output after the swap is now printed as a warning, and the next build deletes it before it swaps.
 Without `--jobs`, a Mac with Apple silicon builds on its performance cores (6 on an M3 Pro) instead of on every core, since a build is mostly file creation and the efficiency cores only add CPU time; elsewhere the default is still one thread per core.
-On the 10,000-page benchmark on an M3 Pro, a default build uses about a quarter less CPU time.
+On the 10,000-page benchmark on an M3 Pro, a default build uses a third to a half less CPU time and finishes about a tenth sooner over an existing output and up to a fifth sooner from scratch.
+`RAYON_NUM_THREADS` no longer changes how many threads a build uses; use `--jobs`.
 
 ### Library API
 
