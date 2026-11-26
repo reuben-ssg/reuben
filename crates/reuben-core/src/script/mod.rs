@@ -231,7 +231,7 @@ impl ScriptEngine {
             .engine
             .compile(&block.source)
             .map_err(|e| ScriptError {
-                message: e.err_type().to_string(),
+                message: parse_message(&e),
                 location: map_pos(e.position()),
                 stack: Vec::new(),
             })?;
@@ -295,9 +295,19 @@ impl ScriptEngine {
         let mut ast = self
             .engine
             .compile(&src)
-            .map_err(|e| plain(e.err_type().to_string(), e.position()))?;
+            .map_err(|e| plain(parse_message(&e), e.position()))?;
         ast.set_source(path_str);
         Ok(ast)
+    }
+}
+
+/// The message for a Rhai parse error; Rhai's wording for the disabled `eval` doesn't say why it's disabled.
+fn parse_message(err: &rhai::ParseError) -> String {
+    match err.err_type() {
+        rhai::ParseErrorType::BadInput(rhai::LexError::ImproperSymbol(symbol, _)) if symbol == "eval" => {
+            "`eval` isn't available in Reuben scripts, so that every script that runs is visible in the site's files; write the code directly instead".to_string()
+        }
+        other => other.to_string(),
     }
 }
 
@@ -605,6 +615,47 @@ mod tests {
     #[test]
     fn eval_is_disabled() {
         assert!(eval("eval(\"1\")").is_err());
+    }
+    #[test]
+    fn eval_in_a_block_is_explained_at_the_call() {
+        let err = eval("let x = 1;\n  eval(\"1\")").unwrap_err();
+        assert!(
+            err.message.contains("visible in the site's files"),
+            "{}",
+            err.message
+        );
+        assert!(!err.message.contains("reserved keyword"), "{}", err.message);
+        assert_eq!(
+            err.location,
+            Some(Span {
+                line: 11,
+                column: 3
+            })
+        );
+    }
+    #[test]
+    fn eval_in_an_include_is_explained_at_the_call() {
+        use assert_fs::prelude::*;
+        let dir = assert_fs::TempDir::new().unwrap();
+        dir.child("includes/bad.rhai")
+            .write_str("// x\nfn bad() {\n    eval(\"1\")\n}\n")
+            .unwrap();
+        let mut engine = ScriptEngine::new(dir.path());
+        let err = engine
+            .load_includes(&[dir.path().join("includes")])
+            .unwrap_err();
+        let text = format!("{err:?}");
+        assert!(text.contains("visible in the site's files"), "{text}");
+        assert!(!text.contains("reserved keyword"), "{text}");
+        assert!(
+            text.contains("line: 3") && text.contains("column: 5"),
+            "{text}"
+        );
+    }
+    #[test]
+    fn other_syntax_errors_are_unchanged() {
+        let err = eval("1 +").unwrap_err();
+        assert!(!err.message.contains("visible in the site's files"));
     }
     #[test]
     fn import_is_disabled() {

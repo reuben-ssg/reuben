@@ -17,6 +17,9 @@ This covers `/guide/checks/index.html#anchor` and links that carry the path of `
 A missing anchor is reported with the file, line and column of the link.
 Links to static files and to other sites are not checked.
 
+Calling `eval` in a script now says why it is blocked, instead of Rhai's `reserved keyword 'eval' is disabled`.
+The error still points at the `eval` call.
+
 ### Changed checks
 
 Sites with a plain link to an anchor that doesn't exist will start failing to build.
