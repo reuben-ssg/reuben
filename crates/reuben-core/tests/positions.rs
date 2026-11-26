@@ -13,10 +13,13 @@ const FRONT_MATTER: &str = "---\ntitle: T\n---\n";
 
 /// Renders a site whose `content/p.md` has `body` after three lines of front matter, with a `c.md` to link to.
 fn render(body: &str, extra: &[(&str, &str)]) -> (Vec<Error>, Vec<Finding>) {
+    render_page(&format!("{FRONT_MATTER}{body}"), extra)
+}
+
+/// Renders a site whose `content/p.md` is `page`, front matter included.
+fn render_page(page: &str, extra: &[(&str, &str)]) -> (Vec<Error>, Vec<Finding>) {
     let tmp = TempDir::new().unwrap();
-    tmp.child("content/p.md")
-        .write_str(&format!("{FRONT_MATTER}{body}"))
-        .unwrap();
+    tmp.child("content/p.md").write_str(page).unwrap();
     tmp.child("content/c.md")
         .write_str(&format!("{FRONT_MATTER}# C\n"))
         .unwrap();
@@ -205,4 +208,24 @@ fn math_error_after_a_multi_line_block() {
         })
         .collect();
     assert_eq!(math, [at(8, 6)], "{errors:?}");
+}
+
+#[test]
+fn crlf_line_endings() {
+    let page = "---\r\ntitle: T\r\n---\r\n{%\r\n  let a = 1;\r\n%}\r\n\r\nText {{ a +\r\n 1 }} and [bad](@/nope.md)\r\n\r\n![](/a.png)\r\n";
+    let (errors, _) = render_page(page, &[]);
+    assert_eq!(missing_pages(&errors), [at(9, 11)], "{errors:?}");
+    let (errors, findings) = render_page(&page.replace("@/nope.md", "@/c.md"), &[]);
+    assert_eq!(errors.len(), 0, "{errors:?}");
+    assert_eq!(found(&findings, Rule::ImgAlt), [at(11, 1)]);
+}
+
+#[test]
+fn two_multi_line_blocks_on_one_line() {
+    // Line 5 ends one block and starts the next.
+    let body = "x {% let a = 1 +\n2; %} y {% let b = 3 +\n4; %} ![](/a.png) [a](@/nope.md)\n![](/a.png) [b](@/nope.md)\n";
+    let (errors, _) = render(body, &[]);
+    let findings = checked(body);
+    assert_eq!(missing_pages(&errors), [at(6, 19), at(7, 13)], "{errors:?}");
+    assert_eq!(found(&findings, Rule::ImgAlt), [at(6, 7), at(7, 1)]);
 }
