@@ -241,7 +241,13 @@ fn walk(node: &Node, outputs: &[Output], items: &mut Vec<Item<At>>) {
     match &node.kind {
         NodeKind::HtmlBlock(text) | NodeKind::Raw(text) => {
             fragment(
-                &[(text.clone(), Place::Written { shift: 0 })],
+                &[(
+                    text.clone(),
+                    Place::Written {
+                        added: 0,
+                        removed: 0,
+                    },
+                )],
                 &[],
                 node.span,
                 items,
@@ -397,8 +403,9 @@ fn with_markers(node: &Node, generated: &mut Vec<(String, usize)>) -> Node {
 #[derive(Debug, Clone, Copy, PartialEq)]
 enum Place {
     /// HTML written in the page, so its lines are page lines: an item is at the node's line plus its line in the
-    /// whole input, less `shift`, the lines that generated HTML before it added.
-    Written { shift: usize },
+    /// whole input, less `added`, the lines that generated HTML before it added, plus `removed`, the lines that the
+    /// blocks before it spanned in the page.
+    Written { added: usize, removed: usize },
     /// HTML a block made, or a node rendered whole: every item is at the node's `line`-th line (1-based), and
     /// `origin` indexes the include that wrote it. Lines within generated HTML aren't lines of the page.
     Made { line: usize, origin: Option<usize> },
@@ -448,7 +455,7 @@ fn filled_pieces(
 ) -> Vec<(String, Place)> {
     let mut pieces = Vec::new();
     let mut pos = 0;
-    let mut shift = 0;
+    let (mut added, mut removed) = (0, 0);
     for fill in fills {
         let (Some(gap), Some(text)) = (
             html.get(pos..fill.range.start),
@@ -456,18 +463,19 @@ fn filled_pieces(
         ) else {
             continue;
         };
-        pieces.push((gap.to_string(), Place::Written { shift }));
+        pieces.push((gap.to_string(), Place::Written { added, removed }));
         pieces.extend(generated_pieces(
             text,
             outputs.get(fill.block),
             fill.line,
             origins,
         ));
-        shift += text.matches('\n').count();
+        added += text.matches('\n').count();
+        removed += fill.newlines;
         pos = fill.range.end;
     }
     if let Some(tail) = html.get(pos..) {
-        pieces.push((tail.to_string(), Place::Written { shift }));
+        pieces.push((tail.to_string(), Place::Written { added, removed }));
     }
     pieces
 }
@@ -478,7 +486,9 @@ fn fragment(pieces: &[(String, Place)], origins: &[Origin], span: Span, items: &
     for item in fragment_items(&refs) {
         items.push(map_at(item, |(place, line)| {
             let (line, origin) = match place {
-                Place::Written { shift } => ((span.line + line - 1).saturating_sub(shift), None),
+                Place::Written { added, removed } => {
+                    ((span.line + line - 1 + removed).saturating_sub(added), None)
+                }
                 Place::Made { line, origin } => (span.line + line - 1, origin),
             };
             At {
@@ -526,7 +536,7 @@ mod tests {
 
     fn items(md: &str, outputs: &[Output]) -> Vec<Item<At>> {
         let mut doc = markdown::parse(md, 1);
-        splice::splice(&mut doc, outputs);
+        splice::splice(&mut doc, outputs, &[]);
         tree_items(&doc, outputs)
     }
 

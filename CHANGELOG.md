@@ -45,6 +45,12 @@ The previous minimum, 1.85, was wrong: a dependency already needed 1.89.
 Run `rustup update` if `cargo install` says your Rust is too old.
 The npm package and the installers ship prebuilt binaries, so they don't need Rust at all.
 
+### Fixed
+
+Errors and accessibility findings after a `{{ }}` or `{% %}` block that spans several lines now point at the right line and column.
+Before, every position after such a block was too early by the number of lines the block spanned.
+This covers blocks between paragraphs and blocks inside a paragraph, list item, table cell, heading or HTML block.
+
 ### Performance
 
 A page whose accessibility rules for the finished HTML (`html-lang`, `page-title`, `single-h1`, `main-landmark`, `id-unique`, `form-label` and `link-target`) are all off is no longer parsed a second time.
@@ -56,6 +62,8 @@ A build makes fewer system calls: each layout is found and read once per build i
 Added to `reuben-a11y`: `page_ids`, `Rule::runs_on_html` and `RuleSet::any_html_rule`.
 Added to `reuben-core`: `check::page_ids` and `layout::Layouts`, which finds and reads layouts once for a render.
 Changed in `reuben-core`: `layout::render_layout` takes a `&Layouts` after the layout's path, and reads the layout through it.
+Added to `reuben-core`: `blocks::SourceMap`, the `map` field of `blocks::Extracted`, and `markdown::parse_extracted`, which gives nodes their positions in the page before its blocks were taken out.
+Changed in `reuben-core`: `splice::splice` takes how many line breaks each block spanned, and `doc::Fill` has a `newlines` field and counts its `line` in the page source.
 
 ## 0.2.0 (2026-11-21)
 

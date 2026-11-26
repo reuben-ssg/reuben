@@ -24,6 +24,91 @@ pub struct Extracted {
     /// The input with block `n` replaced by `placeholder(n)`.
     pub text: String,
     pub blocks: Vec<Block>,
+    /// Takes a position in `text` back to the input, which has more lines wherever a block spanned several.
+    pub map: SourceMap,
+}
+
+/// Maps positions in extracted text back to the body it came from. A placeholder is one line, but the block it
+/// replaced may have spanned several, so everything after it on its line and on later lines moves. Lines count from
+/// the body's first line and columns are 1-based byte columns, like the Markdown parser's source positions.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SourceMap {
+    /// One per block, in order.
+    jumps: Vec<Jump>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Jump {
+    /// The placeholder's line in the extracted text, and the columns of its first byte and of the byte after it.
+    line: usize,
+    start: usize,
+    end: usize,
+    /// The body positions of the block's opening delimiter and of the byte after its closing one.
+    from: Span,
+    to: Span,
+}
+
+impl SourceMap {
+    /// The body position of `line` and `column` in the extracted text. A position inside a placeholder is the
+    /// position of its block's opening delimiter.
+    pub fn source(&self, line: usize, column: usize) -> Span {
+        let before = self
+            .jumps
+            .partition_point(|j| (j.line, j.start) <= (line, column));
+        let Some(jump) = before.checked_sub(1).map(|i| &self.jumps[i]) else {
+            return Span { line, column };
+        };
+        if line != jump.line {
+            Span {
+                line: line + jump.to.line - jump.line,
+                column,
+            }
+        } else if column < jump.end {
+            jump.from
+        } else {
+            Span {
+                line: jump.to.line,
+                column: jump.to.column + column - jump.end,
+            }
+        }
+    }
+
+    /// How many line breaks each block spanned, which its placeholder took out.
+    pub fn lines(&self) -> Vec<usize> {
+        self.jumps.iter().map(|j| j.to.line - j.from.line).collect()
+    }
+}
+
+/// Counts lines over a text as positions in it are asked for in increasing order.
+struct Cursor {
+    offset: usize,
+    line: usize,
+    line_start: usize,
+}
+
+impl Cursor {
+    fn new() -> Self {
+        Self {
+            offset: 0,
+            line: 1,
+            line_start: 0,
+        }
+    }
+
+    /// The line and byte column of `to`, which is at or after the last position asked for.
+    fn at(&mut self, text: &[u8], to: usize) -> Span {
+        for (i, b) in text[self.offset..to].iter().enumerate() {
+            if *b == b'\n' {
+                self.line += 1;
+                self.line_start = self.offset + i + 1;
+            }
+        }
+        self.offset = to;
+        Span {
+            line: self.line,
+            column: to - self.line_start + 1,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -73,6 +158,8 @@ pub fn extract(
     let bytes = body.as_bytes();
     let mut text = String::with_capacity(body.len());
     let mut blocks = Vec::new();
+    let mut jumps = Vec::new();
+    let (mut in_body, mut in_text) = (Cursor::new(), Cursor::new());
     let mut literal_from = 0;
     let mut i = 0;
     while i + 1 < bytes.len() {
@@ -101,17 +188,30 @@ pub fn extract(
             });
         };
         text.push_str(&body[literal_from..i]);
-        text.push_str(&placeholder(blocks.len()));
+        let held = in_text.at(text.as_bytes(), text.len());
+        let slot = placeholder(blocks.len());
+        text.push_str(&slot);
         blocks.push(Block {
             kind,
             source: body[code_start..code_end].to_string(),
             span: position(body, code_start, body_line),
         });
+        jumps.push(Jump {
+            line: held.line,
+            start: held.column,
+            end: held.column + slot.len(),
+            from: in_body.at(bytes, i),
+            to: in_body.at(bytes, code_end + 2),
+        });
         i = code_end + 2;
         literal_from = i;
     }
     text.push_str(&body[literal_from..]);
-    Ok(Extracted { text, blocks })
+    Ok(Extracted {
+        text,
+        blocks,
+        map: SourceMap { jumps },
+    })
 }
 
 /// For layouts, which have no Markdown code to protect.
@@ -242,6 +342,63 @@ mod tests {
         let e = extract(body, 1, std::slice::from_ref(&skip)).unwrap();
         assert_eq!(e.blocks.len(), 1);
         assert!(e.text.starts_with("`{{ x }}`"));
+    }
+
+    #[test]
+    fn positions_without_blocks_are_unchanged() {
+        let e = extract("a\nb c\n", 1, &[]).unwrap();
+        assert_eq!(e.map.source(2, 3), Span { line: 2, column: 3 });
+    }
+
+    #[test]
+    fn positions_after_a_multi_line_block_map_to_the_body() {
+        // The placeholder is 7 bytes, so the extracted text is `a ⟨0⟩ b` then `c`.
+        let e = extract("a {{ x\ny }} b\nc\n", 1, &[]).unwrap();
+        assert_eq!(e.text, format!("a {} b\nc\n", placeholder(0)));
+        let at = |line, column| e.map.source(line, column);
+        assert_eq!(at(1, 1), Span { line: 1, column: 1 });
+        // Inside the placeholder is the block's opening.
+        assert_eq!(at(1, 3), Span { line: 1, column: 3 });
+        assert_eq!(at(1, 9), Span { line: 1, column: 3 });
+        // After it, on its line, is after the closing `}}`.
+        assert_eq!(at(1, 10), Span { line: 2, column: 5 });
+        assert_eq!(at(1, 11), Span { line: 2, column: 6 });
+        assert_eq!(at(2, 1), Span { line: 3, column: 1 });
+    }
+
+    #[test]
+    fn several_blocks_add_up() {
+        let body = "{%\nlet a = 1;\n%}\n\nx {{ a +\n1 }} y {{ 2 }} z\n\nw\n";
+        let e = extract(body, 1, &[]).unwrap();
+        let p = |n| placeholder(n).len();
+        // `x ⟨1⟩ y ⟨2⟩ z` is extracted line 3; body line 6 is `1 }} y {{ 2 }} z`.
+        let z = 1 + 2 + p(1) + 3 + p(2) + 1;
+        assert_eq!(
+            e.map.source(3, z),
+            Span {
+                line: 6,
+                column: 16
+            }
+        );
+        assert_eq!(e.map.source(5, 1), Span { line: 8, column: 1 });
+        assert_eq!(e.map.lines(), [2, 1, 0]);
+    }
+
+    #[test]
+    fn blocks_in_skipped_code_shift_nothing() {
+        let body = "`{{ a\nb }}`\n{{ c\n}}\nd\n";
+        let skip = 0..11;
+        let e = extract(body, 1, std::slice::from_ref(&skip)).unwrap();
+        assert_eq!(e.blocks.len(), 1);
+        assert_eq!(e.map.source(2, 2), Span { line: 2, column: 2 });
+        assert_eq!(e.map.source(4, 1), Span { line: 5, column: 1 });
+    }
+
+    #[test]
+    fn multi_byte_text_counts_bytes_like_the_parser() {
+        let e = extract("é {{ x\n}} ü\n", 1, &[]).unwrap();
+        let after = "é ".len() + placeholder(0).len() + 2;
+        assert_eq!(e.map.source(1, after), Span { line: 2, column: 4 });
     }
 
     #[test]
