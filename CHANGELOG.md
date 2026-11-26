@@ -38,6 +38,13 @@ This applies to every site, whether or not it uses `[assets]`.
 A site with a broken `src`, `srcset` or `<link href>` will start failing checks after you upgrade.
 To fix it, correct the path, or turn the check off with `[a11y] disable = ["link-target"]`.
 
+### Changed requirements
+
+Building Reuben from source, including with `cargo install reuben`, now needs Rust 1.100 or later.
+The previous minimum, 1.85, was wrong: a dependency already needed 1.89.
+Run `rustup update` if `cargo install` says your Rust is too old.
+The npm package and the installers ship prebuilt binaries, so they don't need Rust at all.
+
 ## 0.2.0 (2026-11-21)
 
 ### Changed defaults
