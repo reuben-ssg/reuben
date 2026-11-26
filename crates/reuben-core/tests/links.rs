@@ -482,3 +482,64 @@ fn plain_anchors_are_not_collected_without_one() {
     ]);
     build(&tmp).unwrap();
 }
+
+#[test]
+fn raw_html_source_links_resolve() {
+    let tmp = site_of(&[
+        (
+            "reuben.toml",
+            "title = \"S\"\nbase_url = \"https://x.dev/sub/\"\n",
+        ),
+        (
+            "content/b.md",
+            &page(
+                "<a class=\"button\" href=\"@/c.md#top\">Go</a>\n\nText <a href='@/c.md?x=1'>inline</a> and <img alt=\"\" src=\"@/c.md\">.\n\n```html\n<a href=\"@/c.md\">code</a>\n```\n\n`<a href=\"@/c.md\">`",
+            ),
+        ),
+        ("content/c.md", &page("# Top")),
+    ]);
+    build(&tmp).unwrap();
+    let html = built(&tmp, "b/index.html");
+    assert!(
+        html.contains("<a class=\"button\" href=\"/sub/c/#top\">"),
+        "{html}"
+    );
+    assert!(html.contains("href='/sub/c/?x=1'"), "{html}");
+    assert!(html.contains("src=\"/sub/c/\""), "{html}");
+    assert_eq!(html.matches("@/c.md").count(), 2, "{html}");
+}
+
+#[test]
+fn raw_html_source_links_are_checked() {
+    let tmp = site_of(&[
+        (
+            "content/b.md",
+            &page(
+                "<div>\n  <a href=\"@/missing.md\">gone</a>\n</div>\n\nText <a href=\"@/c.md#nope\">x</a>\n\n<a href=\"@/c.md#top\">ok</a>",
+            ),
+        ),
+        ("content/c.md", &page("# Top")),
+    ]);
+    let errors = build(&tmp).unwrap_err();
+    let got = link_errors(&errors);
+    assert_eq!(got.len(), 2, "{got:?}");
+    assert_eq!((got[0].0, got[0].1), (5, 12), "{got:?}");
+    assert!(got[0].2.starts_with("no page `missing.md`"), "{got:?}");
+    assert_eq!((got[1].0, got[1].1), (8, 15), "{got:?}");
+    assert_eq!(got[1].2, "links to `#nope` on `c.md`, which has no such id");
+    assert!(errors.iter().all(|e| e.path.ends_with("b.md")));
+}
+
+#[test]
+fn raw_html_source_links_beside_block_output() {
+    let tmp = site_of(&[
+        (
+            "content/b.md",
+            &page("<p>{{ 1 + 1 }} <a href=\"@/c.md\">go</a> {{ 2 + 2 }}</p>"),
+        ),
+        ("content/c.md", &page("# Top")),
+    ]);
+    build(&tmp).unwrap();
+    let html = built(&tmp, "b/index.html");
+    assert!(html.contains("<p>2 <a href=\"/c/\">go</a> 4</p>"), "{html}");
+}

@@ -1,10 +1,11 @@
 //! Links in Markdown that name `.md` source files, and their resolution to page URLs.
 
 use std::collections::{BTreeMap, HashMap};
+use std::ops::Range;
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
-use crate::doc::{Document, Node, NodeKind, Span};
+use crate::doc::{Document, Fill, Node, NodeKind, Span};
 
 /// A link destination that names a Markdown source file.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -318,8 +319,8 @@ struct Resolver<'a> {
 impl Resolver<'_> {
     fn walk(&mut self, node: &mut Node) {
         let span = node.span;
-        if let NodeKind::Link { url, .. } = &mut node.kind {
-            match parse_source_link(url) {
+        match &mut node.kind {
+            NodeKind::Link { url, .. } => match parse_source_link(url) {
                 Some(parsed) => {
                     if let Some((page, suffix)) = self.resolve_dest(parsed, span) {
                         *url = format!("{page}{suffix}");
@@ -334,7 +335,12 @@ impl Resolver<'_> {
                         });
                     }
                 }
+            },
+            NodeKind::HtmlBlock(html) | NodeKind::HtmlInline(html) => {
+                self.resolve_html(html, &mut [], span);
             }
+            NodeKind::FilledHtmlBlock { html, fills } => self.resolve_html(html, fills, span),
+            _ => {}
         }
         for child in &mut node.children {
             self.walk(child);
@@ -367,6 +373,149 @@ impl Resolver<'_> {
             }
         }
     }
+
+    /// Resolves the `@/` links in the `href` and `src` attributes of raw HTML, which `span` is the start of.
+    /// Text a block filled in is left alone, and the fills after a rewrite are moved to where their text went.
+    fn resolve_html(&mut self, html: &mut String, fills: &mut [Fill], span: Span) {
+        if !html.contains("@/") {
+            return;
+        }
+        let mut out = String::with_capacity(html.len());
+        let mut copied = 0;
+        let mut shifts: Vec<(usize, isize)> = Vec::new();
+        for range in source_attr_values(html) {
+            if fills
+                .iter()
+                .any(|f| f.range.start < range.end && range.start < f.range.end)
+            {
+                continue;
+            }
+            let location = html_location(html, fills, span, range.start);
+            let Some(parsed) = parse_source_link(&html[range.clone()]) else {
+                continue;
+            };
+            let Some((page, suffix)) = self.resolve_dest(parsed, location) else {
+                continue;
+            };
+            let rewritten = format!("{}{suffix}", escape_attr(&page));
+            out.push_str(&html[copied..range.start]);
+            out.push_str(&rewritten);
+            copied = range.end;
+            shifts.push((
+                range.end,
+                rewritten.len().cast_signed() - range.len().cast_signed(),
+            ));
+        }
+        if shifts.is_empty() {
+            return;
+        }
+        out.push_str(&html[copied..]);
+        for fill in fills {
+            let by: isize = shifts
+                .iter()
+                .filter(|(end, _)| *end <= fill.range.start)
+                .map(|(_, delta)| delta)
+                .sum();
+            fill.range = fill.range.start.saturating_add_signed(by)
+                ..fill.range.end.saturating_add_signed(by);
+        }
+        *html = out;
+    }
+}
+
+/// Where the text at byte `at` of an HTML block that starts at `span` is in the source file.
+/// A block's own text keeps its line breaks, and a fill stands for as many as its block spanned.
+fn html_location(html: &str, fills: &[Fill], span: Span, at: usize) -> Span {
+    let before = &html[..at];
+    let from_fills: usize = fills
+        .iter()
+        .filter(|f| f.range.end <= at)
+        .map(|f| f.newlines)
+        .sum();
+    let lines = before.matches('\n').count() + from_fills;
+    let line = span.line + lines;
+    let column = match before.rfind('\n') {
+        None if from_fills == 0 => span.column + before.chars().count(),
+        None => before.chars().count() + 1,
+        Some(i) => before[i + 1..].chars().count() + 1,
+    };
+    Span { line, column }
+}
+
+/// The byte range of each `href` or `src` attribute value in `html` that starts with `@/`.
+/// Only text inside a start tag counts, so prose that quotes an attribute is left alone.
+fn source_attr_values(html: &str) -> Vec<Range<usize>> {
+    let bytes = html.as_bytes();
+    let end = bytes.len();
+    let blank = |b: u8| b.is_ascii_whitespace();
+    let mut found = Vec::new();
+    let mut i = 0;
+    while let Some(at) = html[i..].find('<') {
+        i += at + 1;
+        if html[i..].starts_with("!--") {
+            i = html[i..].find("-->").map_or(end, |e| i + e + 3);
+            continue;
+        }
+        if !bytes.get(i).is_some_and(u8::is_ascii_alphabetic) {
+            continue;
+        }
+        while i < end && !blank(bytes[i]) && !matches!(bytes[i], b'/' | b'>') {
+            i += 1;
+        }
+        loop {
+            while i < end && (blank(bytes[i]) || bytes[i] == b'/') {
+                i += 1;
+            }
+            if i >= end || bytes[i] == b'>' {
+                i += 1;
+                break;
+            }
+            let name = i;
+            while i < end && !blank(bytes[i]) && !matches!(bytes[i], b'=' | b'>' | b'/') {
+                i += 1;
+            }
+            let name = &html[name..i];
+            while i < end && blank(bytes[i]) {
+                i += 1;
+            }
+            if bytes.get(i) != Some(&b'=') {
+                continue;
+            }
+            i += 1;
+            while i < end && blank(bytes[i]) {
+                i += 1;
+            }
+            let value = match bytes.get(i) {
+                Some(&quote @ (b'"' | b'\'')) => {
+                    let start = i + 1;
+                    let stop = html[start..].find(quote as char).map_or(end, |p| start + p);
+                    i = (stop + 1).min(end);
+                    start..stop
+                }
+                _ => {
+                    let start = i;
+                    while i < end && !blank(bytes[i]) && bytes[i] != b'>' {
+                        i += 1;
+                    }
+                    start..i
+                }
+            };
+            if (name.eq_ignore_ascii_case("href") || name.eq_ignore_ascii_case("src"))
+                && html[value.clone()].starts_with("@/")
+            {
+                found.push(value);
+            }
+        }
+    }
+    found
+}
+
+fn escape_attr(url: &str) -> String {
+    url.replace('&', "&amp;")
+        .replace('"', "&quot;")
+        .replace('\'', "&#39;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
 }
 
 fn edit_distance(a: &str, b: &str) -> usize {
