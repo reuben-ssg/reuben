@@ -71,7 +71,15 @@ pub(crate) fn finish_atomic(
             stage(output, staging)?;
             // Written before the swap so `out` never exists without its marker. A swap that then fails leaves a marker
             // beside an `out` that was already Reuben's (or didn't exist), which the next build treats the same.
-            fs::write(&marker, "").map_err(|e| vec![Error::new(&marker, e)])?;
+            let identity = fs::metadata(staging)
+                .ok()
+                .and_then(|m| identity(&m))
+                .ok_or_else(|| {
+                    let msg =
+                        "can't read the staging folder's identity to record in the output marker";
+                    vec![Error::new(staging, io::Error::other(msg))]
+                })?;
+            fs::write(&marker, identity).map_err(|e| vec![Error::new(&marker, e)])?;
             swap(staging, &real, &old).map_err(|e| vec![e])
         });
     if result.is_err() {
@@ -155,12 +163,35 @@ pub(crate) fn check_out_dir(out: &Path) -> Result<(), Error> {
         if entries.next().is_some() {
             // A symlinked `out` keeps its marker beside the folder it points to, as the swap does.
             let (real, _, _, marker) = paths(out)?;
-            if !marker.is_file() && !real.join(OUTPUT_MARKER).is_file() {
+            let ours = fs::read_to_string(&marker).ok().is_some_and(|recorded| {
+                fs::metadata(out)
+                    .ok()
+                    .and_then(|m| identity(&m))
+                    .is_some_and(|now| now == recorded)
+            });
+            if !ours && !real.join(OUTPUT_MARKER).is_file() {
                 return Err(Error::new(out, ErrorKind::UnsafeOutputDir));
             }
         }
     }
     Ok(())
+}
+
+/// Names a folder so a marker can tell the folder it was written for from a different one created later at the same
+/// path. A rename keeps it, so the staging folder's identity is the output's after the swap. `None` when it can't be
+/// read, which makes the folder count as foreign.
+fn identity(meta: &fs::Metadata) -> Option<String> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        Some(format!("{}:{}", meta.dev(), meta.ino()))
+    }
+    #[cfg(not(unix))]
+    {
+        let created = meta.created().ok()?;
+        let since = created.duration_since(std::time::UNIX_EPOCH).ok()?;
+        Some(format!("{}", since.as_nanos()))
+    }
 }
 
 /// The staging, old and marker paths beside `out`.
@@ -380,7 +411,7 @@ mod tests {
     #[test]
     fn write_atomic_replaces_and_drops_stale_files() {
         let tmp = TempDir::new().unwrap();
-        tmp.child(".dist.reuben-output").write_str("").unwrap();
+        write_atomic(&one_page(), &tmp.path().join("dist")).unwrap();
         tmp.child("dist/stale.html").write_str("old").unwrap();
         write_atomic(&one_page(), &tmp.path().join("dist")).unwrap();
         let dist = tmp.path().join("dist");
@@ -421,7 +452,7 @@ mod tests {
     #[test]
     fn another_outputs_marker_does_not_vouch_for_a_foreign_dir() {
         let tmp = TempDir::new().unwrap();
-        tmp.child(".dist.reuben-output").write_str("").unwrap();
+        write_atomic(&one_page(), &tmp.path().join("dist")).unwrap();
         tmp.child("public/keep.txt").write_str("mine").unwrap();
         let err = write_atomic(&one_page(), &tmp.path().join("public")).unwrap_err();
         assert!(matches!(err[0].kind, ErrorKind::UnsafeOutputDir));
@@ -445,6 +476,32 @@ mod tests {
         assert_eq!(errs.len(), 1);
         assert!(errs[0].path.starts_with(&parent));
         assert!(!parent.join("dist").exists());
+    }
+
+    #[test]
+    fn foreign_dir_made_after_the_output_was_deleted_is_refused() {
+        let tmp = TempDir::new().unwrap();
+        let dist = tmp.path().join("dist");
+        write_atomic(&one_page(), &dist).unwrap();
+        std::fs::remove_dir_all(&dist).unwrap();
+        tmp.child("dist/keep.txt").write_str("mine").unwrap();
+        let err = write_atomic(&one_page(), &dist).unwrap_err();
+        assert!(matches!(err[0].kind, ErrorKind::UnsafeOutputDir));
+        assert_eq!(
+            std::fs::read_to_string(dist.join("keep.txt")).unwrap(),
+            "mine"
+        );
+    }
+
+    #[test]
+    fn leftover_marker_with_no_output_folder_is_overwritten() {
+        let tmp = TempDir::new().unwrap();
+        let dist = tmp.path().join("dist");
+        write_atomic(&one_page(), &dist).unwrap();
+        std::fs::remove_dir_all(&dist).unwrap();
+        write_atomic(&one_page(), &dist).unwrap();
+        write_atomic(&one_page(), &dist).unwrap();
+        assert!(dist.join("a.html").is_file());
     }
 
     #[test]

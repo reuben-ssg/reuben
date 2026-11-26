@@ -78,7 +78,8 @@ Changed behavior in `reuben-core`: `HtmlOptions::default()`, and so `html::rende
 ### Changed output
 
 Reuben now marks its output folder with an empty `.<name>.reuben-output` file beside it (`.dist.reuben-output` for `dist/`), next to the `.<name>.reuben-staging` and `.<name>.reuben-old` folders it already uses.
-It still refuses to clear a non-empty output folder that has no marker.
+The marker records which folder it belongs to, so a different folder later made at the same path is refused even if the marker is left over.
+Reuben still refuses to clear a non-empty output folder that has no matching marker.
 An output folder from 0.3.0 that still has `.reuben-output` inside is recognised and replaced, and the new output doesn't contain that file.
 
 ## 0.3.0 (2026-11-26)

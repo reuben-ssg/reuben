@@ -104,7 +104,7 @@ fn symlinked_out_dir_keeps_its_link() {
     let other = TempDir::new().unwrap();
     let target = other.path().join("www");
     fs::create_dir_all(&target).unwrap();
-    fs::write(other.path().join(".www.reuben-output"), "").unwrap();
+    fs::write(target.join(".reuben-output"), "").unwrap();
     fs::write(target.join("index.html"), "old").unwrap();
     std::os::unix::fs::symlink(&target, site.path().join("dist")).unwrap();
     build(site.path()).unwrap();

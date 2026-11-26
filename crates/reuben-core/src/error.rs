@@ -70,7 +70,7 @@ pub enum ErrorKind {
     #[error("builds to {}, but `__reuben/` is reserved for the dev server", .0.display())]
     ReservedOutputPath(PathBuf),
     #[error(
-        "output directory isn't empty and wasn't created by Reuben (no `.<name>.reuben-output` file beside it), so it won't be cleared"
+        "output directory isn't empty and wasn't created by Reuben (no matching `.<name>.reuben-output` file beside it), so it won't be cleared: delete the folder, or pass a different `--out`"
     )]
     UnsafeOutputDir,
 }
