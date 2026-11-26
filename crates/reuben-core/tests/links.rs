@@ -423,3 +423,123 @@ fn markdown_helper_resolves_links() {
     assert!(matches!(errors[0].kind, ErrorKind::Script(_)), "{errors:?}");
     assert!(errors[0].kind.to_string().contains("nope.md"), "{errors:?}");
 }
+
+fn link_errors(errors: &[reuben_core::Error]) -> Vec<(usize, usize, String)> {
+    errors
+        .iter()
+        .map(|e| {
+            let at = e.location().expect("a link error has a location");
+            (at.line, at.column, e.kind.to_string())
+        })
+        .collect()
+}
+
+#[test]
+fn plain_links_check_their_anchors() {
+    let tmp = site_of(&[
+        (
+            "content/b.md",
+            &page(
+                "[ok](/c/#top)\n\n[no](/c/#nope)\n\n[idx](/c/index.html#nope2)\n\n[bare](/c#nope3)\n\n[query](/c/?x=1#nope4)",
+            ),
+        ),
+        ("content/c.md", &page("# Top")),
+    ]);
+    let errors = build(&tmp).unwrap_err();
+    let got = link_errors(&errors);
+    let lines: Vec<usize> = got.iter().map(|g| g.0).collect();
+    assert_eq!(lines, [6, 8, 10, 12], "{got:?}");
+    assert_eq!(got[0].2, "links to `#nope` on `c.md`, which has no such id");
+}
+
+#[test]
+fn plain_anchors_follow_the_base_path() {
+    let tmp = site_of(&[
+        (
+            "reuben.toml",
+            "title = \"S\"\nbase_url = \"https://x.dev/sub/\"\n",
+        ),
+        (
+            "content/b.md",
+            &page(
+                "[ok](/sub/c/#top)\n\n[no](/sub/c/#nope)\n\n[other](/c/#elsewhere)\n\n[file](/f.txt#x)\n\n[ext](https://x.dev/sub/c/#nope)",
+            ),
+        ),
+        ("content/c.md", &page("# Top")),
+        ("static/f.txt", "hi"),
+    ]);
+    let errors = build(&tmp).unwrap_err();
+    let got = link_errors(&errors);
+    assert_eq!(got.len(), 1, "{got:?}");
+    assert_eq!(got[0].0, 6);
+}
+
+#[test]
+fn plain_anchors_are_not_collected_without_one() {
+    let tmp = site_of(&[
+        ("content/b.md", &page("[ok](/c/) [also](/c/?x=1)")),
+        ("content/c.md", &page("# Top")),
+    ]);
+    build(&tmp).unwrap();
+}
+
+#[test]
+fn raw_html_source_links_resolve() {
+    let tmp = site_of(&[
+        (
+            "reuben.toml",
+            "title = \"S\"\nbase_url = \"https://x.dev/sub/\"\n",
+        ),
+        (
+            "content/b.md",
+            &page(
+                "<a class=\"button\" href=\"@/c.md#top\">Go</a>\n\nText <a href='@/c.md?x=1'>inline</a> and <img alt=\"\" src=\"@/c.md\">.\n\n```html\n<a href=\"@/c.md\">code</a>\n```\n\n`<a href=\"@/c.md\">`",
+            ),
+        ),
+        ("content/c.md", &page("# Top")),
+    ]);
+    build(&tmp).unwrap();
+    let html = built(&tmp, "b/index.html");
+    assert!(
+        html.contains("<a class=\"button\" href=\"/sub/c/#top\">"),
+        "{html}"
+    );
+    assert!(html.contains("href='/sub/c/?x=1'"), "{html}");
+    assert!(html.contains("src=\"/sub/c/\""), "{html}");
+    assert_eq!(html.matches("@/c.md").count(), 2, "{html}");
+}
+
+#[test]
+fn raw_html_source_links_are_checked() {
+    let tmp = site_of(&[
+        (
+            "content/b.md",
+            &page(
+                "<div>\n  <a href=\"@/missing.md\">gone</a>\n</div>\n\nText <a href=\"@/c.md#nope\">x</a>\n\n<a href=\"@/c.md#top\">ok</a>",
+            ),
+        ),
+        ("content/c.md", &page("# Top")),
+    ]);
+    let errors = build(&tmp).unwrap_err();
+    let got = link_errors(&errors);
+    assert_eq!(got.len(), 2, "{got:?}");
+    assert_eq!((got[0].0, got[0].1), (5, 12), "{got:?}");
+    assert!(got[0].2.starts_with("no page `missing.md`"), "{got:?}");
+    assert_eq!((got[1].0, got[1].1), (8, 15), "{got:?}");
+    assert_eq!(got[1].2, "links to `#nope` on `c.md`, which has no such id");
+    assert!(errors.iter().all(|e| e.path.ends_with("b.md")));
+}
+
+#[test]
+fn raw_html_source_links_beside_block_output() {
+    let tmp = site_of(&[
+        (
+            "content/b.md",
+            &page("<p>{{ 1 + 1 }} <a href=\"@/c.md\">go</a> {{ 2 + 2 }}</p>"),
+        ),
+        ("content/c.md", &page("# Top")),
+    ]);
+    build(&tmp).unwrap();
+    let html = built(&tmp, "b/index.html");
+    assert!(html.contains("<p>2 <a href=\"/c/\">go</a> 4</p>"), "{html}");
+}

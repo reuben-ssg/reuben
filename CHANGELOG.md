@@ -1,5 +1,26 @@
 # Changelog
 
+## Unreleased
+
+### Added
+
+`@/page.md` links, with an optional `#anchor`, now work in the `href` and `src` attributes of raw HTML, such as `<a class="button" href="@/quickstart.md">`.
+They resolve to the page's URL, with the path of `base_url`, and are checked like Markdown `@/` links.
+A link to a missing page or anchor is an error naming the file, line and column of the attribute.
+Code blocks and inline code are not rewritten.
+Raw HTML that a Rhai block or an include produces is not rewritten.
+
+### Fixed
+
+A plain root-relative link to a page Reuben built, such as `/guide/checks/#anchor`, now has its anchor checked, like an `@/page.md#anchor` link.
+This covers `/guide/checks/index.html#anchor` and links that carry the path of `base_url`.
+A missing anchor is reported with the file, line and column of the link.
+Links to static files and to other sites are not checked.
+
+### Changed checks
+
+Sites with a plain link to an anchor that doesn't exist will start failing to build.
+
 ## 0.3.0 (2026-11-26)
 
 ### Added
