@@ -45,7 +45,7 @@ enum Command {
         #[arg(long)]
         env: Option<String>,
         /// Read, render and write with this many threads. Defaults to the performance cores on Apple silicon,
-        /// and one per core elsewhere.
+        /// and one per core elsewhere. Deleting the previous output after a build isn't limited by it.
         #[arg(long, value_name = "N")]
         jobs: Option<usize>,
     },
@@ -63,8 +63,8 @@ enum Command {
         /// Merge `reuben.<name>.toml` over `reuben.toml` if it exists.
         #[arg(long)]
         env: Option<String>,
-        /// Read, render and write with this many threads. Defaults to the performance cores on Apple silicon,
-        /// and one per core elsewhere.
+        /// Read and render with this many threads. Defaults to the performance cores on Apple silicon, and one
+        /// per core elsewhere.
         #[arg(long, value_name = "N")]
         jobs: Option<usize>,
     },
@@ -79,8 +79,8 @@ enum Command {
         /// Merge `reuben.<name>.toml` over `reuben.toml` if it exists.
         #[arg(long)]
         env: Option<String>,
-        /// Read, render and write with this many threads. Defaults to the performance cores on Apple silicon,
-        /// and one per core elsewhere.
+        /// Read and render with this many threads. Defaults to the performance cores on Apple silicon, and one
+        /// per core elsewhere.
         #[arg(long, value_name = "N")]
         jobs: Option<usize>,
     },

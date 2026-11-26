@@ -962,10 +962,13 @@ impl Site {
             }
         };
         // Pages are already in `staging`; `out` changes only when the swap succeeds.
-        finish_atomic(&output, &opts.out, &staging).map_err(|errors| Failure {
+        let left = finish_atomic(&output, &opts.out, &staging).map_err(|errors| Failure {
             errors,
             findings: report.findings.clone(),
         })?;
+        // The new output is in place, so leftovers of the old one are only warnings; the next build retries them.
+        let mut report = report;
+        report.warnings.extend(left.iter().map(ToString::to_string));
         Ok(report)
     }
 
