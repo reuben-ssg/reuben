@@ -112,7 +112,8 @@ fn refuses_foreign_out_dir() {
 fn clears_own_out_dir() {
     let tmp = fixture("basic");
     build(tmp.path(), false).unwrap();
-    assert!(tmp.path().join("dist").join(OUTPUT_MARKER).is_file());
+    assert!(tmp.path().join(".dist.reuben-output").is_file());
+    assert!(!tmp.path().join("dist").join(OUTPUT_MARKER).exists());
     fs::remove_file(tmp.path().join("content/about.md")).unwrap();
     tmp.child("dist/stale.html").write_str("old").unwrap();
     build(tmp.path(), false).unwrap();

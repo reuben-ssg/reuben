@@ -36,7 +36,9 @@ use crate::template::{self, Escape};
 use crate::theme::{PageShell, builtin_page};
 use crate::{html, layout, markdown, page, splice};
 
-/// Written into every output directory Reuben builds. Only a directory containing it is ever cleared.
+/// The marker Reuben 0.3.0 wrote inside every output directory, where static hosts served it. Newer builds write
+/// `.<out>.reuben-output` beside the output instead, and only recognise this one so that an old output is still
+/// replaced.
 pub const OUTPUT_MARKER: &str = ".reuben-output";
 
 #[derive(Debug, Clone, Copy, PartialEq)]

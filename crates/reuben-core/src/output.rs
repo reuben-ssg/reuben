@@ -42,7 +42,7 @@ pub struct Output {
 /// The previous output is deleted after the swap. What can't be deleted then is left behind without an error, and
 /// deleted before the next swap.
 pub fn write_atomic(output: &Output, out: &Path) -> Result<(), Vec<Error>> {
-    let (real, _, _) = paths(out).map_err(|e| vec![e])?;
+    let (real, _, _, _) = paths(out).map_err(|e| vec![e])?;
     check_out_dir(&real).map_err(|e| vec![e])?;
     let staging = prepare_staging(out).map_err(|e| vec![e])?;
     finish_atomic(output, out, &staging).map(|_| ())
@@ -50,24 +50,38 @@ pub fn write_atomic(output: &Output, out: &Path) -> Result<(), Vec<Error>> {
 
 /// Empties and creates the staging directory beside `out`, and returns it.
 pub(crate) fn prepare_staging(out: &Path) -> Result<PathBuf, Error> {
-    let (_, staging, _) = paths(out)?;
+    let (_, staging, _, _) = paths(out)?;
     remove_dir(&staging)?;
     fs::create_dir_all(&staging).map_err(|e| Error::new(&staging, e))?;
     Ok(staging)
 }
 
-/// Writes every file not yet in `staging` plus the marker, then swaps `staging` into `out`. On failure `out` is
+/// Writes every file not yet in `staging`, writes the marker beside `out`, then swaps `staging` into `out`. On failure `out` is
 /// untouched and `staging` is removed. On success, returns what of the old output couldn't be deleted.
 pub(crate) fn finish_atomic(
     output: &Output,
     out: &Path,
     staging: &Path,
 ) -> Result<Vec<Error>, Vec<Error>> {
-    let result = paths(out).map_err(|e| vec![e]).and_then(|(real, _, old)| {
-        // Rechecked here because `out` may have changed while the site rendered, and the swap deletes it.
-        check_out_dir(&real).map_err(|e| vec![e])?;
-        stage(output, staging).and_then(|()| swap(staging, &real, &old).map_err(|e| vec![e]))
-    });
+    let result = paths(out)
+        .map_err(|e| vec![e])
+        .and_then(|(real, _, old, marker)| {
+            // Rechecked here because `out` may have changed while the site rendered, and the swap deletes it.
+            check_out_dir(&real).map_err(|e| vec![e])?;
+            stage(output, staging)?;
+            // Written before the swap so `out` never exists without its marker. A swap that then fails leaves a marker
+            // beside an `out` that was already Reuben's (or didn't exist), which the next build treats the same.
+            let identity = fs::metadata(staging)
+                .ok()
+                .and_then(|m| identity(&m))
+                .ok_or_else(|| {
+                    let msg =
+                        "can't read the staging folder's identity to record in the output marker";
+                    vec![Error::new(staging, io::Error::other(msg))]
+                })?;
+            fs::write(&marker, identity).map_err(|e| vec![Error::new(&marker, e)])?;
+            swap(staging, &real, &old).map_err(|e| vec![e])
+        });
     if result.is_err() {
         let _ = fs::remove_dir_all(staging);
     }
@@ -129,30 +143,66 @@ impl Stage {
 static MKDIRS: std::sync::Mutex<Vec<PathBuf>> = std::sync::Mutex::new(Vec::new());
 
 /// The output's real location (a symlinked output is swapped where it points, so the link keeps pointing at the new
-/// build), and its staging and old siblings.
-fn paths(out: &Path) -> Result<(PathBuf, PathBuf, PathBuf), Error> {
+/// build), and its staging, old and marker siblings.
+fn paths(out: &Path) -> Result<(PathBuf, PathBuf, PathBuf, PathBuf), Error> {
     let real = if fs::symlink_metadata(out).is_ok_and(|m| m.is_symlink()) {
         fs::canonicalize(out).map_err(|e| Error::new(out, e))?
     } else {
         out.to_path_buf()
     };
-    let (staging, old) = sibling_dirs(&real)?;
-    Ok((real, staging, old))
+    let (staging, old, marker) = siblings(&real)?;
+    Ok((real, staging, old, marker))
 }
 
-/// Refuses a non-empty directory that no earlier Reuben build created.
+/// Refuses a non-empty directory that no earlier Reuben build created: one with neither the marker beside it nor
+/// the 0.3.0 marker inside it.
 pub(crate) fn check_out_dir(out: &Path) -> Result<(), Error> {
     let io = |e: io::Error| Error::new(out, e);
     if out.exists() {
         let mut entries = fs::read_dir(out).map_err(io)?;
-        if entries.next().is_some() && !out.join(OUTPUT_MARKER).is_file() {
-            return Err(Error::new(out, ErrorKind::UnsafeOutputDir));
+        if entries.next().is_some() {
+            // A symlinked `out` keeps its marker beside the folder it points to, as the swap does.
+            let (real, _, _, marker) = paths(out)?;
+            let ours = fs::read_to_string(&marker).ok().is_some_and(|recorded| {
+                fs::metadata(out)
+                    .ok()
+                    .and_then(|m| identity(&m))
+                    .is_some_and(|now| now == recorded)
+            });
+            if !ours && !real.join(OUTPUT_MARKER).is_file() {
+                return Err(Error::new(out, ErrorKind::UnsafeOutputDir));
+            }
         }
     }
     Ok(())
 }
 
-fn sibling_dirs(out: &Path) -> Result<(PathBuf, PathBuf), Error> {
+/// Names a folder so a marker can tell the folder it was written for from a different one created later at the same
+/// path. A rename keeps it, so the staging folder's identity is the output's after the swap. `None` when it can't be
+/// read, which makes the folder count as foreign.
+///
+/// Linux file systems such as ext4 hand a deleted folder's inode to the next folder created, so on Unix the inode is
+/// paired with the creation time where the file system records one.
+fn identity(meta: &fs::Metadata) -> Option<String> {
+    let created = meta
+        .created()
+        .ok()
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|d| d.as_nanos());
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let created = created.map_or_else(String::new, |c| c.to_string());
+        Some(format!("{}:{}:{created}", meta.dev(), meta.ino()))
+    }
+    #[cfg(not(unix))]
+    {
+        created.map(|c| c.to_string())
+    }
+}
+
+/// The staging, old and marker paths beside `out`.
+fn siblings(out: &Path) -> Result<(PathBuf, PathBuf, PathBuf), Error> {
     let name = out.file_name().map(|n| n.to_string_lossy().into_owned());
     let Some(name) = name else {
         let msg =
@@ -167,6 +217,7 @@ fn sibling_dirs(out: &Path) -> Result<(PathBuf, PathBuf), Error> {
     Ok((
         parent.join(format!(".{name}.reuben-staging")),
         parent.join(format!(".{name}.reuben-old")),
+        parent.join(format!(".{name}.reuben-output")),
     ))
 }
 
@@ -219,10 +270,6 @@ fn stage(output: &Output, staging: &Path) -> Result<(), Vec<Error>> {
         })
         .collect();
     errors.extend(write_errors);
-    let marker = staging.join(OUTPUT_MARKER);
-    if let Err(e) = fs::write(&marker, "") {
-        errors.push(Error::new(&marker, e));
-    }
     if errors.is_empty() {
         Ok(())
     } else {
@@ -371,15 +418,97 @@ mod tests {
     #[test]
     fn write_atomic_replaces_and_drops_stale_files() {
         let tmp = TempDir::new().unwrap();
-        tmp.child("dist/.reuben-output").write_str("").unwrap();
+        write_atomic(&one_page(), &tmp.path().join("dist")).unwrap();
         tmp.child("dist/stale.html").write_str("old").unwrap();
         write_atomic(&one_page(), &tmp.path().join("dist")).unwrap();
         let dist = tmp.path().join("dist");
         assert_eq!(std::fs::read_to_string(dist.join("a.html")).unwrap(), "new");
-        assert!(dist.join(OUTPUT_MARKER).is_file());
+        assert!(tmp.path().join(".dist.reuben-output").is_file());
+        assert!(!dist.join(OUTPUT_MARKER).exists());
         assert!(!dist.join("stale.html").exists());
         assert!(!tmp.path().join(".dist.reuben-staging").exists());
         assert!(!tmp.path().join(".dist.reuben-old").exists());
+    }
+
+    #[test]
+    fn fresh_write_puts_the_marker_beside_out_not_inside() {
+        let tmp = TempDir::new().unwrap();
+        write_atomic(&one_page(), &tmp.path().join("public")).unwrap();
+        assert!(tmp.path().join(".public.reuben-output").is_file());
+        let inside: Vec<_> = std::fs::read_dir(tmp.path().join("public"))
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect();
+        assert_eq!(inside, ["a.html"]);
+        write_atomic(&one_page(), &tmp.path().join("public")).unwrap();
+        assert!(tmp.path().join("public/a.html").is_file());
+    }
+
+    #[test]
+    fn output_from_0_3_0_is_replaced_and_its_inner_marker_dropped() {
+        let tmp = TempDir::new().unwrap();
+        tmp.child("dist/.reuben-output").write_str("").unwrap();
+        tmp.child("dist/old.html").write_str("old").unwrap();
+        write_atomic(&one_page(), &tmp.path().join("dist")).unwrap();
+        assert!(tmp.path().join("dist/a.html").is_file());
+        assert!(!tmp.path().join("dist/old.html").exists());
+        assert!(!tmp.path().join("dist/.reuben-output").exists());
+        assert!(tmp.path().join(".dist.reuben-output").is_file());
+    }
+
+    #[test]
+    fn another_outputs_marker_does_not_vouch_for_a_foreign_dir() {
+        let tmp = TempDir::new().unwrap();
+        write_atomic(&one_page(), &tmp.path().join("dist")).unwrap();
+        tmp.child("public/keep.txt").write_str("mine").unwrap();
+        let err = write_atomic(&one_page(), &tmp.path().join("public")).unwrap_err();
+        assert!(matches!(err[0].kind, ErrorKind::UnsafeOutputDir));
+        assert!(tmp.path().join("public/keep.txt").is_file());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unwritable_parent_is_a_clear_error() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = TempDir::new().unwrap();
+        let parent = tmp.path().join("ro");
+        std::fs::create_dir(&parent).unwrap();
+        std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(0o555)).unwrap();
+        let result = write_atomic(&one_page(), &parent.join("dist"));
+        std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(0o755)).unwrap();
+        if std::fs::write(parent.join("probe"), "").is_ok() {
+            return; // running as a user who ignores permissions
+        }
+        let errs = result.unwrap_err();
+        assert_eq!(errs.len(), 1);
+        assert!(errs[0].path.starts_with(&parent));
+        assert!(!parent.join("dist").exists());
+    }
+
+    #[test]
+    fn foreign_dir_made_after_the_output_was_deleted_is_refused() {
+        let tmp = TempDir::new().unwrap();
+        let dist = tmp.path().join("dist");
+        write_atomic(&one_page(), &dist).unwrap();
+        std::fs::remove_dir_all(&dist).unwrap();
+        tmp.child("dist/keep.txt").write_str("mine").unwrap();
+        let err = write_atomic(&one_page(), &dist).unwrap_err();
+        assert!(matches!(err[0].kind, ErrorKind::UnsafeOutputDir));
+        assert_eq!(
+            std::fs::read_to_string(dist.join("keep.txt")).unwrap(),
+            "mine"
+        );
+    }
+
+    #[test]
+    fn leftover_marker_with_no_output_folder_is_overwritten() {
+        let tmp = TempDir::new().unwrap();
+        let dist = tmp.path().join("dist");
+        write_atomic(&one_page(), &dist).unwrap();
+        std::fs::remove_dir_all(&dist).unwrap();
+        write_atomic(&one_page(), &dist).unwrap();
+        write_atomic(&one_page(), &dist).unwrap();
+        assert!(dist.join("a.html").is_file());
     }
 
     #[test]
@@ -628,7 +757,8 @@ mod tests {
             "streamed"
         );
         assert_eq!(std::fs::read_to_string(out.join("a.html")).unwrap(), "new");
-        assert!(out.join(OUTPUT_MARKER).is_file());
+        assert!(tmp.path().join(".dist.reuben-output").is_file());
+        assert!(!out.join(OUTPUT_MARKER).exists());
         assert!(!staging.exists());
     }
 

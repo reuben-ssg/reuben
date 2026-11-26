@@ -205,8 +205,8 @@ fn streamed_build_matches_in_memory() {
     assert!(expected.contains_key(Path::new("logo.png")));
     assert!(expected.contains_key(Path::new("deli/index.html")));
     build(tmp.path()).unwrap();
-    let mut built = snapshot(&tmp.path().join("dist"));
-    assert_eq!(built.remove(Path::new(".reuben-output")), Some(Vec::new()));
+    let built = snapshot(&tmp.path().join("dist"));
+    assert!(!built.contains_key(Path::new(".reuben-output")));
     assert_eq!(built, expected);
 }
 
@@ -249,7 +249,8 @@ fn streamed_build_into_symlink() {
     assert_eq!(fs::read_link(tmp.path().join("dist")).unwrap(), real);
     assert!(real.join("index.html").is_file());
     assert!(real.join("notes/index.html").is_file());
-    assert!(real.join(".reuben-output").is_file());
+    assert!(!real.join(".reuben-output").exists());
+    assert!(tmp.path().join(".real.reuben-output").is_file());
     assert!(!tmp.path().join(".real.reuben-staging").exists());
     assert!(!tmp.path().join(".dist.reuben-staging").exists());
 }
@@ -270,4 +271,27 @@ fn out_dir_refused_before_rendering() {
         entry_names(&tmp.path().join("dist")),
         vec!["keep.txt".to_string()]
     );
+}
+
+#[test]
+fn build_keeps_the_marker_out_of_dist_and_rebuilds() {
+    let tmp = fixture("basic");
+    build(tmp.path()).unwrap();
+    assert!(tmp.path().join(".dist.reuben-output").is_file());
+    assert!(!tmp.path().join("dist/.reuben-output").exists());
+    build(tmp.path()).unwrap();
+    assert!(!tmp.path().join("dist/.reuben-output").exists());
+    assert!(tmp.path().join("dist/index.html").is_file());
+}
+
+#[test]
+fn build_migrates_a_0_3_0_output_folder() {
+    let tmp = fixture("basic");
+    tmp.child("dist/.reuben-output").write_str("").unwrap();
+    tmp.child("dist/stale.html").write_str("old").unwrap();
+    build(tmp.path()).unwrap();
+    assert!(!tmp.path().join("dist/.reuben-output").exists());
+    assert!(!tmp.path().join("dist/stale.html").exists());
+    assert!(tmp.path().join("dist/index.html").is_file());
+    assert!(tmp.path().join(".dist.reuben-output").is_file());
 }
