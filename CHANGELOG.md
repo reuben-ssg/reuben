@@ -45,6 +45,18 @@ The previous minimum, 1.85, was wrong: a dependency already needed 1.89.
 Run `rustup update` if `cargo install` says your Rust is too old.
 The npm package and the installers ship prebuilt binaries, so they don't need Rust at all.
 
+### Performance
+
+A page whose accessibility rules for the finished HTML (`html-lang`, `page-title`, `single-h1`, `main-landmark`, `id-unique`, `form-label` and `link-target`) are all off is no longer parsed a second time.
+Its ids are collected only when a link such as `@/page.md#anchor` asks for one, so broken anchors are still errors.
+A build makes fewer system calls: each layout is found and read once per build instead of once per page, a page's output folder is created once however many pages share it, a sidecar `.rhai` is looked up in the folder listing instead of on disk, and a static template is opened once.
+
+### Library API
+
+Added to `reuben-a11y`: `page_ids`, `Rule::runs_on_html` and `RuleSet::any_html_rule`.
+Added to `reuben-core`: `check::page_ids` and `layout::Layouts`, which finds and reads layouts once for a render.
+Changed in `reuben-core`: `layout::render_layout` takes a `&Layouts` after the layout's path, and reads the layout through it.
+
 ## 0.2.0 (2026-11-21)
 
 ### Changed defaults

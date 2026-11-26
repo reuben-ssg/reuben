@@ -23,8 +23,9 @@ use crate::error::{Error, ErrorKind};
 use crate::frontmatter::{self, FrontMatter};
 use crate::headings::TocEntry;
 use crate::lastmod;
+use crate::layout::Layouts;
 use crate::links::{AnchorRequest, LinkProblem, PageIndex, Target};
-use crate::output::{self, Output, OutputFile, check_out_dir, finish_atomic, prepare_staging};
+use crate::output::{Output, OutputFile, Stage, check_out_dir, finish_atomic, prepare_staging};
 use crate::page::Failed;
 use crate::route::{Route, route_for_page, route_for_template};
 use crate::script::helpers::url_for;
@@ -159,8 +160,9 @@ struct Rendered {
     findings: Vec<Finding>,
     /// Local links of the page, to be checked once every output file is known.
     links: Vec<LocalLink>,
-    /// Every id in the page, for the anchors other pages link to.
-    ids: HashSet<String>,
+    /// Every id in the page, for the anchors other pages link to. `None` when the HTML pass was skipped: the ids are
+    /// then collected only if a link asks for one of them.
+    ids: Option<HashSet<String>>,
     /// The `#anchor`s this page's source links ask for, to be checked against their target's ids.
     anchors: Vec<AnchorRequest>,
 }
@@ -171,7 +173,7 @@ impl Rendered {
             html,
             findings: Vec::new(),
             links: Vec::new(),
-            ids: HashSet::new(),
+            ids: None,
             anchors: Vec::new(),
         }
     }
@@ -189,6 +191,8 @@ struct Merged<'a> {
     page_links: Vec<(&'a Page, Vec<LocalLink>)>,
     /// Only Markdown pages are anchor targets, keyed by their path under `content/`.
     page_ids: HashMap<&'a Path, HashSet<String>>,
+    /// Markdown pages whose ids weren't collected as they rendered, keyed like `page_ids`.
+    unscanned: HashMap<&'a Path, &'a Page>,
     page_anchors: Vec<(&'a Page, Vec<AnchorRequest>)>,
     /// HTML pages were written to staging as they rendered.
     staged: bool,
@@ -221,6 +225,7 @@ impl<'a> Merged<'a> {
             findings: Vec::new(),
             page_links: Vec::new(),
             page_ids: HashMap::new(),
+            unscanned: HashMap::new(),
             page_anchors: Vec::new(),
             staged,
             keep: site
@@ -271,7 +276,8 @@ impl Site {
         errors.append(&mut dir_errors);
         let mut asset_rels = Vec::new();
         let mut failed_markdown = Vec::new();
-        let to_load: Vec<(PathBuf, PathBuf)> = walk(&content, &mut errors)
+        let (walked, listing) = walk(&content, &mut errors);
+        let to_load: Vec<(PathBuf, PathBuf)> = walked
             .into_iter()
             .filter(|(path, rel)| {
                 let is_markdown = path.extension().is_some_and(|e| e == "md");
@@ -296,9 +302,10 @@ impl Site {
             .par_iter()
             .map(|(path, rel)| {
                 if path.extension().is_some_and(|e| e == "md") {
-                    load_page(path, rel, Some(&dirs), PageKind::Markdown, config.a11y).map(Some)
+                    let kind = PageKind::Markdown;
+                    load_page(path, rel, Some(&dirs), &listing, kind, config.a11y).map(Some)
                 } else {
-                    load_template(path, rel, Some(&dirs), config.a11y)
+                    load_template(path, rel, Some(&dirs), &listing, config.a11y)
                 }
             })
             .collect();
@@ -332,13 +339,14 @@ impl Site {
         let static_dir = root.join("static");
         let mut static_files = Vec::new();
         if static_dir.exists() {
-            let to_load: Vec<(PathBuf, PathBuf)> = walk(&static_dir, &mut errors)
+            let (walked, listing) = walk(&static_dir, &mut errors);
+            let to_load: Vec<(PathBuf, PathBuf)> = walked
                 .into_iter()
                 .filter(|(_, rel)| !is_junk(rel))
                 .collect();
             let loaded_all: Vec<_> = to_load
                 .par_iter()
-                .map(|(path, rel)| load_template(path, rel, None, config.a11y))
+                .map(|(path, rel)| load_template(path, rel, None, &listing, config.a11y))
                 .collect();
             for ((_, rel), loaded) in to_load.into_iter().zip(loaded_all) {
                 match loaded {
@@ -355,6 +363,7 @@ impl Site {
         let theme_static_files = match config.theme.as_ref() {
             Some(theme) if theme.join("static").exists() => {
                 walk(&theme.join("static"), &mut errors)
+                    .0
                     .into_iter()
                     .map(|(_, rel)| rel)
                     .filter(|rel| !is_junk(rel))
@@ -437,7 +446,8 @@ impl Site {
 
         // Everything below adds to one list, sorted once at the end, so no stage hides another's errors.
         let mut errors = self.load_errors.clone();
-        errors.append(&mut self.check_collisions(&pages, opts.drafts));
+        let (mut collision_errors, colliding) = self.check_collisions(&pages, opts.drafts);
+        errors.append(&mut collision_errors);
         let (collections, mut collection_errors) = collections::build(&pages, &self.config);
         errors.append(&mut collection_errors);
 
@@ -448,14 +458,17 @@ impl Site {
             collections: &collections,
             pages: &index,
         };
+        let stager = stage.map(|dir| Stage::new(dir.to_path_buf()));
+        let layouts = Layouts::new(&self.root, self.config.theme.as_deref());
         let render_one = |page: &&Page, assets: &Arc<AssetMap>| -> Result<Rendered, Failed> {
-            let (html, tree, anchors) = self.render_page(page, &scopes, assets)?;
+            let (html, tree, anchors) = self.render_page(page, &scopes, assets, &layouts)?;
             splice::ensure_no_placeholders(&page.source, &html)
                 .map_err(|e| Failed::from(vec![e]))?;
-            let mut done = check_html(page, html, tree, anchors);
-            if let Some(stage) = stage.filter(|_| !is_css(&page.route.file)) {
-                if let Err(e) = output::write_staged(stage, &page.route.file, done.html.as_bytes())
-                {
+            let ids_now = !colliding.is_empty()
+                && colliding.contains(&page.route.file.to_string_lossy().to_lowercase());
+            let mut done = check_html(page, html, tree, anchors, ids_now);
+            if let Some(stage) = stager.as_ref().filter(|_| !is_css(&page.route.file)) {
+                if let Err(e) = stage.write(&page.route.file, done.html.as_bytes()) {
                     return Err(Failed {
                         errors: vec![e],
                         anchors: done.anchors,
@@ -638,7 +651,8 @@ impl Site {
             partial_pages,
             mut findings,
             page_links,
-            page_ids,
+            mut page_ids,
+            unscanned,
             page_anchors,
             ..
         } = m;
@@ -711,6 +725,38 @@ impl Site {
                 }
                 Ok(_) => {}
                 Err(msg) => errors.push(Error::new("reuben.toml", ErrorKind::Config(msg))),
+            }
+        }
+        // The ids of a page whose HTML pass was skipped are collected now, and only if a link asks for one.
+        // Scanned in parallel, then added in path order, so the errors don't depend on which thread finished first.
+        let wanted: Vec<&Page> = page_anchors
+            .iter()
+            .flat_map(|(_, anchors)| anchors.iter().map(|a| a.target.as_path()))
+            .filter_map(|target| unscanned.get(target).copied())
+            .map(|page| (page.rel.as_path(), page))
+            .collect::<BTreeMap<_, _>>()
+            .into_values()
+            .collect();
+        let scanned: Vec<_> = in_pool(pool.as_ref(), || {
+            wanted
+                .par_iter()
+                .map(|page| {
+                    built_html(&output, stage, page)
+                        .map(|html| html.map(|html| check::page_ids(&page.source, &html)))
+                })
+                .collect()
+        });
+        for (page, result) in wanted.into_iter().zip(scanned) {
+            match result {
+                Some(Ok(ids)) => {
+                    page_ids.insert(page.rel.as_path(), ids);
+                }
+                Some(Err(e)) => errors.push(e),
+                None => debug_assert!(
+                    false,
+                    "{} rendered but isn't in the output",
+                    page.rel.display()
+                ),
             }
         }
         // Unlike `link-target`, this runs on a failed build too: a target that didn't render is skipped, not blamed.
@@ -802,7 +848,14 @@ impl Site {
                     m.findings.extend(done.findings);
                     m.page_links.push((page, done.links));
                     if page.kind == PageKind::Markdown {
-                        m.page_ids.insert(page.rel.as_path(), done.ids);
+                        match done.ids {
+                            Some(ids) => {
+                                m.page_ids.insert(page.rel.as_path(), ids);
+                            }
+                            None => {
+                                m.unscanned.insert(page.rel.as_path(), page);
+                            }
+                        }
                     }
                     m.page_anchors.push((page, done.anchors));
                     let file = if m.staged {
@@ -900,17 +953,18 @@ impl Site {
     }
 
     /// Renders one page or template to its final output text, layout included. A Markdown page also returns what the
-    /// tree pass found in its final body tree.
+    /// tree pass found in its final body tree. `layouts` is shared by every page of one render.
     pub(crate) fn render_page(
         &self,
         page: &Page,
         scopes: &page::SiteScopes<'_>,
         assets: &Arc<AssetMap>,
+        layouts: &Layouts,
     ) -> Result<(String, Option<TreeReport>, Vec<AnchorRequest>), Failed> {
         // Rayon reuses threads, so misses left by an earlier page must not leak into this one.
         take_asset_misses();
         let result = with_link_context(self.link_context(page, scopes.pages, assets), || {
-            self.render_page_in_context(page, scopes)
+            self.render_page_in_context(page, scopes, layouts)
         });
         // A miss in a layout or include is reported there, once per call site however many pages use it: `Error::sort`
         // drops the repeats other pages add.
@@ -988,6 +1042,7 @@ impl Site {
         &self,
         page: &Page,
         scopes: &page::SiteScopes<'_>,
+        layouts: &Layouts,
     ) -> Result<(String, Option<TreeReport>, Vec<AnchorRequest>), Failed> {
         let (body, mut scope, layout_name, tree, anchors) = match page.kind {
             PageKind::Markdown => {
@@ -1028,14 +1083,13 @@ impl Site {
             errors,
             anchors: anchors.clone(),
         };
-        let layout = layout::find_layout(layout_name, &self.root, self.config.theme.as_deref())
-            .map_err(|mut e| {
-                e.path.clone_from(&page.source);
-                failed(vec![e])
-            })?;
+        let layout = layouts.find(layout_name).map_err(|mut e| {
+            e.path.clone_from(&page.source);
+            failed(vec![e])
+        })?;
         let html = match (layout, page.kind) {
             (Some(path), _) => {
-                layout::render_layout(&path, &self.engine, &mut scope, Html::new(body))
+                layout::render_layout(&path, layouts, &self.engine, &mut scope, Html::new(body))
                     .map_err(failed)?
             }
             (None, PageKind::Markdown) => builtin_page(&PageShell {
@@ -1107,8 +1161,9 @@ impl Site {
         theme.chain(site).chain(assets).collect()
     }
 
-    /// Fails if two sources (pages or static files) would write the same output file.
-    fn check_collisions(&self, pages: &[&Page], drafts: bool) -> Vec<Error> {
+    /// Fails if two sources (pages or static files) would write the same output file. Also returns the colliding
+    /// output paths, lowercased.
+    fn check_collisions(&self, pages: &[&Page], drafts: bool) -> (Vec<Error>, HashSet<String>) {
         let sources = pages
             .iter()
             .map(|p| (p.route.file.clone(), p.source.clone()))
@@ -1118,6 +1173,7 @@ impl Site {
         // that relies on the difference can't be deployed portably anyway.
         let mut seen: HashMap<String, PathBuf> = HashMap::new();
         let mut errors = Vec::new();
+        let mut colliding = HashSet::new();
         for (file, source) in sources {
             if file
                 .components()
@@ -1138,21 +1194,27 @@ impl Site {
                         file: file.clone(),
                     },
                 ));
+                colliding.insert(key);
             } else {
                 seen.insert(key, source);
             }
         }
-        errors
+        (errors, colliding)
     }
 }
 
 /// Runs the HTML pass on a page's finished text, with the tree pass's findings. Only HTML pages are checked:
 /// Markdown pages and `.html` templates. Other templates are CSS, XML and the like.
+///
+/// With every HTML-pass rule off the pass has nothing to find, so it is skipped and the page's ids are left to be
+/// collected later, only if a link asks for one. `ids_now` collects them anyway, for a page whose output another
+/// file may replace before then.
 fn check_html(
     page: &Page,
     html: String,
     tree: Option<TreeReport>,
     anchors: Vec<AnchorRequest>,
+    ids_now: bool,
 ) -> Rendered {
     let is_html = match page.kind {
         PageKind::Markdown => true,
@@ -1163,6 +1225,16 @@ fn check_html(
     }
     let (mut findings, reported_ids) =
         tree.map_or_else(Default::default, |t| (t.findings, t.reported_ids));
+    if !page.rules.any_html_rule() {
+        let ids = ids_now.then(|| check::page_ids(&page.source, &html));
+        return Rendered {
+            html,
+            findings,
+            links: Vec::new(),
+            ids,
+            anchors,
+        };
+    }
     let report = check::html_pass(
         &page.source,
         &page.route.file,
@@ -1175,8 +1247,23 @@ fn check_html(
         html,
         findings,
         links: report.links,
-        ids: report.ids,
+        ids: Some(report.ids),
         anchors,
+    }
+}
+
+/// The finished HTML of a rendered page: from `output`, or read back from `stage` if it was streamed there. Its
+/// output path must be its own, which a page whose path collides doesn't have. `None` if the page isn't in `output`.
+fn built_html(output: &Output, stage: Option<&Path>, page: &Page) -> Option<Result<String, Error>> {
+    match (output.files.get(&page.route.file), stage) {
+        (Some(OutputFile::Bytes(bytes)), _) => {
+            Some(Ok(String::from_utf8_lossy(bytes).into_owned()))
+        }
+        (Some(OutputFile::Staged), Some(stage)) => {
+            let path = stage.join(&page.route.file);
+            Some(fs::read_to_string(&path).map_err(|e| Error::new(path, e)))
+        }
+        _ => None,
     }
 }
 
@@ -1204,27 +1291,91 @@ fn in_pool<R: Send>(pool: Option<&rayon::ThreadPool>, f: impl FnOnce() -> R + Se
     }
 }
 
-/// Every file under `dir`, sorted, as (full path, path relative to `dir`).
-fn walk(dir: &Path, errors: &mut Vec<Error>) -> Vec<(PathBuf, PathBuf)> {
+/// Every sidecar path the filesystem was asked about, for tests that count them.
+#[cfg(test)]
+static SIDECAR_PROBES: std::sync::Mutex<Vec<PathBuf>> = std::sync::Mutex::new(Vec::new());
+
+/// What a walk saw, so a page's sidecar can be found without asking the filesystem about every page.
+///
+/// A sidecar the walk listed under its exact name is a file. Otherwise the filesystem may still resolve one: through
+/// a symlink, or, on a case- or normalization-insensitive filesystem, under another spelling (`x.RHAI` for `x.md`).
+/// Only those cases are asked about, so the answer is always the one `is_file()` would give.
+#[derive(Default)]
+struct Listing {
+    /// Every regular file.
+    files: HashSet<PathBuf>,
+    /// Every regular file with an ASCII name and a `rhai` extension in any case, with its name lowercased.
+    rhai_lower: HashSet<PathBuf>,
+    /// Folders the walk can't vouch for: they hold a symlink, a file with a non-ASCII name, or something unreadable.
+    ask: HashSet<PathBuf>,
+}
+
+impl Listing {
+    /// The sibling `<stem>.rhai` of `path`, if it is a file.
+    fn sidecar(&self, path: &Path) -> Option<PathBuf> {
+        let candidate = path.with_extension("rhai");
+        if self.files.contains(&candidate) {
+            return Some(candidate);
+        }
+        let (Some(dir), Some(name)) = (candidate.parent(), candidate.file_name()) else {
+            return None;
+        };
+        let ask = self.ask.contains(dir)
+            || !name.is_ascii()
+            || self
+                .rhai_lower
+                .contains(&dir.join(name.to_ascii_lowercase()));
+        #[cfg(test)]
+        if ask {
+            SIDECAR_PROBES.lock().unwrap().push(candidate.clone());
+        }
+        (ask && candidate.is_file()).then_some(candidate)
+    }
+}
+
+/// Every file under `dir`, sorted, as (full path, path relative to `dir`), and the listing of what was seen.
+fn walk(dir: &Path, errors: &mut Vec<Error>) -> (Vec<(PathBuf, PathBuf)>, Listing) {
     let mut files = Vec::new();
+    let mut listing = Listing::default();
     for entry in WalkDir::new(dir).sort_by_file_name() {
         match entry {
             Ok(entry) if entry.file_type().is_file() => {
                 let path = entry.into_path();
+                if let (Some(parent), Some(name)) = (path.parent(), path.file_name()) {
+                    if !name.is_ascii() {
+                        listing.ask.insert(parent.to_path_buf());
+                    } else if path
+                        .extension()
+                        .is_some_and(|e| e.eq_ignore_ascii_case("rhai"))
+                    {
+                        listing
+                            .rhai_lower
+                            .insert(parent.join(name.to_ascii_lowercase()));
+                    }
+                }
+                listing.files.insert(path.clone());
                 let rel = path
                     .strip_prefix(dir)
                     .expect("walkdir yields paths under its root")
                     .to_path_buf();
                 files.push((path, rel));
             }
+            Ok(entry) if entry.file_type().is_symlink() => {
+                if let Some(parent) = entry.path().parent() {
+                    listing.ask.insert(parent.to_path_buf());
+                }
+            }
             Ok(_) => {}
             Err(e) => {
                 let path = e.path().unwrap_or(dir).to_path_buf();
+                // What the walk couldn't see may hold a sidecar.
+                listing.ask.extend(path.parent().map(Path::to_path_buf));
+                listing.ask.insert(path.clone());
                 errors.push(Error::new(path, std::io::Error::from(e)));
             }
         }
     }
-    files
+    (files, listing)
 }
 
 /// Why a page didn't load. `from_defaults` are failures in the merged front matter, which a broken `_dir.toml` can
@@ -1249,6 +1400,7 @@ fn load_template(
     path: &Path,
     rel: &Path,
     dirs: Option<&DirDefaults>,
+    listing: &Listing,
     rules: RuleSet,
 ) -> Result<Option<Page>, LoadFailure> {
     let io = |e: std::io::Error| Error::new(path, e);
@@ -1256,39 +1408,43 @@ fn load_template(
     let mut file = fs::File::open(path).map_err(io)?;
     let mut head = [0u8; 8];
     let n = file.read(&mut head).map_err(io)?;
-    let head = head[..n]
+    let start = head[..n]
         .strip_prefix(b"\xef\xbb\xbf")
         .unwrap_or(&head[..n]);
-    if !(head.starts_with(b"---") || head.starts_with(b"+++")) {
+    if !(start.starts_with(b"---") || start.starts_with(b"+++")) {
         return Ok(None);
     }
-    let bytes = fs::read(path).map_err(io)?;
+    let mut bytes = head[..n].to_vec();
+    file.read_to_end(&mut bytes).map_err(io)?;
     if !template::starts_with_front_matter(&bytes) {
         return Ok(None);
     }
     let kind = PageKind::Template {
         escape: template::escape_for(rel),
     };
-    load_page_from(path, rel, bytes, dirs, kind, rules).map(Some)
+    load_page_from(path, rel, bytes, dirs, listing, kind, rules).map(Some)
 }
 
 fn load_page(
     path: &Path,
     rel: &Path,
     dirs: Option<&DirDefaults>,
+    listing: &Listing,
     kind: PageKind,
     rules: RuleSet,
 ) -> Result<Page, LoadFailure> {
     let bytes = fs::read(path).map_err(|e| Error::new(path, e))?;
-    load_page_from(path, rel, bytes, dirs, kind, rules)
+    load_page_from(path, rel, bytes, dirs, listing, kind, rules)
 }
 
 /// `rules` are the accessibility rules the config leaves on; the page's merged `a11y.disable` switches more off.
+/// `listing` is the walk that found `path`, for finding its sidecar.
 fn load_page_from(
     path: &Path,
     rel: &Path,
     bytes: Vec<u8>,
     dirs: Option<&DirDefaults>,
+    listing: &Listing,
     kind: PageKind,
     rules: RuleSet,
 ) -> Result<Page, LoadFailure> {
@@ -1325,7 +1481,7 @@ fn load_page_from(
             });
         }
     };
-    let sidecar = Some(path.with_extension("rhai")).filter(|p| p.is_file());
+    let sidecar = listing.sidecar(path);
     let route = match kind {
         PageKind::Markdown => route_for_page(rel),
         PageKind::Template { .. } => route_for_template(rel),
@@ -1487,6 +1643,409 @@ mod tests {
         assert!(!is_static_sidecar(&pages, dir, Path::new("other.rhai")));
         let none = [static_template(None)];
         assert!(!is_static_sidecar(&none, dir, Path::new("side.rhai")));
+    }
+
+    const ALL_RULES_OFF: &str = "[a11y]\ndisable = [\"heading-order\",\"link-text\",\"img-alt\",\"heading-id-unique\",\"table-header\",\"html-lang\",\"page-title\",\"single-h1\",\"main-landmark\",\"id-unique\",\"form-label\",\"link-target\"]\n";
+
+    fn site_dir(files: &[(&str, &str)]) -> assert_fs::TempDir {
+        use assert_fs::prelude::*;
+        let tmp = assert_fs::TempDir::new().unwrap();
+        for (path, text) in files {
+            tmp.child(path).write_str(text).unwrap();
+        }
+        tmp
+    }
+
+    /// How many pages under `dir` had their finished HTML tokenized.
+    fn html_scans(dir: &Path) -> usize {
+        check::HTML_SCANS
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|p| p.starts_with(dir))
+            .count()
+    }
+
+    fn render_site(dir: &Path) -> Result<(Output, BuildReport), Failure> {
+        Site::load(dir)
+            .map_err(Failure::from)?
+            .render(&RenderOptions {
+                drafts: false,
+                jobs: None,
+            })
+    }
+
+    fn no_anchor_fragments(failure: &Failure) -> Vec<String> {
+        failure
+            .errors
+            .iter()
+            .filter_map(|e| match &e.kind {
+                ErrorKind::Link {
+                    problem: LinkProblem::NoAnchor { fragment, .. },
+                    ..
+                } => Some(fragment.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn html_pass_is_skipped_when_no_rule_or_anchor_needs_it() {
+        let tmp = site_dir(&[
+            ("reuben.toml", ALL_RULES_OFF),
+            (
+                "content/index.md",
+                "---\ntitle: Home\n---\n# Home\n\n[b](@/b.md)\n",
+            ),
+            (
+                "content/b.md",
+                "---\ntitle: B\n---\n# B\n\n<p id=\"x\"></p><p id=\"x\"></p>\n",
+            ),
+            (
+                "content/raw.html",
+                "---\ntitle: Raw\n---\n<p id=\"y\"></p><p id=\"y\"></p><input>\n",
+            ),
+        ]);
+        let (output, report) = render_site(tmp.path()).unwrap();
+        assert_eq!(html_scans(tmp.path()), 0);
+        assert_eq!(report.findings, []);
+        let html = |rel: &str| match output.files.get(Path::new(rel)) {
+            Some(OutputFile::Bytes(b)) => String::from_utf8(b.clone()).unwrap(),
+            other => panic!("{rel}: {other:?}"),
+        };
+        assert!(html("index.html").contains("href=\"/b/\""));
+        assert!(html("b/index.html").contains(">B</h1>"));
+        assert!(html("raw/index.html").contains("<input>"));
+    }
+
+    #[test]
+    fn skipped_html_pass_reports_what_the_full_pass_would() {
+        let mut rules = RuleSet::all();
+        for rule in reuben_a11y::Rule::ALL {
+            rules.disable(rule);
+        }
+        let mut page = static_template(None);
+        page.kind = PageKind::Markdown;
+        page.rules = rules;
+        let html = "<html><body><p id=a></p><p id=a></p><input><a href=\"/x/\">x</a></body></html>";
+        let full = check::html_pass(
+            &page.source,
+            &page.route.file,
+            html,
+            &rules,
+            &HashSet::new(),
+        );
+        let skipped = check_html(&page, html.to_string(), None, Vec::new(), false);
+        assert_eq!(skipped.findings, full.findings);
+        assert_eq!(skipped.links, full.links);
+        assert_eq!(skipped.ids, None);
+        assert_eq!(check::page_ids(&page.source, html), full.ids);
+    }
+
+    #[test]
+    fn broken_anchors_are_reported_with_every_rule_off() {
+        let files = [
+            ("reuben.toml", ALL_RULES_OFF),
+            (
+                "content/a.md",
+                "---\ntitle: A\n---\n# A\n\n[ok](@/b.md#there) [bad](@/b.md#nope)\n",
+            ),
+            (
+                "content/b.md",
+                "---\ntitle: B\n---\n# B\n\n## There\n\n<span id=\"raw\"></span>\n",
+            ),
+            (
+                "content/c.md",
+                "---\ntitle: C\n---\n# C\n\n[raw](@/b.md#raw)\n",
+            ),
+        ];
+        let tmp = site_dir(&files);
+        let failure = render_site(tmp.path()).unwrap_err();
+        assert_eq!(no_anchor_fragments(&failure), ["nope"]);
+        assert_eq!(failure.errors.len(), 1);
+        // Only the page linked with a fragment is scanned.
+        assert_eq!(html_scans(tmp.path()), 1);
+
+        // A staged build reads the target back from staging.
+        let tmp = site_dir(&files);
+        let site = Site::load(tmp.path()).unwrap();
+        let failure = site
+            .build(&BuildOptions {
+                drafts: false,
+                out: tmp.path().join("dist"),
+                jobs: None,
+            })
+            .unwrap_err();
+        assert_eq!(no_anchor_fragments(&failure), ["nope"]);
+        assert_eq!(failure.errors.len(), 1);
+        assert_eq!(html_scans(tmp.path()), 1);
+    }
+
+    #[test]
+    fn a_colliding_page_is_scanned_for_ids_as_it_renders() {
+        // `x/index.md` and `x.md` both write `x/index.html`, and x.md's output replaces it. The anchor is still checked
+        // against `x/index.md`'s own HTML.
+        let tmp = site_dir(&[
+            ("reuben.toml", ALL_RULES_OFF),
+            (
+                "content/a.md",
+                "---\ntitle: A\n---\n# A\n\n[y](@/x/index.md#only-y)\n",
+            ),
+            ("content/x.md", "---\ntitle: X\n---\n# X\n"),
+            (
+                "content/x/index.md",
+                "---\ntitle: Y\n---\n# Y\n\n## Only Y\n",
+            ),
+        ]);
+        let failure = render_site(tmp.path()).unwrap_err();
+        assert!(
+            failure
+                .errors
+                .iter()
+                .any(|e| matches!(e.kind, ErrorKind::OutputCollision { .. })),
+            "{failure:?}"
+        );
+        assert_eq!(no_anchor_fragments(&failure), Vec::<String>::new());
+    }
+
+    /// A site with the HTML rules on, where `lazy.md` (front matter) and `quiet/` (`_dir.toml`) switch them all off
+    /// when `quiet` is set. Each page has an unlabelled input, which `form-label` reports.
+    fn mixed_site(quiet: bool, broken: bool) -> assert_fs::TempDir {
+        let off: Vec<String> = reuben_a11y::Rule::ALL
+            .into_iter()
+            .filter(|r| r.runs_on_html())
+            .map(|r| format!("\"{}\"", r.id()))
+            .collect();
+        let off = off.join(", ");
+        let page_a11y = if quiet {
+            format!("a11y:\n  disable: [{off}]\n")
+        } else {
+            String::new()
+        };
+        let dir_a11y = if quiet {
+            format!("[a11y]\ndisable = [{off}]\n")
+        } else {
+            String::new()
+        };
+        let mut links =
+            String::from("[e](@/eager.md#e-ok) [l](@/lazy.md#l-ok) [q](@/quiet/q.md#q-ok)\n");
+        if broken {
+            links
+                .push_str("\n[e](@/eager.md#e-bad) [l](@/lazy.md#l-bad) [q](@/quiet/q.md#q-bad)\n");
+        }
+        let index = format!("---\ntitle: Home\n---\n# Home\n\n{links}");
+        let lazy = format!("---\ntitle: L\n{page_a11y}---\n# L\n\n## L ok\n\n<input>\n");
+        site_dir(&[
+            ("content/index.md", &index),
+            (
+                "content/eager.md",
+                "---\ntitle: E\n---\n# E\n\n## E ok\n\n<input>\n",
+            ),
+            ("content/lazy.md", &lazy),
+            ("content/quiet/_dir.toml", &dir_a11y),
+            (
+                "content/quiet/q.md",
+                "---\ntitle: Q\n---\n# Q\n\n## Q ok\n\n<input>\n",
+            ),
+        ])
+    }
+
+    fn build_site(dir: &Path) -> Result<BuildReport, Failure> {
+        Site::load(dir)
+            .map_err(Failure::from)?
+            .build(&BuildOptions {
+                drafts: false,
+                out: dir.join("dist"),
+                jobs: None,
+            })
+    }
+
+    fn dist_files(dir: &Path) -> BTreeMap<PathBuf, Vec<u8>> {
+        WalkDir::new(dir.join("dist"))
+            .into_iter()
+            .map(Result::unwrap)
+            .filter(|e| e.file_type().is_file())
+            .map(|e| {
+                let rel = e
+                    .path()
+                    .strip_prefix(dir.join("dist"))
+                    .unwrap()
+                    .to_path_buf();
+                (rel, fs::read(e.path()).unwrap())
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_staged_build_checks_anchors_on_eager_and_lazy_pages_alike() {
+        let tmp = mixed_site(true, true);
+        let failure = build_site(tmp.path()).unwrap_err();
+        let mut got: Vec<(PathBuf, String, String)> = failure
+            .errors
+            .iter()
+            .map(|e| match &e.kind {
+                ErrorKind::Link {
+                    problem: LinkProblem::NoAnchor { target, fragment },
+                    ..
+                } => (
+                    e.path.clone(),
+                    target.display().to_string(),
+                    fragment.clone(),
+                ),
+                other => panic!("unexpected error {other:?}"),
+            })
+            .collect();
+        got.sort();
+        let index = tmp.path().join("content/index.md");
+        let want = [
+            ("eager.md", "e-bad"),
+            ("lazy.md", "l-bad"),
+            ("quiet/q.md", "q-bad"),
+        ]
+        .map(|(t, f)| (index.clone(), t.to_string(), f.to_string()));
+        assert_eq!(got, want);
+        assert!(!tmp.path().join("dist").exists());
+        // Only the two quiet pages are scanned after rendering; the rest as they render.
+        let scans = |rel: &str| {
+            check::HTML_SCANS
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|p| *p == &tmp.path().join("content").join(rel))
+                .count()
+        };
+        for rel in ["index.md", "eager.md", "lazy.md", "quiet/q.md"] {
+            assert_eq!(scans(rel), 1, "{rel}");
+        }
+
+        let mixed = mixed_site(true, false);
+        let report = build_site(mixed.path()).unwrap();
+        let all_on = mixed_site(false, false);
+        let all_report = build_site(all_on.path()).unwrap();
+        assert_eq!(dist_files(mixed.path()), dist_files(all_on.path()));
+        let sources = |report: &BuildReport, root: &Path| -> Vec<PathBuf> {
+            let mut s: Vec<PathBuf> = report
+                .findings
+                .iter()
+                .map(|f| f.path.strip_prefix(root).unwrap().to_path_buf())
+                .collect();
+            s.dedup();
+            s
+        };
+        assert_eq!(
+            sources(&report, mixed.path()),
+            [PathBuf::from("content/eager.md")]
+        );
+        assert_eq!(
+            sources(&all_report, all_on.path()),
+            ["content/eager.md", "content/lazy.md", "content/quiet/q.md"].map(PathBuf::from)
+        );
+    }
+
+    #[test]
+    fn each_html_rule_fires_alone() {
+        let page = "---\ntitle: T\n---\n<html><body><p id=\"d\"></p><p id=\"d\"></p><input><a href=\"/nope/\">x</a></body></html>\n";
+        let html_rules = reuben_a11y::Rule::ALL
+            .into_iter()
+            .filter(|r| r.runs_on_html());
+        for rule in html_rules {
+            let others: Vec<String> = reuben_a11y::Rule::ALL
+                .into_iter()
+                .filter(|r| *r != rule)
+                .map(|r| format!("\"{}\"", r.id()))
+                .collect();
+            let config = format!("[a11y]\ndisable = [{}]\n", others.join(","));
+            let tmp = site_dir(&[("reuben.toml", &config), ("content/bad.html", page)]);
+            let (_, report) = render_site(tmp.path()).unwrap();
+            let rules: Vec<_> = report.findings.iter().map(|f| f.rule).collect();
+            assert_eq!(rules, [rule], "{}", rule.id());
+            assert_eq!(html_scans(tmp.path()), 1, "{}", rule.id());
+        }
+    }
+
+    fn sidecar_probes(dir: &Path) -> usize {
+        SIDECAR_PROBES
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|p| p.starts_with(dir))
+            .count()
+    }
+
+    fn sidecar_of<'a>(site: &'a Site, rel: &str) -> Option<&'a Path> {
+        site.pages
+            .iter()
+            .find(|p| p.rel == Path::new(rel))
+            .unwrap_or_else(|| panic!("no page {rel}"))
+            .sidecar
+            .as_deref()
+    }
+
+    #[test]
+    fn sidecars_are_found_from_the_walk_without_probing() {
+        let page = "---\ntitle: T\n---\nx\n";
+        let tmp = site_dir(&[
+            ("content/plain.md", page),
+            ("content/with.md", page),
+            ("content/with.rhai", "let a = 1;"),
+            ("content/sub/deep.md", page),
+            ("content/sub/deep.rhai", "let a = 1;"),
+            ("static/t.css", "---\ntitle: T\n---\nb {}\n"),
+            ("static/t.rhai", "let a = 1;"),
+            ("static/u.css", "---\ntitle: U\n---\nb {}\n"),
+        ]);
+        let site = Site::load(tmp.path()).unwrap();
+        assert_eq!(sidecar_of(&site, "plain.md"), None);
+        let content = tmp.path().join("content");
+        assert_eq!(
+            sidecar_of(&site, "with.md"),
+            Some(content.join("with.rhai").as_path())
+        );
+        assert_eq!(
+            sidecar_of(&site, "sub/deep.md"),
+            Some(content.join("sub/deep.rhai").as_path())
+        );
+        assert_eq!(
+            sidecar_of(&site, "t.css"),
+            Some(tmp.path().join("static/t.rhai").as_path())
+        );
+        assert_eq!(sidecar_of(&site, "u.css"), None);
+        assert_eq!(sidecar_probes(tmp.path()), 0);
+    }
+
+    #[test]
+    fn a_sidecar_the_walk_cant_vouch_for_is_probed() {
+        let page = "---\ntitle: T\n---\nx\n";
+        let tmp = site_dir(&[
+            ("content/case.md", page),
+            ("content/case.RHAI", "let a = 1;"),
+            ("content/other.md", page),
+            ("content/intl/café.md", page),
+        ]);
+        let content = tmp.path().join("content");
+        #[cfg(unix)]
+        {
+            fs::create_dir_all(content.join("linked")).unwrap();
+            fs::write(content.join("linked/l.md"), page).unwrap();
+            fs::write(tmp.path().join("real.rhai"), "let a = 1;").unwrap();
+            std::os::unix::fs::symlink(tmp.path().join("real.rhai"), content.join("linked/l.rhai"))
+                .unwrap();
+        }
+        let site = Site::load(tmp.path()).unwrap();
+        // Whatever the filesystem says, as before: found on a case-insensitive one.
+        let case = content.join("case.rhai");
+        let expected = case.is_file().then_some(case.as_path());
+        assert_eq!(sidecar_of(&site, "case.md"), expected);
+        assert_eq!(sidecar_of(&site, "other.md"), None);
+        #[cfg(unix)]
+        assert_eq!(
+            sidecar_of(&site, "linked/l.md"),
+            Some(content.join("linked/l.rhai").as_path())
+        );
+        assert_eq!(sidecar_of(&site, "intl/café.md"), None);
+        // `case.md`, `café.md` and the page beside the link are asked about; `other.md` isn't.
+        let probed = if cfg!(unix) { 3 } else { 2 };
+        assert_eq!(sidecar_probes(tmp.path()), probed);
     }
 
     #[test]

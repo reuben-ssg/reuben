@@ -1,9 +1,10 @@
 //! The built site held in memory, and the atomic swap that puts it on disk.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
+use std::sync::{Mutex, PoisonError};
 
 use rayon::prelude::*;
 
@@ -64,14 +65,57 @@ pub(crate) fn finish_atomic(output: &Output, out: &Path, staging: &Path) -> Resu
     result
 }
 
-/// Writes one rendered file into `staging`, creating its directory.
-pub(crate) fn write_staged(staging: &Path, rel: &Path, bytes: &[u8]) -> Result<(), Error> {
-    let dest = staging.join(rel);
-    if let Some(dir) = dest.parent() {
-        fs::create_dir_all(dir).map_err(|e| Error::new(dir, e))?;
-    }
-    fs::write(&dest, bytes).map_err(|e| Error::new(&dest, e))
+/// The staging directory that pages are written into as they render. It remembers the directories it has made, so
+/// pages that share one don't each ask the filesystem for it again.
+pub(crate) struct Stage {
+    dir: PathBuf,
+    made: Mutex<HashSet<PathBuf>>,
 }
+
+impl Stage {
+    /// `dir` must already exist, as `prepare_staging` leaves it.
+    pub(crate) fn new(dir: PathBuf) -> Self {
+        let made = Mutex::new(HashSet::from([dir.clone()]));
+        Self { dir, made }
+    }
+
+    /// Writes one rendered file, creating its directory.
+    pub(crate) fn write(&self, rel: &Path, bytes: &[u8]) -> Result<(), Error> {
+        let dest = self.dir.join(rel);
+        if let Some(dir) = dest.parent() {
+            self.make_dir(dir)?;
+        }
+        fs::write(&dest, bytes).map_err(|e| Error::new(&dest, e))
+    }
+
+    /// Creates `dir` and its parents unless this stage already has. Two pages may both create a new directory at
+    /// once, which `create_dir_all` allows; a directory is remembered only once it exists.
+    fn make_dir(&self, dir: &Path) -> Result<(), Error> {
+        let made = |d: &Path| {
+            self.made
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .contains(d)
+        };
+        if made(dir) {
+            return Ok(());
+        }
+        #[cfg(test)]
+        MKDIRS.lock().unwrap().push(dir.to_path_buf());
+        fs::create_dir_all(dir).map_err(|e| Error::new(dir, e))?;
+        let mut set = self.made.lock().unwrap_or_else(PoisonError::into_inner);
+        for d in dir.ancestors().take_while(|d| *d != self.dir) {
+            if !set.insert(d.to_path_buf()) {
+                break;
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Every directory `Stage::write` asked the filesystem to create, for tests that count them.
+#[cfg(test)]
+static MKDIRS: std::sync::Mutex<Vec<PathBuf>> = std::sync::Mutex::new(Vec::new());
 
 /// The output's real location (a symlinked output is swapped where it points, so the link keeps pointing at the new
 /// build), and its staging and old siblings.
@@ -382,6 +426,92 @@ mod tests {
         );
         assert!(!staging.exists());
         assert!(!tmp.path().join(".dist.reuben-old").exists());
+    }
+
+    fn mkdirs_under(dir: &Path) -> usize {
+        MKDIRS
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|p| p.starts_with(dir))
+            .count()
+    }
+
+    #[test]
+    fn staged_pages_in_one_directory_create_it_once() {
+        let tmp = TempDir::new().unwrap();
+        let staging = prepare_staging(&tmp.path().join("dist")).unwrap();
+        let stage = Stage::new(staging.clone());
+        for name in ["a", "b", "c"] {
+            let rel = PathBuf::from(format!("blog/{name}.html"));
+            stage.write(&rel, name.as_bytes()).unwrap();
+        }
+        stage.write(Path::new("index.html"), b"home").unwrap();
+        assert_eq!(mkdirs_under(&staging), 1);
+        for name in ["a", "b", "c"] {
+            let got = std::fs::read_to_string(staging.join(format!("blog/{name}.html"))).unwrap();
+            assert_eq!(got, name);
+        }
+        assert_eq!(
+            std::fs::read_to_string(staging.join("index.html")).unwrap(),
+            "home"
+        );
+    }
+
+    #[test]
+    fn staged_pages_in_nested_new_directories_are_written() {
+        let tmp = TempDir::new().unwrap();
+        let staging = prepare_staging(&tmp.path().join("dist")).unwrap();
+        let stage = Stage::new(staging.clone());
+        stage.write(Path::new("a/b/c/index.html"), b"deep").unwrap();
+        stage.write(Path::new("a/b/index.html"), b"mid").unwrap();
+        stage.write(Path::new("a/index.html"), b"top").unwrap();
+        stage.write(Path::new("a/b/d/index.html"), b"sib").unwrap();
+        let read = |rel: &str| std::fs::read_to_string(staging.join(rel)).unwrap();
+        assert_eq!(read("a/b/c/index.html"), "deep");
+        assert_eq!(read("a/b/index.html"), "mid");
+        assert_eq!(read("a/index.html"), "top");
+        assert_eq!(read("a/b/d/index.html"), "sib");
+        // `a/b/c` makes its parents too, so only `a/b/d` needs another.
+        assert_eq!(mkdirs_under(&staging), 2);
+    }
+
+    #[test]
+    fn staged_pages_written_concurrently_into_one_new_directory() {
+        let tmp = TempDir::new().unwrap();
+        let staging = prepare_staging(&tmp.path().join("dist")).unwrap();
+        let stage = Stage::new(staging.clone());
+        let names: Vec<String> = (0..64).map(|i| format!("p{i}")).collect();
+        let results: Vec<Result<(), Error>> = names
+            .par_iter()
+            .map(|n| {
+                stage.write(
+                    &Path::new("shared/deeper").join(format!("{n}.html")),
+                    n.as_bytes(),
+                )
+            })
+            .collect();
+        assert!(results.iter().all(Result::is_ok));
+        for n in &names {
+            let got =
+                std::fs::read_to_string(staging.join(format!("shared/deeper/{n}.html"))).unwrap();
+            assert_eq!(&got, n);
+        }
+    }
+
+    #[test]
+    fn a_staged_page_whose_directory_cant_be_made_names_the_directory_every_time() {
+        let tmp = TempDir::new().unwrap();
+        let staging = prepare_staging(&tmp.path().join("dist")).unwrap();
+        std::fs::write(staging.join("blocked"), "a file").unwrap();
+        let stage = Stage::new(staging.clone());
+        for name in ["a", "b"] {
+            let err = stage
+                .write(&Path::new("blocked/x").join(format!("{name}.html")), b"x")
+                .unwrap_err();
+            assert_eq!(err.path, staging.join("blocked/x"));
+            assert!(matches!(err.kind, ErrorKind::Io(_)));
+        }
     }
 
     #[cfg(unix)]

@@ -32,6 +32,25 @@ impl Rule {
         Rule::LinkTarget,
     ];
 
+    /// Whether `check_page` checks the rule on a finished page's HTML; the others run on the document tree. A page
+    /// with every such rule off skips the HTML pass, so a rule `check_page` checks must say `true` here.
+    pub fn runs_on_html(self) -> bool {
+        match self {
+            Rule::HtmlLang
+            | Rule::PageTitle
+            | Rule::SingleH1
+            | Rule::MainLandmark
+            | Rule::IdUnique
+            | Rule::FormLabel
+            | Rule::LinkTarget => true,
+            Rule::HeadingOrder
+            | Rule::LinkText
+            | Rule::ImgAlt
+            | Rule::HeadingIdUnique
+            | Rule::TableHeader => false,
+        }
+    }
+
     pub fn id(self) -> &'static str {
         match self {
             Rule::HeadingOrder => "heading-order",
@@ -89,6 +108,13 @@ impl RuleSet {
         self.0 & Self::bit(rule) != 0
     }
 
+    /// Whether `check_page` has anything to find: some rule of the HTML pass is on.
+    pub fn any_html_rule(&self) -> bool {
+        Rule::ALL
+            .iter()
+            .any(|&rule| rule.runs_on_html() && self.is_on(rule))
+    }
+
     fn bit(rule: Rule) -> u16 {
         1 << (rule as u16)
     }
@@ -130,5 +156,18 @@ mod tests {
         rules.disable(Rule::LinkText);
         assert!(!rules.is_on(Rule::LinkText));
         assert!(rules.is_on(Rule::ImgAlt));
+    }
+
+    #[test]
+    fn any_html_rule_ignores_tree_rules() {
+        let mut rules = RuleSet::all();
+        for rule in Rule::ALL.into_iter().filter(|r| r.runs_on_html()) {
+            assert!(rules.any_html_rule());
+            rules.disable(rule);
+        }
+        assert!(!rules.any_html_rule());
+        for rule in Rule::ALL.into_iter().filter(|r| !r.runs_on_html()) {
+            assert!(rules.is_on(rule));
+        }
     }
 }

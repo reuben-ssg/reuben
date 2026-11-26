@@ -226,6 +226,20 @@ pub fn check_page(html: &str, rules: &RuleSet, reported_ids: &HashSet<String>) -
     report
 }
 
+/// Every non-blank `id` in a page: the `ids` that `check_page` collects, for a page no HTML-pass rule checks.
+pub fn page_ids(html: &str) -> HashSet<String> {
+    let mut ids = HashSet::new();
+    for event in scan(&[(html, ())]) {
+        if let Event::Start(tag) = event
+            && let Some(id) = tag.attr("id")
+            && !id.trim().is_empty()
+        {
+            ids.insert(id.to_string());
+        }
+    }
+    ids
+}
+
 fn page_wide(report: &mut PageReport, rules: &RuleSet, rule: Rule, message: &str) {
     if rules.is_on(rule) {
         report.findings.push(HtmlFinding {
@@ -560,5 +574,44 @@ mod tests {
         let report = check_page(html, &rules, &HashSet::new());
         let expected: HashSet<String> = ["a", "fn-1"].map(String::from).into();
         assert_eq!(report.ids, expected);
+    }
+
+    /// `runs_on_html` must name exactly the rules `check_page` reports on: a rule it leaves out would go unchecked on
+    /// a page whose other HTML rules are off.
+    #[test]
+    fn check_page_reports_only_on_rules_that_run_on_html() {
+        let html =
+            "<html><body><p id=d></p><p id=d></p><input><a href=\"/nope/\">x</a></body></html>";
+        for rule in Rule::ALL {
+            let mut only = RuleSet::all();
+            for other in Rule::ALL.into_iter().filter(|r| *r != rule) {
+                only.disable(other);
+            }
+            let report = check_page(html, &only, &HashSet::new());
+            let reported =
+                report.findings.iter().any(|f| f.rule == rule) || !report.links.is_empty();
+            assert_eq!(reported, rule.runs_on_html(), "{}", rule.id());
+            assert!(
+                report.findings.iter().all(|f| f.rule == rule),
+                "{}",
+                rule.id()
+            );
+        }
+    }
+
+    #[test]
+    fn page_ids_match_the_ids_check_page_collects() {
+        let pages = [
+            GOOD.to_string(),
+            "<h2 id=\"a\">x</h2><p id=\"\">y</p><sup id=\"fn-1\">".to_string(),
+            "<P ID=Up></P><p id=' sp '></p><p id=\"a&amp;b\"></p><p id=a></p><p id=a></p>".to_string(),
+            "<!-- <p id=c></p> --><script>'<p id=s>'</script><style>/* <p id=t> */</style><svg><g id=g/></svg>"
+                .to_string(),
+            "<p id=x".to_string(),
+            String::new(),
+        ];
+        for html in &pages {
+            assert_eq!(page_ids(html), check(html).ids, "{html}");
+        }
     }
 }
