@@ -576,6 +576,29 @@ mod tests {
         assert_eq!(report.ids, expected);
     }
 
+    /// `runs_on_html` must name exactly the rules `check_page` reports on: a rule it leaves out would go unchecked on
+    /// a page whose other HTML rules are off.
+    #[test]
+    fn check_page_reports_only_on_rules_that_run_on_html() {
+        let html =
+            "<html><body><p id=d></p><p id=d></p><input><a href=\"/nope/\">x</a></body></html>";
+        for rule in Rule::ALL {
+            let mut only = RuleSet::all();
+            for other in Rule::ALL.into_iter().filter(|r| *r != rule) {
+                only.disable(other);
+            }
+            let report = check_page(html, &only, &HashSet::new());
+            let reported =
+                report.findings.iter().any(|f| f.rule == rule) || !report.links.is_empty();
+            assert_eq!(reported, rule.runs_on_html(), "{}", rule.id());
+            assert!(
+                report.findings.iter().all(|f| f.rule == rule),
+                "{}",
+                rule.id()
+            );
+        }
+    }
+
     #[test]
     fn page_ids_match_the_ids_check_page_collects() {
         let pages = [

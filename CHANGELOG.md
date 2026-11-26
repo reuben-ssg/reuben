@@ -53,7 +53,7 @@ A build makes fewer system calls: each layout is found and read once per build i
 
 ### Library API
 
-Added to `reuben-a11y`: `page_ids`, `Rule::HTML_PASS` and `RuleSet::any_html_rule`.
+Added to `reuben-a11y`: `page_ids`, `Rule::runs_on_html` and `RuleSet::any_html_rule`.
 Added to `reuben-core`: `check::page_ids` and `layout::Layouts`, which finds and reads layouts once for a render.
 Changed in `reuben-core`: `layout::render_layout` takes a `&Layouts` after the layout's path, and reads the layout through it.
 

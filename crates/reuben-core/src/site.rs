@@ -728,16 +728,28 @@ impl Site {
             }
         }
         // The ids of a page whose HTML pass was skipped are collected now, and only if a link asks for one.
-        let wanted: BTreeSet<&Path> = page_anchors
+        // Scanned in parallel, then added in path order, so the errors don't depend on which thread finished first.
+        let wanted: Vec<&Page> = page_anchors
             .iter()
             .flat_map(|(_, anchors)| anchors.iter().map(|a| a.target.as_path()))
-            .filter(|target| unscanned.contains_key(target))
+            .filter_map(|target| unscanned.get(target).copied())
+            .map(|page| (page.rel.as_path(), page))
+            .collect::<BTreeMap<_, _>>()
+            .into_values()
             .collect();
-        for target in wanted {
-            let page = unscanned[target];
-            match built_html(&output, stage, page) {
-                Some(Ok(html)) => {
-                    page_ids.insert(page.rel.as_path(), check::page_ids(&page.source, &html));
+        let scanned: Vec<_> = in_pool(pool.as_ref(), || {
+            wanted
+                .par_iter()
+                .map(|page| {
+                    built_html(&output, stage, page)
+                        .map(|html| html.map(|html| check::page_ids(&page.source, &html)))
+                })
+                .collect()
+        });
+        for (page, result) in wanted.into_iter().zip(scanned) {
+            match result {
+                Some(Ok(ids)) => {
+                    page_ids.insert(page.rel.as_path(), ids);
                 }
                 Some(Err(e)) => errors.push(e),
                 None => debug_assert!(
@@ -1796,18 +1808,147 @@ mod tests {
         assert_eq!(no_anchor_fragments(&failure), Vec::<String>::new());
     }
 
+    /// A site with the HTML rules on, where `lazy.md` (front matter) and `quiet/` (`_dir.toml`) switch them all off
+    /// when `quiet` is set. Each page has an unlabelled input, which `form-label` reports.
+    fn mixed_site(quiet: bool, broken: bool) -> assert_fs::TempDir {
+        let off: Vec<String> = reuben_a11y::Rule::ALL
+            .into_iter()
+            .filter(|r| r.runs_on_html())
+            .map(|r| format!("\"{}\"", r.id()))
+            .collect();
+        let off = off.join(", ");
+        let page_a11y = if quiet {
+            format!("a11y:\n  disable: [{off}]\n")
+        } else {
+            String::new()
+        };
+        let dir_a11y = if quiet {
+            format!("[a11y]\ndisable = [{off}]\n")
+        } else {
+            String::new()
+        };
+        let mut links =
+            String::from("[e](@/eager.md#e-ok) [l](@/lazy.md#l-ok) [q](@/quiet/q.md#q-ok)\n");
+        if broken {
+            links
+                .push_str("\n[e](@/eager.md#e-bad) [l](@/lazy.md#l-bad) [q](@/quiet/q.md#q-bad)\n");
+        }
+        let index = format!("---\ntitle: Home\n---\n# Home\n\n{links}");
+        let lazy = format!("---\ntitle: L\n{page_a11y}---\n# L\n\n## L ok\n\n<input>\n");
+        site_dir(&[
+            ("content/index.md", &index),
+            (
+                "content/eager.md",
+                "---\ntitle: E\n---\n# E\n\n## E ok\n\n<input>\n",
+            ),
+            ("content/lazy.md", &lazy),
+            ("content/quiet/_dir.toml", &dir_a11y),
+            (
+                "content/quiet/q.md",
+                "---\ntitle: Q\n---\n# Q\n\n## Q ok\n\n<input>\n",
+            ),
+        ])
+    }
+
+    fn build_site(dir: &Path) -> Result<BuildReport, Failure> {
+        Site::load(dir)
+            .map_err(Failure::from)?
+            .build(&BuildOptions {
+                drafts: false,
+                out: dir.join("dist"),
+                jobs: None,
+            })
+    }
+
+    fn dist_files(dir: &Path) -> BTreeMap<PathBuf, Vec<u8>> {
+        WalkDir::new(dir.join("dist"))
+            .into_iter()
+            .map(Result::unwrap)
+            .filter(|e| e.file_type().is_file())
+            .map(|e| {
+                let rel = e
+                    .path()
+                    .strip_prefix(dir.join("dist"))
+                    .unwrap()
+                    .to_path_buf();
+                (rel, fs::read(e.path()).unwrap())
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_staged_build_checks_anchors_on_eager_and_lazy_pages_alike() {
+        let tmp = mixed_site(true, true);
+        let failure = build_site(tmp.path()).unwrap_err();
+        let mut got: Vec<(PathBuf, String, String)> = failure
+            .errors
+            .iter()
+            .map(|e| match &e.kind {
+                ErrorKind::Link {
+                    problem: LinkProblem::NoAnchor { target, fragment },
+                    ..
+                } => (
+                    e.path.clone(),
+                    target.display().to_string(),
+                    fragment.clone(),
+                ),
+                other => panic!("unexpected error {other:?}"),
+            })
+            .collect();
+        got.sort();
+        let index = tmp.path().join("content/index.md");
+        let want = [
+            ("eager.md", "e-bad"),
+            ("lazy.md", "l-bad"),
+            ("quiet/q.md", "q-bad"),
+        ]
+        .map(|(t, f)| (index.clone(), t.to_string(), f.to_string()));
+        assert_eq!(got, want);
+        assert!(!tmp.path().join("dist").exists());
+        // Only the two quiet pages are scanned after rendering; the rest as they render.
+        let scans = |rel: &str| {
+            check::HTML_SCANS
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|p| *p == &tmp.path().join("content").join(rel))
+                .count()
+        };
+        for rel in ["index.md", "eager.md", "lazy.md", "quiet/q.md"] {
+            assert_eq!(scans(rel), 1, "{rel}");
+        }
+
+        let mixed = mixed_site(true, false);
+        let report = build_site(mixed.path()).unwrap();
+        let all_on = mixed_site(false, false);
+        let all_report = build_site(all_on.path()).unwrap();
+        assert_eq!(dist_files(mixed.path()), dist_files(all_on.path()));
+        let sources = |report: &BuildReport, root: &Path| -> Vec<PathBuf> {
+            let mut s: Vec<PathBuf> = report
+                .findings
+                .iter()
+                .map(|f| f.path.strip_prefix(root).unwrap().to_path_buf())
+                .collect();
+            s.dedup();
+            s
+        };
+        assert_eq!(
+            sources(&report, mixed.path()),
+            [PathBuf::from("content/eager.md")]
+        );
+        assert_eq!(
+            sources(&all_report, all_on.path()),
+            ["content/eager.md", "content/lazy.md", "content/quiet/q.md"].map(PathBuf::from)
+        );
+    }
+
     #[test]
     fn each_html_rule_fires_alone() {
         let page = "---\ntitle: T\n---\n<html><body><p id=\"d\"></p><p id=\"d\"></p><input><a href=\"/nope/\">x</a></body></html>\n";
-        for rule in [
-            reuben_a11y::Rule::HtmlLang,
-            reuben_a11y::Rule::PageTitle,
-            reuben_a11y::Rule::SingleH1,
-            reuben_a11y::Rule::MainLandmark,
-            reuben_a11y::Rule::IdUnique,
-            reuben_a11y::Rule::FormLabel,
-            reuben_a11y::Rule::LinkTarget,
-        ] {
+        let html_rules = reuben_a11y::Rule::ALL
+            .into_iter()
+            .filter(|r| r.runs_on_html());
+        for rule in html_rules {
             let others: Vec<String> = reuben_a11y::Rule::ALL
                 .into_iter()
                 .filter(|r| *r != rule)
