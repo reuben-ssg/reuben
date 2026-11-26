@@ -180,17 +180,24 @@ pub(crate) fn check_out_dir(out: &Path) -> Result<(), Error> {
 /// Names a folder so a marker can tell the folder it was written for from a different one created later at the same
 /// path. A rename keeps it, so the staging folder's identity is the output's after the swap. `None` when it can't be
 /// read, which makes the folder count as foreign.
+///
+/// Linux file systems such as ext4 hand a deleted folder's inode to the next folder created, so on Unix the inode is
+/// paired with the creation time where the file system records one.
 fn identity(meta: &fs::Metadata) -> Option<String> {
+    let created = meta
+        .created()
+        .ok()
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|d| d.as_nanos());
     #[cfg(unix)]
     {
         use std::os::unix::fs::MetadataExt;
-        Some(format!("{}:{}", meta.dev(), meta.ino()))
+        let created = created.map_or_else(String::new, |c| c.to_string());
+        Some(format!("{}:{}:{created}", meta.dev(), meta.ino()))
     }
     #[cfg(not(unix))]
     {
-        let created = meta.created().ok()?;
-        let since = created.duration_since(std::time::UNIX_EPOCH).ok()?;
-        Some(format!("{}", since.as_nanos()))
+        created.map(|c| c.to_string())
     }
 }
 
