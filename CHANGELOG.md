@@ -1,5 +1,16 @@
 # Changelog
 
+## Unreleased
+
+### Added
+
+`reuben new <path> [--npm]` creates a minimal site in a new or empty folder.
+It writes `reuben.toml`, `content/index.md` and a `.gitignore`, creating any missing parent folders.
+It refuses a folder that already has files in it, and a path that is a file, before writing anything.
+If it fails partway, it removes only what it created.
+It runs `git init` when `git` is on the `PATH`, and otherwise prints a note and still succeeds; it makes no commit.
+`--npm` also writes a `package.json` that pins the exact version of Reuben that ran the command, and adds `node_modules/` to `.gitignore`.
+
 ## 0.3.1 (2026-11-26)
 
 ### Added

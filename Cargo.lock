@@ -1917,6 +1917,8 @@ dependencies = [
  "predicates",
  "reuben-a11y",
  "reuben-core",
+ "serde_json",
+ "toml",
 ]
 
 [[package]]

@@ -3,6 +3,7 @@
 
 mod diagnostic;
 mod jobs;
+mod new;
 
 use std::collections::HashSet;
 use std::panic::AssertUnwindSafe;
@@ -30,6 +31,14 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
+    /// Create a minimal site in a new or empty folder.
+    New {
+        /// The folder to create the site in.
+        path: PathBuf,
+        /// Also write a `package.json` that pins this version of Reuben, for `npm install`.
+        #[arg(long)]
+        npm: bool,
+    },
     /// Build the site into the output directory.
     Build {
         /// Site root, containing `content/` and optionally `static/`.
@@ -134,6 +143,7 @@ fn main() -> ExitCode {
             jobs,
         } => check(&root, drafts, env, resolve(jobs)),
         Command::Explain { page, root, env } => explain(&page, &root, env),
+        Command::New { path, npm } => new_site(&path, npm),
         Command::Css(CssCommand::Highlight { theme }) => match highlight::theme_css(&theme) {
             Ok(css) => {
                 print!("{css}");
@@ -223,6 +233,98 @@ fn explain(page: &str, root: &Path, env: Option<String>) -> ExitCode {
             ExitCode::FAILURE
         }
     }
+}
+
+/// Writes a minimal site, then makes it a Git repository when `git` is installed.
+fn new_site(path: &Path, npm: bool) -> ExitCode {
+    let created = match new::scaffold(path, &new::NewOptions { npm }) {
+        Ok(created) => created,
+        Err(e) => {
+            eprintln!("error: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    println!("Created a site in {}", path.display());
+    for file in &created.files {
+        println!("  {}", file.display());
+    }
+    match find_on_path("git") {
+        None => println!(
+            "git isn't installed, so the site isn't a Git repository yet; run `git init` in it later."
+        ),
+        Some(git) => {
+            // Only `git init`, so the user's Git configuration can't run anything else.
+            let status = std::process::Command::new(git)
+                .env_remove("GIT_DIR")
+                .env_remove("GIT_WORK_TREE")
+                .env_remove("GIT_TEMPLATE_DIR")
+                .env_remove("GIT_OBJECT_DIRECTORY")
+                .env_remove("GIT_INDEX_FILE")
+                .args(["init", "--quiet"])
+                .arg(&created.root)
+                .status();
+            match status {
+                Ok(s) if s.success() => println!("Initialised a Git repository."),
+                Ok(s) => println!(
+                    "`git init` failed ({s}), so the site isn't a Git repository yet; run `git init` in it later."
+                ),
+                Err(e) => println!(
+                    "`git init` couldn't run ({e}), so the site isn't a Git repository yet; run `git init` in it later."
+                ),
+            }
+        }
+    }
+    println!();
+    println!("Next steps:");
+    if path != Path::new(".") {
+        println!("  cd {}", shell_quote(&path.to_string_lossy()));
+    }
+    if npm {
+        println!("  npm install");
+        println!("  npm run dev");
+    } else {
+        println!("  reuben serve");
+    }
+    ExitCode::SUCCESS
+}
+
+/// The first executable called `name` (`name.exe` on Windows) in a `PATH` entry.
+fn find_on_path(name: &str) -> Option<PathBuf> {
+    let file = if cfg!(windows) {
+        format!("{name}.exe")
+    } else {
+        name.to_string()
+    };
+    std::env::split_paths(&std::env::var_os("PATH")?)
+        // Empty and relative entries mean the current folder, which may hold a hostile `git`.
+        .filter(|dir| dir.is_absolute())
+        .map(|dir| dir.join(&file))
+        .find(|candidate| is_executable(candidate))
+}
+
+/// A path as one shell word: bare when it is plain, otherwise in single quotes.
+fn shell_quote(s: &str) -> String {
+    let plain = !s.is_empty()
+        && s.chars().all(|c| {
+            c.is_alphanumeric()
+                || matches!(c, '/' | '.' | '_' | '-' | '+' | ':' | '@' | '%' | ',' | '=')
+        });
+    if plain {
+        s.to_string()
+    } else {
+        format!("'{}'", s.replace('\'', "'\\''"))
+    }
+}
+
+#[cfg(unix)]
+fn is_executable(path: &Path) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::metadata(path).is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
+}
+
+#[cfg(not(unix))]
+fn is_executable(path: &Path) -> bool {
+    path.is_file()
 }
 
 fn print_findings(findings: &[Finding], root: &Path) {

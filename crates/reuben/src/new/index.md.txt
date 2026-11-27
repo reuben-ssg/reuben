@@ -1,0 +1,8 @@
+---
+title: Welcome
+---
+
+This is your new Reuben site.
+Edit `content/index.md` and save to see the page change.
+
+The site is called {{ site.title }}.
