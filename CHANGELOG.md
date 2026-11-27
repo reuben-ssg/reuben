@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.3.1 (2026-11-26)
 
 ### Added
 
@@ -83,6 +83,7 @@ Two collections with the same name are still an error.
 `_dir.toml` files are found in the same walk of `content/` that finds the pages, instead of a second walk.
 `reuben build` no longer frees the site's memory piece by piece just before it exits; the operating system reclaims it at exit.
 `reuben serve` and library callers of `Site::load_and_build` still free it.
+On a 4-core Linux runner, a bare 10,000-page build takes about 14% less time and a third less peak memory than before these changes, and a 1,000-page build about 10% less time.
 
 ### Library API
 
