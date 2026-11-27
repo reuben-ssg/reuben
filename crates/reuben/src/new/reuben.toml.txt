@@ -6,10 +6,10 @@ base_url = "https://example.com/"
 # Write a sitemap.xml listing every page.
 # sitemap = true
 
-# Highlight fenced code blocks at build time.
+# Highlight fenced code blocks at build time; the colours come from a stylesheet made with `reuben css highlight`.
 # [markdown]
 # highlight = true
 
-# Add content hashes to static file names for long-lived caching (needs `[css] bundle = true`).
+# Add content hashes to static file names for long-lived caching.
 # [assets]
 # hash = true

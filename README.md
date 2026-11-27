@@ -7,7 +7,7 @@ Reuben is a static site generator written in Rust.
 It's built on rye: [Rhai](https://rhai.rs) scripting runs inside your Markdown at build time, with access to collections and page data.
 Includes are plain Rhai functions, so every variable a page uses can be traced back to where it was passed in.
 
-Reuben is in early development: `reuben build`, `serve`, `check` and `explain` work today, but anything may still change.
+Reuben is in early development: `reuben new`, `build`, `serve`, `check` and `explain` work today, but anything may still change.
 
 ## Install
 

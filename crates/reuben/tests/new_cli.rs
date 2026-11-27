@@ -22,7 +22,8 @@ fn builds_and_checks_clean(args: &[&str]) {
     reuben(&tmp)
         .args(["build", "--root", "site"])
         .assert()
-        .success();
+        .success()
+        .stderr(predicate::str::contains("warning").not());
     reuben(&tmp)
         .args(["check", "--root", "site"])
         .assert()
@@ -193,4 +194,75 @@ fn new_never_runs_a_git_from_a_relative_or_empty_path_entry() {
         assert!(!tmp.path().join("site/ran-git").exists(), "case {i}");
         assert!(!tmp.path().join("bin/ran-git").exists(), "case {i}");
     }
+}
+
+const IGNORE: &str = "dist/\n.dist.reuben-staging/\n.dist.reuben-old/\n.dist.reuben-output\n";
+
+fn file(tmp: &TempDir, rel: &str) -> String {
+    std::fs::read_to_string(tmp.path().join(rel)).unwrap()
+}
+
+#[test]
+fn new_writes_exactly_these_files() {
+    let tmp = TempDir::new().unwrap();
+    reuben(&tmp).args(["new", "my site"]).assert().success();
+
+    assert_eq!(file(&tmp, "my site/.gitignore"), IGNORE);
+    assert_eq!(
+        file(&tmp, "my site/content/index.md"),
+        "---\n\
+         title: Welcome\n\
+         ---\n\
+         \n\
+         This is your new Reuben site.\n\
+         Edit `content/index.md` and save to see the page change.\n\
+         \n\
+         The site is called {{ site.title }}.\n"
+    );
+    assert_eq!(
+        file(&tmp, "my site/reuben.toml"),
+        "title = \"my site\"\n\
+         \n\
+         # Change this to your site's real address before deploying.\n\
+         base_url = \"https://example.com/\"\n\
+         \n\
+         # Write a sitemap.xml listing every page.\n\
+         # sitemap = true\n\
+         \n\
+         # Highlight fenced code blocks at build time; the colours come from a stylesheet made with `reuben css highlight`.\n\
+         # [markdown]\n\
+         # highlight = true\n\
+         \n\
+         # Add content hashes to static file names for long-lived caching.\n\
+         # [assets]\n\
+         # hash = true\n"
+    );
+    let mut names: Vec<_> = std::fs::read_dir(tmp.path().join("my site"))
+        .unwrap()
+        .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+        .filter(|n| n != ".git")
+        .collect();
+    names.sort();
+    assert_eq!(names, [".gitignore", "content", "reuben.toml"]);
+}
+
+#[test]
+fn new_npm_writes_exactly_these_files() {
+    let tmp = TempDir::new().unwrap();
+    reuben(&tmp)
+        .args(["new", "my site", "--npm"])
+        .assert()
+        .success();
+
+    assert_eq!(
+        file(&tmp, "my site/.gitignore"),
+        format!("{IGNORE}node_modules/\n")
+    );
+    assert_eq!(
+        file(&tmp, "my site/package.json"),
+        format!(
+            "{{\n  \"name\": \"my-site\",\n  \"private\": true,\n  \"scripts\": {{\n    \"dev\": \"reuben serve\",\n    \"build\": \"reuben build\",\n    \"check\": \"reuben check\"\n  }},\n  \"devDependencies\": {{\n    \"@reuben-ssg/reuben\": \"{}\"\n  }}\n}}\n",
+            env!("CARGO_PKG_VERSION")
+        )
+    );
 }

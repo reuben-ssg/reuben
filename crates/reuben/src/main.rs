@@ -31,6 +31,14 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
+    /// Create a minimal site in a new or empty folder.
+    New {
+        /// The folder to create the site in.
+        path: PathBuf,
+        /// Also write a `package.json` that pins this version of Reuben, for `npm install`.
+        #[arg(long)]
+        npm: bool,
+    },
     /// Build the site into the output directory.
     Build {
         /// Site root, containing `content/` and optionally `static/`.
@@ -99,14 +107,6 @@ enum Command {
     /// Print stylesheets that go with build output.
     #[command(subcommand)]
     Css(CssCommand),
-    /// Create a minimal site in a new or empty folder.
-    New {
-        /// The folder to create the site in.
-        path: PathBuf,
-        /// Also write a `package.json` that pins this version of Reuben, for `npm install`.
-        #[arg(long)]
-        npm: bool,
-    },
 }
 
 #[derive(Subcommand)]
