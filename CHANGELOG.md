@@ -41,7 +41,8 @@ Sites that turn `link-target` off see no change.
 A new `region-name` check reports an element with `role="region"` and a `tabindex` of 0 or more that has no `aria-label`, `aria-labelledby` or `title`.
 A screen reader announces a focused region by its name, so a region without one tells the user nothing.
 The markup Reuben writes for code blocks and tables always has a name, so this only fires on HTML from your own layouts, includes or Markdown.
-It runs on the finished HTML, so a site that switches off every other check of the finished HTML to skip that pass now needs `region-name` in `[a11y] disable` too.
+It runs on the finished HTML, but only when another check of the finished HTML (`html-lang`, `page-title`, `single-h1`, `main-landmark`, `id-unique`, `form-label` or `link-target`) is on, so a site that switches all of those off still skips the second parse of every page.
+To check `region-name` on such a site, turn one of them back on.
 
 ### Changed output
 

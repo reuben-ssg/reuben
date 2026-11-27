@@ -113,11 +113,15 @@ impl RuleSet {
         self.0 & Self::bit(rule) != 0
     }
 
-    /// Whether `check_page` has anything to find: some rule of the HTML pass is on.
+    /// Whether the HTML pass runs: some rule of it other than `region-name` is on.
+    ///
+    /// `region-name` rides along when the pass runs for another rule but never starts it on its own. The pass costs a
+    /// second parse of every finished page, and Reuben's own focusable markup always has a name, so a site that turns
+    /// every other HTML rule off keeps the fast path.
     pub fn any_html_rule(&self) -> bool {
         Rule::ALL
             .iter()
-            .any(|&rule| rule.runs_on_html() && self.is_on(rule))
+            .any(|&rule| rule.runs_on_html() && rule != Rule::RegionName && self.is_on(rule))
     }
 
     fn bit(rule: Rule) -> u16 {
@@ -167,7 +171,10 @@ mod tests {
     #[test]
     fn any_html_rule_ignores_tree_rules() {
         let mut rules = RuleSet::all();
-        for rule in Rule::ALL.into_iter().filter(|r| r.runs_on_html()) {
+        for rule in Rule::ALL
+            .into_iter()
+            .filter(|&r| r.runs_on_html() && r != Rule::RegionName)
+        {
             assert!(rules.any_html_rule());
             rules.disable(rule);
         }
@@ -175,5 +182,18 @@ mod tests {
         for rule in Rule::ALL.into_iter().filter(|r| !r.runs_on_html()) {
             assert!(rules.is_on(rule));
         }
+    }
+
+    #[test]
+    fn region_name_alone_does_not_start_the_html_pass() {
+        let mut rules = RuleSet::all();
+        for rule in Rule::ALL
+            .into_iter()
+            .filter(|&r| r.runs_on_html() && r != Rule::RegionName)
+        {
+            rules.disable(rule);
+        }
+        assert!(rules.is_on(Rule::RegionName));
+        assert!(!rules.any_html_rule());
     }
 }
