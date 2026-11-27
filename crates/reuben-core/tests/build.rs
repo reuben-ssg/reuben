@@ -212,3 +212,48 @@ fn focusable_scroll_follows_the_markdown_table() {
     assert!(!off.contains("tabindex"), "{off}");
     assert!(!off.contains("table-wrap"), "{off}");
 }
+
+/// Every file under `dir`, relative to it, with its bytes.
+fn tree(dir: &Path) -> Vec<(PathBuf, Vec<u8>)> {
+    let mut files: Vec<_> = walkdir::WalkDir::new(dir)
+        .sort_by_file_name()
+        .into_iter()
+        .map(Result::unwrap)
+        .filter(|e| e.file_type().is_file())
+        .map(|e| {
+            let rel = e.path().strip_prefix(dir).unwrap().to_path_buf();
+            (rel, fs::read(e.path()).unwrap())
+        })
+        .collect();
+    files.sort();
+    files
+}
+
+#[test]
+fn building_for_exit_writes_and_reports_the_same() {
+    use reuben_core::site::LoadOptions;
+    for name in ["basic", "collections", "bad"] {
+        let tmp = fixture(name);
+        let root = tmp.path();
+        let opts = |out: &str| BuildOptions {
+            drafts: false,
+            out: root.join(out),
+            jobs: None,
+        };
+        let kept = Site::load_and_build(root, &LoadOptions::default(), &opts("kept"));
+        let left = Site::load_and_build_for_exit(root, &LoadOptions::default(), &opts("left"));
+        match (kept, left) {
+            (Ok(kept), Ok(left)) => {
+                assert_eq!(kept, left, "{name}");
+                assert_eq!(tree(&root.join("kept")), tree(&root.join("left")), "{name}");
+            }
+            (Err(kept), Err(left)) => {
+                let messages =
+                    |f: &Failure| f.errors.iter().map(ToString::to_string).collect::<Vec<_>>();
+                assert_eq!(messages(&kept), messages(&left), "{name}");
+                assert_eq!(kept.findings, left.findings, "{name}");
+            }
+            (kept, left) => panic!("{name}: {kept:?} against {left:?}"),
+        }
+    }
+}

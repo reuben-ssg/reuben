@@ -70,17 +70,24 @@ Each code block costs 45 bytes plus 2 more and the length of the language word w
 Each table costs 78 bytes plus 2 more and the length of the heading text when there is one.
 On the 10,000-page benchmark site, with one code block and one table per page, the output grew by 1,400,000 bytes, from 18,042,709 to 19,442,709 (7.8%), or 140 bytes a page (55 bytes a page gzipped).
 
-### Library API
-
-Added to `reuben-core`: `MarkdownConfig::focusable_scroll` and `HtmlOptions::focusable_scroll`.
-Changed behavior in `reuben-core`: `HtmlOptions::default()`, and so `html::render`, writes the focusable markup for code blocks and tables; set `focusable_scroll: false` for the 0.3.0 markup.
-
-### Changed output
-
 Reuben now marks its output folder with a `.<name>.reuben-output` file beside it (`.dist.reuben-output` for `dist/`), next to the `.<name>.reuben-staging` and `.<name>.reuben-old` folders it already uses.
 The marker records which folder it belongs to, so a different folder later made at the same path is refused even if the marker is left over.
 Reuben still refuses to clear a non-empty output folder that has no matching marker.
 An output folder from 0.3.0 that still has `.reuben-output` inside is recognised and replaced, and the new output doesn't contain that file.
+
+### Performance
+
+A site that never reads `collections` no longer builds the collection items on every build.
+Two collections with the same name are still an error.
+`_dir.toml` files are found in the same walk of `content/` that finds the pages, instead of a second walk.
+`reuben build` no longer frees the site's memory piece by piece just before it exits; the operating system reclaims it at exit.
+`reuben serve` and library callers of `Site::load_and_build` still free it.
+
+### Library API
+
+Added to `reuben-core`: `MarkdownConfig::focusable_scroll` and `HtmlOptions::focusable_scroll`.
+Changed behavior in `reuben-core`: `HtmlOptions::default()`, and so `html::render`, writes the focusable markup for code blocks and tables; set `focusable_scroll: false` for the 0.3.0 markup.
+Added to `reuben-core`: `Site::load_and_build_for_exit`, which is `Site::load_and_build` for a process that exits right after it returns: it leaves the site and the build's working state allocated instead of freeing them.
 
 ## 0.3.0 (2026-11-26)
 

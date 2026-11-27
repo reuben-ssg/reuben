@@ -298,11 +298,14 @@ impl Site {
         errors.append(&mut data_errors);
 
         let content = root.join("content");
-        let (dirs, mut dir_errors) = dirs::load(&content);
+        let mut walk_errors = Vec::new();
+        let (walked, listing) = walk(&content, &mut walk_errors);
+        let (dirs, mut dir_errors) =
+            dirs::from_files(&content, walked.iter().map(|(path, _)| path.as_path()));
         errors.append(&mut dir_errors);
+        errors.append(&mut walk_errors);
         let mut asset_rels = Vec::new();
         let mut failed_markdown = Vec::new();
-        let (walked, listing) = walk(&content, &mut errors);
         let to_load: Vec<(PathBuf, PathBuf)> = walked
             .into_iter()
             .filter(|(path, rel)| {
@@ -467,7 +470,7 @@ impl Site {
     /// Renders the whole site into memory. Nothing touches the disk, and no file is `OutputFile::Staged`.
     pub fn render(&self, opts: &RenderOptions) -> Result<(Output, BuildReport), Failure> {
         let pool = Pool::new(opts.jobs);
-        pool.install(|| self.render_into(opts, None, &pool))
+        pool.install(|| self.render_into(opts, None, &pool, Teardown::Drop))
     }
 
     /// Loads the site at `root` and renders it into memory, both on one pool of `opts.jobs` threads. The site comes
@@ -480,7 +483,7 @@ impl Site {
         let pool = Pool::new(opts.jobs);
         pool.install(|| {
             let site = Site::load_with(root, load).map_err(|errors| pool.with_error(errors))?;
-            let rendered = site.render_into(opts, None, &pool);
+            let rendered = site.render_into(opts, None, &pool, Teardown::Drop);
             Ok((site, rendered))
         })
     }
@@ -492,9 +495,34 @@ impl Site {
         load: &LoadOptions,
         opts: &BuildOptions,
     ) -> Result<BuildReport, Failure> {
+        Self::load_and_build_then(root, load, opts, Teardown::Drop)
+    }
+
+    /// [`Site::load_and_build`] for a process that exits as soon as this returns, such as the `reuben build`
+    /// command. The site and the build's working state are left for the operating system to reclaim at exit instead
+    /// of being freed one allocation at a time, which takes several milliseconds on a large site. A process that
+    /// goes on running never gets that memory back, so it should call [`Site::load_and_build`].
+    pub fn load_and_build_for_exit(
+        root: &Path,
+        load: &LoadOptions,
+        opts: &BuildOptions,
+    ) -> Result<BuildReport, Failure> {
+        Self::load_and_build_then(root, load, opts, Teardown::Leave)
+    }
+
+    fn load_and_build_then(
+        root: &Path,
+        load: &LoadOptions,
+        opts: &BuildOptions,
+        teardown: Teardown,
+    ) -> Result<BuildReport, Failure> {
         let pool = Pool::new(opts.jobs);
         pool.install(|| match Site::load_with(root, load) {
-            Ok(site) => site.build_in(opts, &pool),
+            Ok(site) => {
+                let built = site.build_in(opts, &pool, teardown);
+                teardown.finish(site);
+                built
+            }
             Err(errors) => Err(pool.with_error(errors).into()),
         })
     }
@@ -506,6 +534,7 @@ impl Site {
         opts: &RenderOptions,
         stage: Option<&Path>,
         pool: &Pool,
+        teardown: Teardown,
     ) -> Result<(Output, BuildReport), Failure> {
         let (pages, drafts): (Vec<&Page>, Vec<&Page>) = self
             .pages
@@ -516,9 +545,16 @@ impl Site {
         let mut errors = self.load_errors.clone();
         let (mut collision_errors, colliding) = self.check_collisions(&pages, opts.drafts);
         errors.append(&mut collision_errors);
-        let (collections, mut collection_errors) =
-            collections::build_with(&pages, &self.config, self.collections_named);
-        errors.append(&mut collection_errors);
+        // Without a script that names `collections` nothing reads the items, so only their errors are worked out.
+        let collections = if self.collections_named {
+            let (collections, mut collection_errors) =
+                collections::build_with(&pages, &self.config, true);
+            errors.append(&mut collection_errors);
+            collections
+        } else {
+            errors.extend(collections::check(&pages, &self.config));
+            rhai::Map::new()
+        };
 
         let index = Arc::new(self.page_index(opts.drafts));
         let scopes = page::SiteScopes {
@@ -862,6 +898,14 @@ impl Site {
             }
         }
         check::sort(&mut findings);
+        teardown.finish((
+            page_links,
+            page_ids,
+            page_anchors,
+            unscanned,
+            index,
+            collections,
+        ));
 
         if !errors.is_empty() {
             Error::sort(&mut errors);
@@ -943,11 +987,16 @@ impl Site {
     /// Renders the site and swaps it into `opts.out`. A failed build leaves the previous output untouched.
     pub fn build(&self, opts: &BuildOptions) -> Result<BuildReport, Failure> {
         let pool = Pool::new(opts.jobs);
-        pool.install(|| self.build_in(opts, &pool))
+        pool.install(|| self.build_in(opts, &pool, Teardown::Drop))
     }
 
     /// `build`, on `pool`.
-    fn build_in(&self, opts: &BuildOptions, pool: &Pool) -> Result<BuildReport, Failure> {
+    fn build_in(
+        &self,
+        opts: &BuildOptions,
+        pool: &Pool,
+        teardown: Teardown,
+    ) -> Result<BuildReport, Failure> {
         let staging = check_out_dir(&opts.out).and_then(|()| prepare_staging(&opts.out));
         let rendered = self.render_into(
             &RenderOptions {
@@ -956,6 +1005,7 @@ impl Site {
             },
             staging.as_deref().ok(),
             pool,
+            teardown,
         );
         let (output, report, staging) = match (rendered, staging) {
             (Ok((output, report)), Ok(staging)) => (output, report, staging),
@@ -977,7 +1027,9 @@ impl Site {
             }
         };
         // Pages are already in `staging`; `out` changes only when the swap succeeds.
-        let left = finish_atomic(&output, &opts.out, &staging).map_err(|errors| Failure {
+        let left = finish_atomic(&output, &opts.out, &staging);
+        teardown.finish(output);
+        let left = left.map_err(|errors| Failure {
             errors,
             findings: report.findings.clone(),
         })?;
@@ -1397,6 +1449,23 @@ fn unreadable(errors: &mut Vec<Error>, map: &mut AssetMap, rel: &Path, src: &Pat
     map.insert(rel.to_path_buf(), rel.to_path_buf());
 }
 
+/// What happens to a build's large state once it is done with: freed, or left for the operating system to reclaim
+/// when a process that is about to exit does.
+#[derive(Clone, Copy)]
+enum Teardown {
+    Drop,
+    Leave,
+}
+
+impl Teardown {
+    fn finish<T>(self, state: T) {
+        match self {
+            Teardown::Drop => drop(state),
+            Teardown::Leave => std::mem::forget(state),
+        }
+    }
+}
+
 /// The threads every parallel step of one load and build runs on: reading sources, rendering, writing the output.
 /// It is `jobs` threads, or rayon's global pool when `jobs` is `None`.
 pub(crate) struct Pool {
@@ -1459,6 +1528,10 @@ pub(crate) fn record_work_thread(path: &Path) {
     ));
 }
 
+/// The root of every folder walk, for tests that count them.
+#[cfg(test)]
+pub(crate) static WALKS: std::sync::Mutex<Vec<PathBuf>> = std::sync::Mutex::new(Vec::new());
+
 /// Every sidecar path the filesystem was asked about, for tests that count them.
 #[cfg(test)]
 static SIDECAR_PROBES: std::sync::Mutex<Vec<PathBuf>> = std::sync::Mutex::new(Vec::new());
@@ -1503,6 +1576,8 @@ impl Listing {
 
 /// Every file under `dir`, sorted, as (full path, path relative to `dir`), and the listing of what was seen.
 fn walk(dir: &Path, errors: &mut Vec<Error>) -> (Vec<(PathBuf, PathBuf)>, Listing) {
+    #[cfg(test)]
+    WALKS.lock().unwrap().push(dir.to_path_buf());
     let mut files = Vec::new();
     let mut listing = Listing::default();
     for entry in WalkDir::new(dir).sort_by_file_name() {
@@ -2207,6 +2282,44 @@ mod tests {
     }
 
     #[test]
+    fn content_is_walked_once_and_folder_defaults_still_apply() {
+        let tmp = site_dir(&[
+            (
+                "content/g/_dir.toml",
+                "layout = \"none\"\n[params]\nx = 1\n",
+            ),
+            ("content/g/a.md", "---\ntitle: A\n---\nx\n"),
+            ("content/bad/_dir.toml", "x = [\n"),
+            ("content/bad/b.md", "---\ntitle: B\n---\nx\n"),
+        ]);
+        let site = Site::load(tmp.path()).unwrap();
+        let content = tmp.path().join("content");
+        let walks = WALKS
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|p| **p == content)
+            .count();
+        assert_eq!(walks, 1);
+        let a = site
+            .pages
+            .iter()
+            .find(|p| p.rel == Path::new("g/a.md"))
+            .unwrap();
+        assert_eq!(a.front_matter.layout.as_deref(), Some("none"));
+        assert_eq!(site.load_errors.len(), 1, "{:?}", site.load_errors);
+        assert!(site.load_errors[0].path.ends_with("bad/_dir.toml"));
+        assert!(
+            site.in_broken_dir(
+                site.pages
+                    .iter()
+                    .find(|p| p.rel == Path::new("bad/b.md"))
+                    .unwrap()
+            )
+        );
+    }
+
+    #[test]
     fn sidecars_are_found_from_the_walk_without_probing() {
         let page = "---\ntitle: T\n---\nx\n";
         let tmp = site_dir(&[
@@ -2288,7 +2401,9 @@ mod tests {
             jobs: None,
         };
         let pool = Pool::new(opts.jobs);
-        let (output, _) = site.render_into(&opts, Some(&stage), &pool).unwrap();
+        let (output, _) = site
+            .render_into(&opts, Some(&stage), &pool, Teardown::Drop)
+            .unwrap();
         let about = Path::new("about/index.html");
         assert_eq!(output.files.get(about), Some(&OutputFile::Staged));
         assert!(
@@ -2373,6 +2488,34 @@ mod tests {
         let home = html_of(&output, "index.html");
         assert!(home.contains("parsed-early-blocks {{ x }}"), "{home}");
         assert!(home.contains("parsed-early-plain text"), "{home}");
+    }
+
+    fn items_built(dir: &Path) -> usize {
+        collections::ITEMS_BUILT
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|p| p.starts_with(dir))
+            .count()
+    }
+
+    #[test]
+    fn collection_items_are_built_only_when_a_script_reads_collections() {
+        let page = "---\ntitle: T\n---\nx\n";
+        let quiet = site_dir(&[("content/docs/a.md", page), ("content/docs/b.md", page)]);
+        render_site(quiet.path()).unwrap();
+        assert_eq!(items_built(quiet.path()), 0);
+
+        let reads = site_dir(&[
+            ("content/docs/a.md", page),
+            ("content/docs/b.md", page),
+            (
+                "content/index.md",
+                "---\ntitle: H\n---\n{{ collections.len() }}\n",
+            ),
+        ]);
+        render_site(reads.path()).unwrap();
+        assert_eq!(items_built(reads.path()), 2);
     }
 
     /// Every member reads every member's summary and table of contents, so under parallel rendering some read a page
