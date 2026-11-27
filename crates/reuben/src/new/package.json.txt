@@ -1,0 +1,12 @@
+{
+  "name": "{name}",
+  "private": true,
+  "scripts": {
+    "dev": "reuben serve",
+    "build": "reuben build",
+    "check": "reuben check"
+  },
+  "devDependencies": {
+    "@reuben-ssg/reuben": "{version}"
+  }
+}

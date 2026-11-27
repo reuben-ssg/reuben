@@ -3,6 +3,8 @@
 
 mod diagnostic;
 mod jobs;
+#[cfg_attr(not(test), allow(dead_code))]
+mod new;
 
 use std::collections::HashSet;
 use std::panic::AssertUnwindSafe;
