@@ -179,8 +179,9 @@ fn write_all(
             fs::create_dir(parent).map_err(|e| io_err(parent, e))?;
             made_dirs.push(parent.to_path_buf());
         }
+        // Recorded first: a write that fails midway can leave a partial file to clean up.
+        made_files.push(path.clone());
         write(&path, &text).map_err(|e| io_err(&path, e))?;
-        made_files.push(path);
     }
     Ok(())
 }
@@ -269,6 +270,15 @@ mod tests {
     }
 
     #[test]
+    fn npm_name_falls_back_when_nothing_is_usable() {
+        assert_eq!(npm_name("..."), "site");
+        assert_eq!(npm_name("日本語"), "site");
+        assert_eq!(npm_name(""), "site");
+    }
+
+    // Windows can't create a folder named with double quotes.
+    #[cfg(unix)]
+    #[test]
     fn quotes_and_unicode_titles_stay_valid() {
         let tmp = TempDir::new().unwrap();
         let name = "My \"Café\"";
@@ -319,6 +329,8 @@ mod tests {
         let c = scaffold(&dir.join("."), &NewOptions::default()).unwrap();
         assert_eq!(c.files.len(), 3);
         assert!(dir.join("reuben.toml").is_file());
+        let v: toml::Table = read(&dir, "reuben.toml").parse().unwrap();
+        assert_eq!(v["title"].as_str(), Some("here"));
         let cwd = std::env::current_dir().unwrap();
         let expected = cwd.file_name().unwrap().to_string_lossy().into_owned();
         assert_eq!(site_title(Path::new(".")), expected);
@@ -341,6 +353,7 @@ mod tests {
         let mut flaky = |p: &Path, t: &str| {
             count += 1;
             if count == 3 {
+                fs::write(p, &t[..t.len() / 2])?;
                 Err(io::Error::other("boom"))
             } else {
                 fs::write(p, t)
@@ -356,6 +369,7 @@ mod tests {
         let mut flaky = |p: &Path, t: &str| {
             count += 1;
             if count == 2 {
+                fs::write(p, &t[..t.len() / 2])?;
                 Err(io::Error::other("boom"))
             } else {
                 fs::write(p, t)
