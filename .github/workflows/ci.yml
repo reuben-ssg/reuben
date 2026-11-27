@@ -30,3 +30,20 @@ jobs:
           toolchain: "1.100"
       - uses: Swatinem/rust-cache@v2
       - run: cargo test --workspace --locked
+
+  # The only check the main ruleset requires: it passes only when every job in `needs` passed.
+  # `always()` makes it run, and fail, when a needed job fails; a skipped required check would count as passing.
+  # Add every new job to `needs`.
+  ci-ok:
+    if: always()
+    needs: [check, msrv]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Every job passed
+        env:
+          RESULTS: ${{ join(needs.*.result, ' ') }}
+        run: |
+          echo "job results: $RESULTS"
+          for result in $RESULTS; do
+            [ "$result" = success ] || exit 1
+          done
