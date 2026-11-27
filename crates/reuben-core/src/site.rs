@@ -1931,6 +1931,21 @@ mod tests {
     }
 
     #[test]
+    fn region_name_alone_does_not_start_the_html_pass() {
+        let only_region_name = ALL_RULES_OFF.replace(",\"region-name\"", "");
+        let tmp = site_dir(&[
+            ("reuben.toml", only_region_name.as_str()),
+            (
+                "content/index.md",
+                "---\ntitle: Home\n---\n# Home\n\n<div role=\"region\" tabindex=\"0\"></div>\n",
+            ),
+        ]);
+        let (_, report) = render_site(tmp.path()).unwrap();
+        assert_eq!(html_scans(tmp.path()), 0);
+        assert_eq!(report.findings, []);
+    }
+
+    #[test]
     fn html_pass_is_skipped_when_no_rule_or_anchor_needs_it() {
         let tmp = site_dir(&[
             ("reuben.toml", ALL_RULES_OFF),
@@ -2245,9 +2260,10 @@ mod tests {
     #[test]
     fn each_html_rule_fires_alone() {
         let page = "---\ntitle: T\n---\n<html><body><p id=\"d\"></p><p id=\"d\"></p><input><div role=\"region\" tabindex=\"0\"></div><a href=\"/nope/\">x</a></body></html>\n";
+        // `region-name` never starts the pass on its own; `region_name_alone_does_not_start_the_html_pass` covers it.
         let html_rules = reuben_a11y::Rule::ALL
             .into_iter()
-            .filter(|r| r.runs_on_html());
+            .filter(|&r| r.runs_on_html() && r != reuben_a11y::Rule::RegionName);
         for rule in html_rules {
             let others: Vec<String> = reuben_a11y::Rule::ALL
                 .into_iter()

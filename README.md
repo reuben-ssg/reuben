@@ -58,6 +58,8 @@ Findings print as warnings with the file and line that caused them, and they nev
 | `link-target`       | Internal links point at a page or file that is built.              |
 | `region-name`       | Focusable regions, such as code blocks and tables, have a name.    |
 
+`region-name` runs only when one of the rules from `html-lang` to `link-target` is on too, because those rules decide whether Reuben reads the finished HTML of each page a second time.
+
 A finding looks like this:
 
 ```text
