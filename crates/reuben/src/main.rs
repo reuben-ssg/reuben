@@ -255,6 +255,11 @@ fn new_site(path: &Path, npm: bool) -> ExitCode {
         Some(git) => {
             // Only `git init`, so the user's Git configuration can't run anything else.
             let status = std::process::Command::new(git)
+                .env_remove("GIT_DIR")
+                .env_remove("GIT_WORK_TREE")
+                .env_remove("GIT_TEMPLATE_DIR")
+                .env_remove("GIT_OBJECT_DIRECTORY")
+                .env_remove("GIT_INDEX_FILE")
                 .args(["init", "--quiet"])
                 .arg(&created.root)
                 .status();
@@ -272,7 +277,7 @@ fn new_site(path: &Path, npm: bool) -> ExitCode {
     println!();
     println!("Next steps:");
     if path != Path::new(".") {
-        println!("  cd {}", path.display());
+        println!("  cd {}", shell_quote(&path.to_string_lossy()));
     }
     if npm {
         println!("  npm install");
@@ -291,8 +296,24 @@ fn find_on_path(name: &str) -> Option<PathBuf> {
         name.to_string()
     };
     std::env::split_paths(&std::env::var_os("PATH")?)
+        // Empty and relative entries mean the current folder, which may hold a hostile `git`.
+        .filter(|dir| dir.is_absolute())
         .map(|dir| dir.join(&file))
         .find(|candidate| is_executable(candidate))
+}
+
+/// A path as one shell word: bare when it is plain, otherwise in single quotes.
+fn shell_quote(s: &str) -> String {
+    let plain = !s.is_empty()
+        && s.chars().all(|c| {
+            c.is_alphanumeric()
+                || matches!(c, '/' | '.' | '_' | '-' | '+' | ':' | '@' | '%' | ',' | '=')
+        });
+    if plain {
+        s.to_string()
+    } else {
+        format!("'{}'", s.replace('\'', "'\\''"))
+    }
 }
 
 #[cfg(unix)]

@@ -115,3 +115,82 @@ fn help_lists_new() {
         .success()
         .stdout(predicate::str::is_match(r"(?m)^\s+new\s").unwrap());
 }
+
+#[test]
+fn new_quotes_a_path_with_a_space_in_the_next_steps() {
+    let tmp = TempDir::new().unwrap();
+    reuben(&tmp)
+        .args(["new", "My Site"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("cd 'My Site'"));
+    assert!(tmp.path().join("My Site/reuben.toml").is_file());
+
+    let tmp = TempDir::new().unwrap();
+    reuben(&tmp)
+        .args(["new", "it's"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(r"cd 'it'\''s'"));
+}
+
+#[test]
+fn new_in_the_current_folder_prints_no_cd() {
+    let tmp = TempDir::new().unwrap();
+    let here = tmp.child("here");
+    here.create_dir_all().unwrap();
+    Command::cargo_bin("reuben")
+        .unwrap()
+        .current_dir(here.path())
+        .args(["new", "."])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("reuben serve"))
+        .stdout(predicate::str::contains("cd ").not());
+    assert!(here.path().join("reuben.toml").is_file());
+}
+
+#[test]
+fn new_git_init_ignores_git_dir_from_the_environment() {
+    if !git_available() {
+        eprintln!("skipping: git isn't installed");
+        return;
+    }
+    let tmp = TempDir::new().unwrap();
+    let elsewhere = TempDir::new().unwrap();
+    reuben(&tmp)
+        .env("GIT_DIR", elsewhere.path())
+        .args(["new", "site"])
+        .assert()
+        .success();
+    assert!(tmp.path().join("site/.git").exists());
+    assert_eq!(std::fs::read_dir(elsewhere.path()).unwrap().count(), 0);
+}
+
+#[cfg(unix)]
+#[test]
+fn new_never_runs_a_git_from_a_relative_or_empty_path_entry() {
+    use std::os::unix::fs::PermissionsExt;
+
+    for (i, path) in [".", "bin", "", "bin:."].into_iter().enumerate() {
+        let tmp = TempDir::new().unwrap();
+        let script = "#!/bin/sh\ntouch \"$PWD/ran-git\"\n";
+        for dir in [".", "bin"] {
+            tmp.child(dir).create_dir_all().unwrap();
+            let git = tmp.child(dir).child("git");
+            git.write_str(script).unwrap();
+            std::fs::set_permissions(git.path(), std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        Command::cargo_bin("reuben")
+            .unwrap()
+            .current_dir(tmp.path())
+            .env("PATH", path)
+            .args(["new", "site"])
+            .assert()
+            .success()
+            .stdout(predicate::str::contains("git isn't installed"));
+        assert!(!tmp.path().join("ran-git").exists(), "case {i}: {path:?}");
+        assert!(!tmp.path().join("site/ran-git").exists(), "case {i}");
+        assert!(!tmp.path().join("bin/ran-git").exists(), "case {i}");
+    }
+}

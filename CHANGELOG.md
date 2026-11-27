@@ -11,7 +11,7 @@ If it fails partway, it removes only what it created.
 It runs `git init` when `git` is on the `PATH`, and otherwise prints a note and still succeeds; it makes no commit.
 `--npm` also writes a `package.json` that pins the exact version of Reuben that ran the command, and adds `node_modules/` to `.gitignore`.
 
-## 0.3.1 (2026-11-26)## 0.3.1 (2026-11-26)
+## 0.3.1 (2026-11-26)
 
 ### Added
 
